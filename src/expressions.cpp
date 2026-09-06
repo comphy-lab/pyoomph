@@ -3879,9 +3879,10 @@ namespace pyoomph
 
 		// A multi-return callback has no symbolic derivative to hand out at this level. Its
 		// derivatives exist only during Jacobian code generation, where the EXPANDED node
-		// (GiNaCMultiRetCallback, see codegen.cpp) supplies them to first order - either from the
-		// callback's own _get_symbolic_derivative or, failing that, from the numerical Jacobian the
-		// invoked C/Python callback fills in at runtime. Code generation therefore never reaches the
+		// (GiNaCMultiRetCallback, see codegen.cpp) supplies them to first and second order - either
+		// from the callback's own _get_symbolic_derivative/_get_symbolic_second_derivative or,
+		// failing that, from the numerical Jacobian and second-derivative tensor the invoked
+		// C/Python callback fills in at runtime. See dev_docs/multi_return_second_derivatives.md. Code generation therefore never reaches the
 		// two functions below: SubstitutePlaceholders rewrites every python_multi_cb_function() into
 		// GiNaCMultiRetCallback nodes before the Jacobian is derived from the residual.
 		//
@@ -3933,9 +3934,10 @@ namespace pyoomph
 				<< "happens when deriving " << python_multi_cb_function(func, arglst, numret) << std::endl
 				<< " with respect to its argument " << deriv_param;
 			throw_runtime_error("A multi-return expression cannot be differentiated symbolically. Its "
-								"derivatives are only available while the Jacobian code is generated, and only "
-								"to first order. Build the expression without a multi-return callback if you "
-								"need to differentiate it yourself - for activity coefficients, that is "
+								"derivatives are only available while the element code is generated (there "
+								"to first and second order, which is enough for an analytic Hessian). Build "
+								"the expression without a multi-return callback if you need to differentiate "
+								"it yourself - for activity coefficients, that is "
 								"set_activity_coefficients_by_unifac(..., use_multi_return=False)." +
 								oss.str());
 			return 0;

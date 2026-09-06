@@ -236,6 +236,7 @@ namespace pyoomph
 		// Export the functions to call
 		functable->invoke_callback = _pyoomph_invoke_callback;
 		functable->invoke_multi_ret = _pyoomph_invoke_multi_ret;
+		functable->invoke_multi_ret_hessian = _pyoomph_invoke_multi_ret_hessian;
 		functable->fill_shape_buffer_for_point = _pyoomph_fill_shape_buffer_for_point;
 
 		for (unsigned int i = 0; i < functable->numintegral_expressions; i++)

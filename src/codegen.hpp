@@ -278,16 +278,28 @@ namespace pyoomph
    // (CustomMultiReturnExpressionBase), i.e. a C function call with several outputs. "invok" is the
    // full call (function + args), "retindex" selects which output this expression stands for, and
    // "derived_by_arg" (if >=0) selects that this represents the derivative of that output w.r.t. the
-   // given argument index instead of the value itself.
+   // given argument index instead of the value itself. "derived_by_arg2" (if >=0) makes it the SECOND
+   // derivative, w.r.t. arguments derived_by_arg and derived_by_arg2 - only ever built during Hessian
+   // code generation, where it prints as an entry of the d2multi_ret_* tensor.
    class MultiRetCallback
    {
    public:
       FiniteElementCode *code;
-      GiNaC::ex invok;    // Full invokation to sort things
-      int retindex;       // Return value index
-      int derived_by_arg; // Return value index
-      MultiRetCallback(FiniteElementCode *c, const GiNaC::ex &inv, const int &index) : code(c), invok(inv), retindex(index), derived_by_arg(-1) {}
-      MultiRetCallback(FiniteElementCode *c, const GiNaC::ex &inv, const int &index, const int &derived) : code(c), invok(inv), retindex(index), derived_by_arg(derived) {}
+      GiNaC::ex invok;     // Full invokation to sort things
+      int retindex;        // Return value index
+      int derived_by_arg;  // First differentiation argument index, -1 if this is the value itself
+      int derived_by_arg2; // Second differentiation argument index, -1 if this is not a second derivative
+      MultiRetCallback(FiniteElementCode *c, const GiNaC::ex &inv, const int &index) : code(c), invok(inv), retindex(index), derived_by_arg(-1), derived_by_arg2(-1) {}
+      MultiRetCallback(FiniteElementCode *c, const GiNaC::ex &inv, const int &index, const int &derived) : code(c), invok(inv), retindex(index), derived_by_arg(derived), derived_by_arg2(-1) {}
+      // The index pair is CANONICALISED (sorted). d2f/da_j da_k is symmetric, so a node with the
+      // indices the other way round denotes the same value; left unsorted the two would be distinct
+      // GiNaC atoms reading distinct slots of the tensor, which defeats common-subexpression
+      // elimination and roughly doubles the Hessian body. Callbacks are correspondingly only ever
+      // asked for the j<=k half, and the tensor they fill is required to be symmetric.
+      MultiRetCallback(FiniteElementCode *c, const GiNaC::ex &inv, const int &index, const int &derived, const int &derived2)
+          : code(c), invok(inv), retindex(index),
+            derived_by_arg(derived2 < 0 ? derived : std::min(derived, derived2)),
+            derived_by_arg2(derived2 < 0 ? -1 : std::max(derived, derived2)) {}
    };
    bool operator==(const MultiRetCallback &lhs, const MultiRetCallback &rhs);
    bool operator<(const MultiRetCallback &lhs, const MultiRetCallback &rhs);
@@ -1071,7 +1083,10 @@ namespace pyoomph
       virtual void write_code_geometric_jacobian(std::ostream &os); // Emits the code computing d(dx)/d(nodal coordinate) etc. for moving-mesh Jacobian contributions
       virtual void write_code_get_z2_flux(std::ostream &os,bool for_eigen);
       virtual void check_for_external_ode_dependencies();
-      virtual void write_code_multi_ret_call(std::ostream &os, std::string indent, GiNaC::ex for_what, unsigned i, std::set<int> *multi_return_calls_written = NULL, GiNaC::ex *invok = NULL); // Emits the C call to a multi-return Python callback and stores its outputs in local variables
+      // Emits the C call to a multi-return Python callback and stores its outputs in local variables.
+      // allow_second_derivatives is set only by the Hessian pass; with it false the emitted text is
+      // exactly what it has always been, which is what keeps the residual/Jacobian code unchanged.
+      virtual void write_code_multi_ret_call(std::ostream &os, std::string indent, GiNaC::ex for_what, unsigned i, std::set<int> *multi_return_calls_written = NULL, GiNaC::ex *invok = NULL, bool allow_second_derivatives = false);
       virtual GiNaC::ex write_code_subexpressions(std::ostream &os, std::string indent, GiNaC::ex for_what, const std::set<ShapeExpansion> &required_shapeexps, bool hessian); // Emits local-variable definitions for all CSE'd subexpressions occurring in for_what and returns the substituted expression
       virtual GiNaC::ex expand_initial_or_Dirichlet(const std::string &fieldname, GiNaC::ex expression);
       virtual GiNaC::ex extract_spatial_integral_part(const GiNaC::ex &inp, bool eulerian, bool lagrangian); // Splits off the dx/dX integration-measure factor from inp, returning the remaining integrand
@@ -1205,6 +1220,17 @@ namespace pyoomph
       void register_global_parameters_in(const GiNaC::ex &e, std::set<unsigned> &used_local_indices); // Print-free registration pre-pass over an expression (descends into subexpressions and multi-ret invocations); fills used_local_indices with the local slots occurring in e
       std::vector<FiniteElementCodeSubExpression> subexpressions; // All CSE'd subexpressions registered for this code, in creation order (indices referenced by GiNaCSubExpression)
       std::vector<GiNaC::ex> multi_return_calls; // All distinct multi-return callback invocations registered for this code, in creation order
+      // Those invocations whose SECOND-derivative tensor the pass currently being generated actually
+      // reads, i.e. for which GiNaCMultiRetCallback::derivative built a twice-derived node. Filled
+      // during differentiation and cleared at the start of every generated routine, so that the extra
+      // d2multi_ret_* array and the more expensive callback entry point are emitted only where needed.
+      std::vector<GiNaC::ex> multi_ret_second_deriv_invoks;
+      bool multi_ret_needs_second_derivatives(const GiNaC::ex &invok) const;
+      void register_multi_ret_second_derivative(const GiNaC::ex &invok);
+      // The name of the C variable caching d(subexpressions[j])/d(f), and the value it gets. Shared by
+      // the declaration loop, the fill loop and the Hessian pre-pass of write_code_subexpressions.
+      bool subexpression_derivative_cache_name(unsigned j, const ShapeExpansion &f, std::string &name);
+      GiNaC::ex compute_subexpression_derivative(unsigned j, const ShapeExpansion &f, bool hessian);
       std::map<CustomMultiReturnExpressionBase *, std::pair<unsigned, std::string>, CustomMultiReturnExpressionBasePtrLess> multi_return_ccodes; // Per multi-return callback: its assigned numeric id and generated C function name
       void set_integration_order(unsigned order) { integration_order = order; }
       int get_integration_order() { return integration_order; }

@@ -147,7 +147,16 @@ namespace pyoomph
     virtual std::string get_id_name() { return "unknown multi-ret cb"; }
     virtual std::string _get_c_code() { return ""; } // Optionally return literal C code implementing this function directly (inlined at code generation instead of calling back into Python); empty means no C code present
     virtual void _call(int , double *, unsigned int , double *, unsigned int , double *) { throw_runtime_error("Should not end up here"); } // Numerically evaluate; if flag is set, also fill the nres x nargs derivative matrix
+    // Same, but additionally filling the nres x nargs x nargs second-derivative tensor
+    // (second_derivs[(i_res*nargs + j_arg)*nargs + k_arg], symmetric in j_arg/k_arg). Only reached from the
+    // Hessian routine, through the separate invoke_multi_ret_hessian entry point - see jitbridge.h.
+    virtual void _call_second_derivatives(int , double *, unsigned int , double *, unsigned int , double *, double *) { throw_runtime_error("Should not end up here"); }
+    virtual std::string _get_c_code_second_derivatives() { return ""; } // Optionally literal C code filling second_derivative_tensor; empty means fall back to finite differences of the derivative matrix
+    virtual double get_second_derivative_fd_epsilon() { return 1e-6; }  // Step of that fallback. Larger than a Jacobian FD step on purpose: this differences an already-differenced quantity
     virtual std::pair<bool, GiNaC::ex> _get_symbolic_derivative(const std::vector<GiNaC::ex> &, const int &, const int &) { return std::make_pair(false, 0); } // Optionally provide an analytic symbolic derivative of result i_res w.r.t. argument j_arg (first=false means "not available", fall back to numerical differentiation)
+    // Same for the second derivative of result i_res w.r.t. arguments j_arg and k_arg. Only ever asked with
+    // j_arg <= k_arg, since the tensor is symmetric and MultiRetCallback canonicalises the index pair.
+    virtual std::pair<bool, GiNaC::ex> _get_symbolic_second_derivative(const std::vector<GiNaC::ex> &, const int &, const int &, const int &) { return std::make_pair(false, 0); }
 
     // See CustomMathExpressionBase::acquire_leaf_reference()/release_leaf_reference() - same purpose, for CustomMultiReturnExpressionWrapper below.
     virtual void acquire_leaf_reference() {}

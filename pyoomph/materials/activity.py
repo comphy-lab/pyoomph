@@ -713,9 +713,18 @@ class UNIFACMultiReturnExpression(CustomMultiReturnExpression):
             result_list[i]=numpy.exp(lnC+lnR)
 
         if flag:
-            self.fill_python_derivatives_by_FD(arg_list,result_list,derivative_matrix,fd_epsilion=self.FD_epsilon)
-        
-    
+            # Exact, by forward-mode AD straight through the code above rather than by
+            # finite-differencing it: everything in it is arithmetic and numpy.log/exp/power, which
+            # a HyperDual propagates derivatives through unchanged. See
+            # pyoomph.expressions.cb.HyperDual, and dev_docs/multi_return_second_derivatives.md for
+            # why an FD Jacobian is not good enough once second derivatives are wanted - a
+            # difference of a difference has no correct digits left.
+            self.fill_python_derivatives_by_AD(arg_list,result_list,derivative_matrix)
+
+    def eval_second_derivatives(self, arg_list: NPFloatArray, result_list: NPFloatArray, derivative_matrix: NPFloatArray, second_derivative_tensor: NPFloatArray) -> None:
+        """Exact first and second derivatives, from one AD pass through eval()."""
+        self.fill_python_derivatives_by_AD(arg_list,result_list,derivative_matrix,second_derivative_tensor)
+
     def process_args_to_scalar_list(self, *args: ExpressionOrNum) -> list[ExpressionOrNum]:
         res=[a for a in args]
         res[-1]=res[-1]/kelvin

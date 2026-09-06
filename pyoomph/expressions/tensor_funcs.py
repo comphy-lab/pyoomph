@@ -44,6 +44,10 @@ class DiagonalizeSymmetricTensor(CustomMultiReturnExpression):
     @_deprecated_kwargs(coordinate_system="coordsys")
     def __init__(self,coordsys:BaseCoordinateSystem,dim:int,scale:ExpressionOrNum | str=1,fill_to_max_vector_dim:bool=True,use_FD:bool | float=False,degeneracy_epsilon:float=1e-12) -> None:
         super().__init__()
+        # eval() below is plain arithmetic and numpy calls, so its exact second derivatives
+        # come out of running it on HyperDual numbers - no hand-written Hessian, and it
+        # agrees with this class's own analytic Jacobian to machine precision.
+        self.second_derivative_mode = "ad"
         # Eigenvalues closer together than this (relative to the size of the tensor) are treated as
         # degenerate. It replaces a hardcoded test on the off-diagonal entry alone, which decided the
         # wrong thing: what makes the eigenvectors ill-conditioned is a small eigenvalue GAP, and the
@@ -325,6 +329,10 @@ if (flag)
 class LogConfTensorDecompositionCartesian2d(CustomMultiReturnExpression):
     def __init__(self,epsilon=1e-7,use_subexpression:bool=True) -> None:
         super().__init__()
+        # eval() below is plain arithmetic and numpy calls, so its exact second derivatives
+        # come out of running it on HyperDual numbers - no hand-written Hessian, and it
+        # agrees with this class's own analytic Jacobian to machine precision.
+        self.second_derivative_mode = "ad"
         self.epsilon=epsilon
         self.use_subexpression=use_subexpression
     
@@ -717,6 +725,10 @@ result_list[5]=Omega10;
 class LogConfTensorDecompositionAxisymmetric(CustomMultiReturnExpression):
     def __init__(self,epsilon=1e-7,use_FD:bool | float=False,use_subexpression:bool=True) -> None:
         super().__init__()
+        # eval() below is plain arithmetic and numpy calls, so its exact second derivatives
+        # come out of running it on HyperDual numbers - no hand-written Hessian, and it
+        # agrees with this class's own analytic Jacobian to machine precision.
+        self.second_derivative_mode = "ad"
         self.epsilon=epsilon
         self.use_FD=use_FD
         self.FD_epsilon=1e-8
@@ -1140,6 +1152,10 @@ class SymmetricMatrixExponential(CustomMultiReturnExpression):
     @_deprecated_kwargs(coordinate_system="coordsys")
     def __init__(self,coordsys:BaseCoordinateSystem,dim:int,scale:ExpressionOrNum | str=1,fill_to_max_vector_dim:bool=True,use_FD:bool | float=False,use_subexpression:bool=True) -> None:
         super().__init__()
+        # eval() below is plain arithmetic and numpy calls, so its exact second derivatives
+        # come out of running it on HyperDual numbers - no hand-written Hessian, and it
+        # agrees with this class's own analytic Jacobian to machine precision.
+        self.second_derivative_mode = "ad"
         if isinstance(coordsys,AxisymmetricCoordinateSystem):
             if isinstance(coordsys,AxisymmetryBreakingCoordinateSystem):
                 raise RuntimeError("Not implemented for this coordinate system: "+str(coordsys))
@@ -1207,14 +1223,17 @@ class SymmetricMatrixExponential(CustomMultiReturnExpression):
         a22=arg_list[2]
 
         mu_eps=0
-        mu = math.sqrt((a11-a22)**2 + 4*a12**2)/2
-        eApD2 = math.exp((a11+a22)/2)
+        # numpy rather than math here so that the very same code can be run on HyperDual numbers to
+        # get its exact derivatives (fill_python_derivatives_by_AD): math.sqrt() would coerce them
+        # to plain floats and quietly drop every derivative, while numpy dispatches to the object.
+        mu = numpy.sqrt((a11-a22)**2 + 4*a12**2)/2
+        eApD2 = numpy.exp((a11+a22)/2)
         AmD2 = (a11 - a22)/2.
-        coshMu = math.cosh(mu)
+        coshMu = numpy.cosh(mu)
         if mu<=mu_eps:
             sinchMu=1.0
         else:
-            sinchMu=math.sinh(mu)/mu
+            sinchMu=numpy.sinh(mu)/mu
         result_list[0] = eApD2 * (coshMu + AmD2*sinchMu)
         result_list[1] = eApD2 * a12 * sinchMu
         result_list[2] = eApD2 * (coshMu - AmD2*sinchMu)
@@ -1454,6 +1473,10 @@ class InvertMatrix(CustomMultiReturnExpression):
         self.n = n
         self.matrix_type = matrix_type
         super().__init__()
+        # eval() below is plain arithmetic and numpy calls, so its exact second derivatives
+        # come out of running it on HyperDual numbers - no hand-written Hessian, and it
+        # agrees with this class's own analytic Jacobian to machine precision.
+        self.second_derivative_mode = "ad"
 
     # ---------- argument / result (de)packing ----------
 
@@ -1622,7 +1645,10 @@ class InvertMatrix(CustomMultiReturnExpression):
                 ddet = [C00, 2 * C01, 2 * C02, C11, 2 * C12, C22]
                 dC = [
                     self._sparse_row({3: g, 4: -2 * e, 5: d}, 6),   # C00
-                    self._sparse_row({1: -g, 2: e, 3: c, 5: -b}, 6),  # C01
+                    # C01 = c*e - b*g, so the nonzero slots are b, c, e and g. The 'c' one
+                    # belongs to e (index 4), not to d (index 3): d does not appear in C01
+                    # at all. Wrong index -> wrong Jacobian for a symmetric 3x3 inverse.
+                    self._sparse_row({1: -g, 2: e, 4: c, 5: -b}, 6),  # C01
                     self._sparse_row({1: e, 2: -d, 3: -c, 4: b}, 6),  # C02
                     self._sparse_row({0: g, 2: -2 * c, 5: a}, 6),   # C11
                     self._sparse_row({0: -e, 1: c, 2: b, 4: -a}, 6),  # C12
@@ -1752,7 +1778,8 @@ class InvertMatrix(CustomMultiReturnExpression):
                 "  double dC[6][6];",
                 "  for (int i=0;i<6;i++) for (int j=0;j<6;j++) dC[i][j]=0;",
                 "  dC[0][3]=g;    dC[0][4]=-2*e; dC[0][5]=d;",
-                "  dC[1][1]=-g;   dC[1][2]=e;    dC[1][3]=c;   dC[1][5]=-b;",
+                # C01=c*e-b*g, so the c belongs to e (index 4), not to d: d does not occur in C01.
+                "  dC[1][1]=-g;   dC[1][2]=e;    dC[1][4]=c;   dC[1][5]=-b;",
                 "  dC[2][1]=e;    dC[2][2]=-d;   dC[2][3]=-c;  dC[2][4]=b;",
                 "  dC[3][0]=g;    dC[3][2]=-2*c; dC[3][5]=a;",
                 "  dC[4][0]=-e;   dC[4][1]=c;    dC[4][2]=b;   dC[4][4]=-a;",

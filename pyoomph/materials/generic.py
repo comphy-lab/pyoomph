@@ -2799,7 +2799,7 @@ class MixtureLiquidProperties(BaseLiquidProperties,BaseMixedProperties):
         Args:
             model: A particular UNIFAC model to use. By default, pyoomph has ``"AIOMFAC"``, ``"Original"`` UNIFAC and ``"Dortmund"`` modified UNIFAC implemented.
             set_vapor_pressures: Also set the vapor pressures using non-ideal Raoult's law.
-            use_multi_return: Either a bool or a maximum number of components when to use multi-return expressions. By default, it uses multi-return for mixtures with 3 or more components. multi-return expressions are faster for code generation, but use finite differences for the Jacobian. They cannot be used in all contexts, e.g. for bifurcation tracking.
+            use_multi_return: Either a bool or a maximum number of components when to use multi-return expressions. By default, it uses multi-return for mixtures with 3 or more components. Multi-return expressions keep the generated code small, and their derivatives are exact (forward-mode AD through the model, see dev_docs/multi_return_second_derivatives.md), to first and second order - so they work under bifurcation tracking and stability analysis too. Their derivatives are only available while the element code is generated, so an expression containing one still cannot be differentiated symbolically from Python.
         """
         if isinstance(model,str): #type:ignore
             modelname=model

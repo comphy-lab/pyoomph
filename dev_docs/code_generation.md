@@ -766,6 +766,21 @@ often dead in the Hessian, since the outer index goes through the nested copy; t
 again (once per integration point against `nnode²` entries), except that an unreferenced `exp()` is not
 free to the compiler without `-fno-math-errno`. Neither was measurable against the numbers above.
 
+### 9.3.1 Multi-return callbacks in the Hessian
+
+A `CustomMultiReturnExpression` is opaque to the symbolic machinery: it supplies its value and, at
+runtime, its Jacobian with respect to its arguments, and the generator builds the chain rule around
+them. It now differentiates twice, so such a callback can appear in an analytic Hessian. The node
+carries a second argument index, the pair is canonicalised because the tensor is symmetric, and the
+second derivatives arrive through a *separate* generated function and function-table entry so that
+nothing on the residual/Jacobian path changes. There is an ordering subtlety in this very file —
+the subexpression derivative fill is what creates the twice-derived node, and it runs after the
+multi-return call has been emitted — which is why the Hessian pass computes those differentiations
+before the emission loop and only prints them later.
+
+Full account, including the two live bugs this uncovered and the measured cost:
+[multi_return_second_derivatives.md](multi_return_second_derivatives.md).
+
 ## 9.4 The moving-mesh shape sensitivities are closed forms, and the entries are exactly linear
 
 §9.2 named the coordinate derivative "the largest remaining lever" and left it unmeasured. It is

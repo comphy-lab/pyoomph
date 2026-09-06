@@ -520,7 +520,7 @@ namespace pyoomph
 				{
 					const auto &sp = GiNaC::ex_to<GiNaC::GiNaCMultiRetCallback>(mapped_ex).get_struct();
 					GiNaC::ex invok = expressions::python_multi_cb_function(sp.invok.op(0), sp.invok.op(1).map(*this), sp.invok.op(2));
-					mapped_ex = GiNaC::GiNaCMultiRetCallback(pyoomph::MultiRetCallback(sp.code, invok.map(*this), sp.retindex, sp.derived_by_arg));
+					mapped_ex = GiNaC::GiNaCMultiRetCallback(pyoomph::MultiRetCallback(sp.code, invok.map(*this), sp.retindex, sp.derived_by_arg, sp.derived_by_arg2));
 					invok = GiNaC::ex_to<GiNaC::GiNaCMultiRetCallback>(mapped_ex).get_struct().invok;
 					if (code->resolve_multi_return_call(invok) < 0)
 					{
@@ -632,7 +632,7 @@ namespace pyoomph
 			{
 				const auto &sp = GiNaC::ex_to<GiNaC::GiNaCMultiRetCallback>(inp).get_struct();
 				GiNaC::ex invok = expressions::python_multi_cb_function(sp.invok.op(0), sp.invok.op(1).map(*this), sp.invok.op(2));
-				GiNaC::ex res = GiNaC::GiNaCMultiRetCallback(pyoomph::MultiRetCallback(sp.code, invok.map(*this), sp.retindex, sp.derived_by_arg));
+				GiNaC::ex res = GiNaC::GiNaCMultiRetCallback(pyoomph::MultiRetCallback(sp.code, invok.map(*this), sp.retindex, sp.derived_by_arg, sp.derived_by_arg2));
 				invok = GiNaC::ex_to<GiNaC::GiNaCMultiRetCallback>(res).get_struct().invok;
 
 				if (code->resolve_multi_return_call(invok) < 0)
@@ -898,7 +898,7 @@ namespace pyoomph
 		{
 			const auto &sp = GiNaC::ex_to<GiNaC::GiNaCMultiRetCallback>(inp).get_struct();
 			GiNaC::ex invok = expressions::python_multi_cb_function(sp.invok.op(0), sp.invok.op(1).map(*this), sp.invok.op(2));
-			GiNaC::ex res = GiNaC::GiNaCMultiRetCallback(pyoomph::MultiRetCallback(sp.code, invok.map(*this), sp.retindex, sp.derived_by_arg));
+			GiNaC::ex res = GiNaC::GiNaCMultiRetCallback(pyoomph::MultiRetCallback(sp.code, invok.map(*this), sp.retindex, sp.derived_by_arg, sp.derived_by_arg2));
 			invok = GiNaC::ex_to<GiNaC::GiNaCMultiRetCallback>(res).get_struct().invok;
 
 			if (code->resolve_multi_return_call(invok) < 0)
@@ -1296,7 +1296,7 @@ namespace pyoomph
 				oss << invok;
 				throw_runtime_error("Multi-return functions may not have testfunctions as arguments!\nHappened in:\n" + oss.str());
 			}
-			return GiNaC::GiNaCMultiRetCallback(MultiRetCallback(wrappi.code, invok, wrappi.retindex, wrappi.derived_by_arg));
+			return GiNaC::GiNaCMultiRetCallback(MultiRetCallback(wrappi.code, invok, wrappi.retindex, wrappi.derived_by_arg, wrappi.derived_by_arg2));
 		}
 
 		return inp.map(*this);
@@ -1342,7 +1342,7 @@ namespace pyoomph
 			{
 				const auto &sp = GiNaC::ex_to<GiNaC::GiNaCMultiRetCallback>(inp).get_struct();
 				GiNaC::ex invok = expressions::python_multi_cb_function(sp.invok.op(0), sp.invok.op(1).map(*this), sp.invok.op(2));
-				GiNaC::ex res = GiNaC::GiNaCMultiRetCallback(pyoomph::MultiRetCallback(sp.code, invok.map(*this), sp.retindex, sp.derived_by_arg));
+				GiNaC::ex res = GiNaC::GiNaCMultiRetCallback(pyoomph::MultiRetCallback(sp.code, invok.map(*this), sp.retindex, sp.derived_by_arg, sp.derived_by_arg2));
 				invok = GiNaC::ex_to<GiNaC::GiNaCMultiRetCallback>(res).get_struct().invok;
 
 				/*if (code->resolve_multi_return_call(invok) < 0)
@@ -1468,14 +1468,17 @@ namespace pyoomph
 		return lhs.expr.is_equal(rhs.expr);
 	}
 
+	// derived_by_arg2 is compared after derived_by_arg and before code. It is -1 on every node a
+	// residual or Jacobian expression can contain, so the order induced on the pre-existing node set
+	// is exactly what it was - nothing reorders outside a Hessian pass.
 	bool operator<(const MultiRetCallback &lhs, const MultiRetCallback &rhs)
 	{
-		return GiNaC::ex_is_less()(lhs.invok, rhs.invok) || (lhs.invok.is_equal(rhs.invok) && lhs.retindex < rhs.retindex) || (lhs.invok.is_equal(rhs.invok) && lhs.retindex == rhs.retindex && lhs.derived_by_arg < rhs.derived_by_arg) || (lhs.invok.is_equal(rhs.invok) && lhs.retindex == rhs.retindex && lhs.derived_by_arg == rhs.derived_by_arg && lhs.code < rhs.code);
+		return GiNaC::ex_is_less()(lhs.invok, rhs.invok) || (lhs.invok.is_equal(rhs.invok) && lhs.retindex < rhs.retindex) || (lhs.invok.is_equal(rhs.invok) && lhs.retindex == rhs.retindex && lhs.derived_by_arg < rhs.derived_by_arg) || (lhs.invok.is_equal(rhs.invok) && lhs.retindex == rhs.retindex && lhs.derived_by_arg == rhs.derived_by_arg && lhs.derived_by_arg2 < rhs.derived_by_arg2) || (lhs.invok.is_equal(rhs.invok) && lhs.retindex == rhs.retindex && lhs.derived_by_arg == rhs.derived_by_arg && lhs.derived_by_arg2 == rhs.derived_by_arg2 && lhs.code < rhs.code);
 	}
 
 	bool operator==(const MultiRetCallback &lhs, const MultiRetCallback &rhs)
 	{
-		return lhs.invok.is_equal(rhs.invok) && lhs.retindex == rhs.retindex && lhs.derived_by_arg == rhs.derived_by_arg && lhs.code == rhs.code;
+		return lhs.invok.is_equal(rhs.invok) && lhs.retindex == rhs.retindex && lhs.derived_by_arg == rhs.derived_by_arg && lhs.derived_by_arg2 == rhs.derived_by_arg2 && lhs.code == rhs.code;
 	}
 	bool operator==(const ShapeExpansion &lhs, const ShapeExpansion &rhs)
 	{
@@ -3216,47 +3219,51 @@ namespace pyoomph
 
 				for (auto f2 : hessian_fields)
 				{
-					// Not an AmbientCodegenScope, unlike the other flags: the true-region here spans a
-					// loop body with a `continue` in the middle and three separate clears at the loop
-					// exits below, and the two differentiations that need it are separated by the
-					// symmetry-skip branch. Restructuring the double loop to scope it precisely is a
-					// change to the most intricate part of the Hessian generator for no gain against
-					// either of the two reasons the other flags were scoped (nesting, and throwing
-					// mid-differentiation) - this one is set and cleared inside a single pass.
-					__derive_shapes_by_second_index = true;
-					GiNaC::ex masspart2 = GiNaC::diff(masspart, f2->get_symbol());
+					// Scoped like the other ambient flags, in a plain nested block: the `continue` inside
+					// it leaves the block and so restores the flag, and so does an exception. It used to
+					// be a bare set/clear pair, on the argument that the region is "set and cleared
+					// inside a single pass" - but GiNaC::diff() below is precisely where a residual that
+					// cannot be differentiated twice throws, and the flag then stayed latched for
+					// everything generated afterwards in the process. What that looked like was a LATER,
+					// unrelated element's ordinary Jacobian coming out with `l_shape2` in it, referring
+					// to a loop variable that only exists in a Hessian, i.e. a C file the compiler
+					// rejects with no hint of where it came from.
+					GiNaC::ex masspart2, diffpart2;
 					bool only_mass_part = false; // Since the mass Hessian is NOT symmetric!
-					if (for_code->assemble_hessian_by_symmetry && for_code->Hessian_symmetric_fields_completed.count(f2))
 					{
-						if (masspart2.is_zero())
+						AmbientCodegenScope<bool> second_index_scope(__derive_shapes_by_second_index, true);
+						masspart2 = GiNaC::diff(masspart, f2->get_symbol());
+						if (for_code->assemble_hessian_by_symmetry && for_code->Hessian_symmetric_fields_completed.count(f2))
 						{
-							os << "//SYMMETRY: SKIPPING FIELD COMBINATION:  " << f->get_equation_str(for_code, "any") << " & " << f2->get_equation_str(for_code, "any") << std::endl;
-							continue;
+							if (masspart2.is_zero())
+							{
+								os << "//SYMMETRY: SKIPPING FIELD COMBINATION:  " << f->get_equation_str(for_code, "any") << " & " << f2->get_equation_str(for_code, "any") << std::endl;
+								continue;
+							}
+							else
+							{
+								only_mass_part = true;
+							}
 						}
-						else
+
 						{
-							only_mass_part = true;
+							AmbientCodegenScope<int *> expansion_mode_scope(__derive_only_by_expansion_mode, for_code->get_derive_hessian_by_expansion_mode());
+							AmbientCodegenScope<bool> ignore_dpsi(__ignore_dpsi_coord_diffs_in_jacobian, false);
+							diffpart2 = GiNaC::diff(diffpart, f2->get_symbol());
 						}
+
+						/*if (!masspart.is_zero())
+						{
+						  std::cout << "22 MASSPART " << masspart << std::endl;
+						  std::cout << "22 MASSPART BY" << f2->get_symbol()<< " : " << masspart2 << std::endl;
+						}*/
+						for_code->subexpressions = for_code->se_to_struct_hessian->subexpressions;
+						// The subexpression shape expansions used to be harvested into the Hessian-wide sets
+						// here. They are not any more: this point is skipped by the assemble_hessian_by_symmetry
+						// "continue" above, and it runs before the mappings further down, so the last (f,f2)
+						// pair's subexpressions were never seen. write_generic_Hessian() now sweeps the
+						// finished list once instead.
 					}
-
-					__derive_only_by_expansion_mode=for_code->get_derive_hessian_by_expansion_mode();
-					__ignore_dpsi_coord_diffs_in_jacobian=false;
-					GiNaC::ex diffpart2 = GiNaC::diff(diffpart, f2->get_symbol());
-					__derive_only_by_expansion_mode=NULL;
-					__ignore_dpsi_coord_diffs_in_jacobian=false;
-
-					/*if (!masspart.is_zero())
-					{
-					  std::cout << "22 MASSPART " << masspart << std::endl;
-					  std::cout << "22 MASSPART BY" << f2->get_symbol()<< " : " << masspart2 << std::endl;
-					}*/
-					for_code->subexpressions = for_code->se_to_struct_hessian->subexpressions;
-					// The subexpression shape expansions used to be harvested into the Hessian-wide sets
-					// here. They are not any more: this point is skipped by the assemble_hessian_by_symmetry
-					// "continue" above, and it runs before the mappings further down, so the last (f,f2)
-					// pair's subexpressions were never seen. write_generic_Hessian() now sweeps the
-					// finished list once instead.
-					__derive_shapes_by_second_index = false;
 					if (diffpart2.is_zero() && masspart2.is_zero()) // &&  masspart2.is_zero()
 						continue;
 
@@ -3423,9 +3430,7 @@ namespace pyoomph
 						os << indent << "     }" << std::endl;
 					}
 				}
-				__derive_shapes_by_second_index = false;
 			}
-			__derive_shapes_by_second_index = false;
 
 			if (loop2_written)
 			{
@@ -3447,7 +3452,8 @@ namespace pyoomph
 		{
 			os << indent << "}" << std::endl;
 		}
-		__derive_shapes_by_second_index = false; // the loop above has three exits; this catches them all
+		// No clear needed here any more: the flag is now scoped where it is set, so every exit of the
+		// loop above - including the `continue` and a throwing differentiation - restores it.
 		return has_contribs;
 	}
 
@@ -5376,7 +5382,7 @@ namespace pyoomph
 	// (multi_ret_ccode_<index>, from multi_return_ccodes) over the generic Python callback dispatch
 	// (my_func_table->invoke_multi_ret) when available; if the callback additionally requests
 	// C-vs-Python cross-checking (debug_c_code_epsilon>0), both are emitted.
-	void FiniteElementCode::write_code_multi_ret_call(std::ostream &os, std::string indent, GiNaC::ex for_what, unsigned i, std::set<int> *multi_return_calls_written, GiNaC::ex *invok)
+	void FiniteElementCode::write_code_multi_ret_call(std::ostream &os, std::string indent, GiNaC::ex for_what, unsigned i, std::set<int> *multi_return_calls_written, GiNaC::ex *invok, bool allow_second_derivatives)
 	{
 		if (multi_return_calls_written && invok)
 		{
@@ -5400,7 +5406,10 @@ namespace pyoomph
 					}
 					if (!multi_return_calls_written->count(mr_index))
 					{
-						this->write_code_multi_ret_call(os, indent, for_what, mr_index, multi_return_calls_written, &invok2);
+						// allow_second_derivatives has to travel down here too: for nested calls B(A(u))
+						// the second derivative is B''(A')^2 + B'A'', so the INNER call's tensor is read
+						// as well. Dropping it would leave d2multi_ret_<inner> undeclared.
+						this->write_code_multi_ret_call(os, indent, for_what, mr_index, multi_return_calls_written, &invok2, allow_second_derivatives);
 						multi_return_calls_written->insert(mr_index);
 					}
 				}
@@ -5412,8 +5421,36 @@ namespace pyoomph
 		csrc_opts.for_code = this;
 		if (nret > 0)
 		{
+			// Whether this particular invocation's second-derivative tensor is actually read. Only the
+			// Hessian pass passes allow_second_derivatives at all, and even there only the invocations
+			// that GiNaCMultiRetCallback::derivative registered get the extra array and the more
+			// expensive entry point. With allow_second_derivatives false every line below is byte for
+			// byte what it has always been - that is what keeps the residual/Jacobian code untouched.
+			const bool with_second = allow_second_derivatives && this->multi_ret_needs_second_derivatives(multi_return_calls[i]);
+			// In the Hessian routine `flag` is the Hessian MODE (0..5), not a derivative request: mode 0
+			// is the ordinary Hessian-vector product, and passing it through told the callback NOT to
+			// fill the derivative matrix that the Hessian body then went on to read. So the Hessian pass
+			// passes a literal instead, which also keeps modes 2..5 out of user callbacks that branch on
+			// flag==1. Everywhere else the enclosing routine's own flag is exactly right.
+			const std::string flagarg = allow_second_derivatives
+											? (with_second ? "PYOOMPH_MULTIRET_FLAG_DERIVATIVES|PYOOMPH_MULTIRET_FLAG_SECOND_DERIVATIVES" : "PYOOMPH_MULTIRET_FLAG_DERIVATIVES")
+											: "flag";
 			os << indent << "PYOOMPH_AQUIRE_ARRAY(double,multi_ret_" << i << "," << nret << ");" << std::endl;
 			os << indent << "PYOOMPH_AQUIRE_ARRAY(double,dmulti_ret_" << i << "," << nret << "*" << nargs << ");" << std::endl;
+			std::string d2arg;
+			if (with_second)
+			{
+				std::ostringstream d2decl;
+				d2decl << "PYOOMPH_AQUIRE_ARRAY(double,d2multi_ret_" << i << "," << nret << "*" << nargs << "*" << nargs << ");";
+				// Above the integration loop where the caller offers a place for it: this array is the
+				// largest of the three (nret*nargs^2 doubles) and PYOOMPH_AQUIRE_ARRAY is _alloca on
+				// Windows, which a loop never releases. See FiniteElementCode::hoisted_array_decls.
+				if (hoisted_array_decls)
+					hoisted_array_decls->push_back(d2decl.str());
+				else
+					os << indent << d2decl.str() << std::endl;
+				d2arg = ", d2multi_ret_" + std::to_string(i);
+			}
 			CustomMultiReturnExpressionBase *func = GiNaC::ex_to<GiNaC::GiNaCCustomMultiReturnExpressionWrapper>(multi_return_calls[i].op(0)).get_struct().cme;
 			if (!CustomMultiReturnExpressionBase::code_map.count(func))
 			{
@@ -5422,41 +5459,41 @@ namespace pyoomph
 			unsigned index = CustomMultiReturnExpressionBase::code_map[func];
 			if (multi_return_ccodes.count(func))
 			{
-				os << indent << "multi_ret_ccode_" << multi_return_ccodes[func].first << "(flag,(double []){";
+				os << indent << "multi_ret_ccode_" << (with_second ? "d2_" : "") << multi_return_ccodes[func].first << "(" << flagarg << ",(double []){";
 				for (int l = 0; l < nargs; l++)
 				{
 					print_simplest_form(multi_return_calls[i].op(1).op(l), os, csrc_opts);
 					if (l < nargs - 1)
 						os << ", ";
 				}
-				os << "} , multi_ret_" << i << ", dmulti_ret_" << i;
+				os << "} , multi_ret_" << i << ", dmulti_ret_" << i << d2arg;
 				os << ", " << nargs << ", " << nret << ");" << std::endl
 				   << std::endl;
 				if (func->debug_c_code_epsilon > 0)
 				{
 					os << indent << "//DEBUG CALL WITH EPSILON " << func->debug_c_code_epsilon << std::endl;
-					os << indent << "my_func_table->invoke_multi_ret(my_func_table, " << index << " , flag|128, (double []){";
+					os << indent << "my_func_table->invoke_multi_ret" << (with_second ? "_hessian" : "") << "(my_func_table, " << index << " , " << flagarg << "|PYOOMPH_MULTIRET_FLAG_DEBUG_PYTHON_VS_C, (double []){";
 					for (int l = 0; l < nargs; l++)
 					{
 						print_simplest_form(multi_return_calls[i].op(1).op(l), os, csrc_opts);
 						if (l < nargs - 1)
 							os << ", ";
 					}
-					os << "} , multi_ret_" << i << ", dmulti_ret_" << i;
+					os << "} , multi_ret_" << i << ", dmulti_ret_" << i << d2arg;
 					os << ", " << nargs << ", " << nret << ");" << std::endl
 					   << std::endl;
 				}
 			}
 			else
 			{
-				os << indent << "my_func_table->invoke_multi_ret(my_func_table, " << index << " , flag, (double []){";
+				os << indent << "my_func_table->invoke_multi_ret" << (with_second ? "_hessian" : "") << "(my_func_table, " << index << " , " << flagarg << ", (double []){";
 				for (int l = 0; l < nargs; l++)
 				{
 					print_simplest_form(multi_return_calls[i].op(1).op(l), os, csrc_opts);
 					if (l < nargs - 1)
 						os << ", ";
 				}
-				os << "} , multi_ret_" << i << ", dmulti_ret_" << i;
+				os << "} , multi_ret_" << i << ", dmulti_ret_" << i << d2arg;
 				os << ", " << nargs << ", " << nret << ");" << std::endl
 				   << std::endl;
 			}
@@ -5482,6 +5519,49 @@ namespace pyoomph
 	// respecting dependency order) via write_code_multi_ret_call before the subexpression that needs
 	// them. Nested-coordinate (position-space) dependencies are skipped unless coordinates_as_dofs is
 	// set, and only the current-time history slot (time_history_index==0) is differentiated here.
+	// Name of the C variable caching d(subexpression j)/d(field f), and whether such a variable exists
+	// at all for this (j, f) pair. Factored out of write_code_subexpressions because three loops there
+	// - the declaration, the fill, and the Hessian pre-pass - have to agree on exactly this rule; when
+	// they were written out three times, one of them drifting produced either an undeclared identifier
+	// or a variable declared and never assigned.
+	bool FiniteElementCode::subexpression_derivative_cache_name(unsigned j, const ShapeExpansion &f, std::string &name)
+	{
+		if (!coordinates_as_dofs && dynamic_cast<PositionFiniteElementSpace *>(f.field->get_space()))
+			return false;
+		if (f.time_history_index != 0)
+			return false;
+		std::ostringstream oss;
+		oss << "d_" << subexpressions[j].get_cvar() << "_d_" << f.get_spatial_interpolation_name(this);
+		name = oss.str();
+		return true;
+	}
+
+	// The value that variable is assigned. See the long comment at the fill site in
+	// write_code_subexpressions for why each of the four ambient flags is set the way it is.
+	GiNaC::ex FiniteElementCode::compute_subexpression_derivative(unsigned j, const ShapeExpansion &f, bool hessian)
+	{
+		if (pyoomph::pyoomph_verbose)
+		{
+			std::cout << "DERIVING SUBSEXPRESSION " << subexpressions[j].get_expression() << " BY " << f.field->get_symbol() << ", more specifically by " << (0 + GiNaC::GiNaCShapeExpansion(f)) << std::endl;
+		}
+		GiNaC::ex dsdf;
+		{
+			AmbientCodegenScope<const ShapeExpansion *> wrto_scope(__deriv_subexpression_wrto, &f);
+			AmbientCodegenScope<int *> expansion_mode_scope(__derive_only_by_expansion_mode,
+															hessian ? this->get_derive_hessian_by_expansion_mode() : this->get_derive_jacobian_by_expansion_mode());
+			AmbientCodegenScope<bool> not_in_hessian(pyoomph::__in_hessian, false);
+			AmbientCodegenScope<bool> ignore_dpsi(pyoomph::__ignore_dpsi_coord_diffs_in_jacobian, true);
+			dsdf = pyoomph::expressions::diff(subexpressions[j].get_expression(), f.field->get_symbol());
+		}
+		DerivedShapeExpansionsToUnity deriv_se_to_1(f.basis, f.dt_order, f.dt_scheme); // Map all other expanded basis functions to zero to separate between e.g. d/dx or nonderived shapes
+		GiNaC::ex dsub = deriv_se_to_1(dsdf);
+		if (pyoomph::pyoomph_verbose)
+		{
+			std::cout << "DERIVING SUBSEXPRESSION RESULT " << dsdf << " OR " << dsub << std::endl;
+		}
+		return dsub;
+	}
+
 	GiNaC::ex FiniteElementCode::write_code_subexpressions(std::ostream &os, std::string indent, GiNaC::ex for_what, const std::set<ShapeExpansion> &, bool hessian)
 	{
 		GiNaC::ex res;
@@ -5528,6 +5608,38 @@ namespace pyoomph
 		//	 ReplaceSubexprToCVar rem_subexpr(this);
 		//	 os << "  //Subexpressions" << std::endl;
 		// if (!hessian)
+
+		// The per-subexpression derivative cache d_subexpr_N_d_<field> is filled far below, but in a
+		// Hessian pass its differentiations have to happen HERE, before the multi-return calls are
+		// emitted. A nested Hessian subexpression body already holds a once-derived multi-return node
+		// (GiNaCSubExpression::derivative wraps the outer index in a fresh subexpression), so
+		// differentiating it again down there is what creates the TWICE-derived node - and hence what
+		// decides whether the d2multi_ret_* tensor is needed at all. Left in place, that decision would
+		// be taken after the call that has to act on it was already written out.
+		//
+		// Hoisting the emission instead is not an option: a call's arguments may reference earlier
+		// subexpr_* variables, which is exactly why the two are interleaved below. So the expressions
+		// are computed early and merely printed later, in unchanged order.
+		//
+		// Only for the Hessian: with hessian==false the emission order, and therefore every byte of the
+		// residual/Jacobian code, stays exactly as it was.
+		std::map<std::string, GiNaC::ex> precomputed_subexpr_derivs;
+		if (hessian)
+		{
+			std::set<std::string> precomputed_names;
+			for (unsigned int j = 0; j < subexpressions.size(); j++)
+			{
+				for (auto &f : subexpressions[j].req_fields)
+				{
+					std::string name;
+					if (!subexpression_derivative_cache_name(j, f, name) || precomputed_names.count(name))
+						continue;
+					precomputed_names.insert(name);
+					precomputed_subexpr_derivs[name] = compute_subexpression_derivative(j, f, true);
+				}
+			}
+		}
+
 		std::set<int> multi_return_calls_written;
 		for (unsigned int j = 0; j < subexpressions.size(); j++)
 		{
@@ -5553,7 +5665,7 @@ namespace pyoomph
 					}
 					if (!multi_return_calls_written.count(mr_index))
 					{
-						this->write_code_multi_ret_call(os, indent, for_what, mr_index, &multi_return_calls_written, &invok);
+						this->write_code_multi_ret_call(os, indent, for_what, mr_index, &multi_return_calls_written, &invok, hessian);
 						multi_return_calls_written.insert(mr_index);
 					}
 				}
@@ -5587,26 +5699,17 @@ namespace pyoomph
 
 				for (auto &f : subexpressions[j].req_fields)
 				{
-					if (!coordinates_as_dofs && dynamic_cast<PositionFiniteElementSpace *>(f.field->get_space()))
-						continue;
-					if (f.time_history_index != 0)
-						continue;
-					//				GiNaC::ex dsub=subexpressions[j].expr_subst.diff(f.get_cpp_symbol());
-					//				if (!dsub.is_zero())
-					//				{
-					std::string wrto = f.get_spatial_interpolation_name(this);
-					std::ostringstream derivname;
-					derivname << "d_" << subexpressions[j].get_cvar() << "_d_" << wrto;
 					// Two req_fields entries of one subexpression can differ only in no_jacobian /
 					// no_hessian / expansion_mode - flags that ShapeExpansion::operator< discriminates on
 					// but get_spatial_interpolation_name does not - and would then declare the same C
 					// variable twice. Sharing one variable is safe because the fill below matches on
 					// (field, dt_order, basis, dt_scheme) only, so every variant produces the same value.
 					// The fill loop applies the identical rule, so declaration and assignment agree.
-					if (subexpr_decls_written.count(derivname.str()))
+					std::string derivname;
+					if (!subexpression_derivative_cache_name(j, f, derivname) || subexpr_decls_written.count(derivname))
 						continue;
-					os << "    double " << derivname.str() << ";" << std::endl;
-					subexpr_decls_written.insert(derivname.str());
+					os << "    double " << derivname << ";" << std::endl;
+					subexpr_decls_written.insert(derivname);
 					//	subexpressions[j].derivsyms[f.get_cpp_symbol()]=GiNaC::symbol(derivname.str());
 					//			}
 				}
@@ -5621,26 +5724,14 @@ namespace pyoomph
 			{
 				for (auto &f : subexpressions[j].req_fields)
 				{
-					if (!coordinates_as_dofs && dynamic_cast<PositionFiniteElementSpace *>(f.field->get_space()))
-						continue;
-					if (f.time_history_index != 0)
-						continue;
-					//				GiNaC::ex dsub=subexpressions[j].expr_subst.diff(f.get_cpp_symbol());
-					//				if (!dsub.is_zero())
-					//				{
-					std::string wrto = f.get_spatial_interpolation_name(this);
-					std::ostringstream derivname;
-					derivname << "d_" << subexpressions[j].get_cvar() << "_d_" << wrto;
 					// Same collapsing rule as the declaration loop above, and applied before the diff so
 					// the skipped variant costs nothing.
-					if (subexpr_fills_written.count(derivname.str()))
+					std::string derivname;
+					if (!subexpression_derivative_cache_name(j, f, derivname) || subexpr_fills_written.count(derivname))
 						continue;
-					if (pyoomph::pyoomph_verbose)
-					{
-						std::cout << "DERIVING SUBSEXPRESSION " << subexpressions[j].get_expression() << " BY " << f.field->get_symbol() << ", more specifically by " << (0 + GiNaC::GiNaCShapeExpansion(f)) << std::endl;
-					}
-					// The four flags below are set for the derivative and nothing else: the scope closes
-					// before deriv_se_to_1 runs, which must not see them.
+					// The four flags compute_subexpression_derivative() sets are set for the derivative
+					// and nothing else: the scope closes before deriv_se_to_1 runs, which must not see
+					// them.
 					//
 					// __derive_only_by_expansion_mode: every d_subexpr_N_d_<field> the Hessian actually
 					// reads is a *second*-index derivative - the outer index never touches the cache, it
@@ -5667,26 +5758,18 @@ namespace pyoomph
 					// so keeping them would double count. Only azimuthal/normal-mode expansions on a
 					// moving mesh reach this, since only they put second spatial derivatives of the
 					// coordinates into a subexpression.
-					GiNaC::ex dsdf;
-					{
-						AmbientCodegenScope<const ShapeExpansion *> wrto_scope(__deriv_subexpression_wrto, &f);
-						AmbientCodegenScope<int *> expansion_mode_scope(__derive_only_by_expansion_mode,
-																		hessian ? this->get_derive_hessian_by_expansion_mode() : this->get_derive_jacobian_by_expansion_mode());
-						AmbientCodegenScope<bool> not_in_hessian(pyoomph::__in_hessian, false);
-						AmbientCodegenScope<bool> ignore_dpsi(pyoomph::__ignore_dpsi_coord_diffs_in_jacobian, true);
-						dsdf = pyoomph::expressions::diff(subexpressions[j].get_expression(), f.field->get_symbol());
-					}
-					DerivedShapeExpansionsToUnity deriv_se_to_1(f.basis,f.dt_order,f.dt_scheme); // Map all other expanded basis functions to zero to separate between e.g. d/dx or nonderived shapes
-					GiNaC::ex dsub = deriv_se_to_1(dsdf);
-					if (pyoomph::pyoomph_verbose)
-					{
-						std::cout << "DERIVING SUBSEXPRESSION RESULT " << dsdf << " OR " << dsub << std::endl;
-					}
-					
+					// Already computed above in the Hessian pre-pass, which had to run before the
+					// multi-return calls were emitted; recomputing it here would be both wasteful and,
+					// worse, a second chance for the two to disagree.
+					auto precomputed = precomputed_subexpr_derivs.find(derivname);
+					GiNaC::ex dsub = (precomputed != precomputed_subexpr_derivs.end())
+										 ? precomputed->second
+										 : compute_subexpression_derivative(j, f, hessian);
+
 					// if (!dsub.is_zero())
 					{
-						os << "     " << derivname.str() << " = ";
-						subexpr_fills_written.insert(derivname.str());
+						os << "     " << derivname << " = ";
+						subexpr_fills_written.insert(derivname);
 						// dsub.evalf().print(GiNaC::print_csrc_FEM(os,&csrc_opts));
 						// GiNaC::factor(GiNaC::normal(GiNaC::expand(GiNaC::expand(dsub).evalf()))).print(GiNaC::print_csrc_FEM(os,&csrc_opts));
 						print_simplest_form(dsub, os, csrc_opts);
@@ -5703,7 +5786,7 @@ namespace pyoomph
 		{
 			if (!multi_return_calls_written.count(i))
 			{
-				this->write_code_multi_ret_call(os, indent, for_what, i);
+				this->write_code_multi_ret_call(os, indent, for_what, i, NULL, NULL, hessian);
 				multi_return_calls_written.insert(i);
 			}
 		}
@@ -5946,6 +6029,10 @@ namespace pyoomph
 	bool FiniteElementCode::write_generic_Hessian(std::ostream &os, std::string funcname, GiNaC::ex resi, bool)
 	{
 		this->current_shapeflag_func_type = "Hessian[" + std::to_string(residual_index) + "]";
+		// Rebuilt from scratch for every generated routine: an entry left over from a previous pass
+		// would make a later one emit the d2multi_ret_* array and the Hessian entry point for a call
+		// whose second derivatives it never reads.
+		this->multi_ret_second_deriv_invoks.clear();
 		AmbientCodegenScope<bool> in_hessian_scope(__in_hessian, true); // cleared on every exit, including the throwing ones
 		bool has_contribs = false;
 		std::ostringstream osh; // Header
@@ -6285,6 +6372,10 @@ namespace pyoomph
 	void FiniteElementCode::write_generic_RJM(std::ostream &os, std::string funcname, GiNaC::ex resi, bool, bool may_be_asked_for_mass_matrix, bool allow_hang_split)
 	{
 		this->current_shapeflag_func_type = "ResJac[" + std::to_string(residual_index) + "]";
+		// Rebuilt from scratch for every generated routine: an entry left over from a previous pass
+		// would make a later one emit the d2multi_ret_* array and the Hessian entry point for a call
+		// whose second derivatives it never reads.
+		this->multi_ret_second_deriv_invoks.clear();
 		// Redundant since write_generic_Hessian restores the flag on every exit (AmbientCodegenScope);
 		// kept because it costs nothing and this function is also reached from paths that predate that.
 		__in_hessian = false;
@@ -7545,6 +7636,27 @@ namespace pyoomph
 			   << "{" << std::endl;
 			os << body << std::endl;
 			os << "}" << std::endl;
+			// The second-derivative entry point, deliberately a separate function rather than a widened
+			// version of the one above: the user's own C body keeps being pasted into the unchanged
+			// signature, so every existing generate_c_code() implementation compiles untouched, and the
+			// residual/Jacobian call sites are not perturbed either. Only emitted when an analytic
+			// Hessian is being generated at all, so an element that will never call it does not carry
+			// it - which is what makes the generated file for a plain residual/Jacobian run identical
+			// to what it was before second derivatives existed, bar the function-table size.
+			// Which individual calls need it is decided later, per routine; PYOOMPH_MAYBE_UNUSED covers
+			// the case where the Hessian turns out not to read this particular callback's tensor.
+			// The default body finite-differences the derivative matrix, reaching the function above
+			// through CURRENT_MULTIRET_FUNCTION, which is still defined here.
+			if (generate_hessian)
+			{
+				std::string body2 = entry.first->_get_c_code_second_derivatives();
+				if (body2.empty())
+					body2 = "  FILL_MULTI_RET_HESSIAN_BY_FD(" + std::to_string(entry.first->get_second_derivative_fd_epsilon()) + ")";
+				os << "PYOOMPH_MAYBE_UNUSED static void multi_ret_ccode_d2_" << index << "(int flag, double *arg_list, double *result_list, double *derivative_matrix, double *second_derivative_tensor,int nargs,int nret)" << std::endl
+				   << "{" << std::endl;
+				os << body2 << std::endl;
+				os << "}" << std::endl;
+			}
 			os << "#undef CURRENT_MULTIRET_FUNCTION" << std::endl
 			   << std::endl;
 		}
@@ -9088,6 +9200,30 @@ namespace pyoomph
 				return i;
 		}
 		return -1;
+	}
+
+	// Records that the routine currently being generated reads the second-derivative tensor of this
+	// invocation. Called from GiNaCMultiRetCallback::derivative whenever it builds a twice-derived
+	// node; the list is short (one entry per distinct multi-return call in the residual), so a linear
+	// scan for the duplicate check costs nothing.
+	void FiniteElementCode::register_multi_ret_second_derivative(const GiNaC::ex &invok)
+	{
+		for (const auto &e : multi_ret_second_deriv_invoks)
+		{
+			if (e.is_equal(invok))
+				return;
+		}
+		multi_ret_second_deriv_invoks.push_back(invok);
+	}
+
+	bool FiniteElementCode::multi_ret_needs_second_derivatives(const GiNaC::ex &invok) const
+	{
+		for (const auto &e : multi_ret_second_deriv_invoks)
+		{
+			if (e.is_equal(invok))
+				return true;
+		}
+		return false;
 	}
 
 	// Intended to suppress a bulk element's residual contribution for a given DoF on an interface
@@ -11003,9 +11139,10 @@ namespace pyoomph
 				dxs = dx->get_symbol();
 			}
 			std::cout << "DERIVATIVE WRT " << dx2 << " : " << dxs << std::endl;
-			__derive_shapes_by_second_index = true;
-			curr = GiNaC::diff(curr, dxs);
-			__derive_shapes_by_second_index = false;
+			{
+				AmbientCodegenScope<bool> second_index_scope(__derive_shapes_by_second_index, true);
+				curr = GiNaC::diff(curr, dxs);
+			}
 			std::cout << "GIVES " << curr << std::endl;
 			std::cout << "C CODE: ";
 			print_simplest_form(curr, std::cout, csrc_opts);
@@ -11246,7 +11383,14 @@ namespace GiNaC
 					throw_runtime_error("Cannot resolve multi_return_call" + oss.str());
 				}
 
-				if (sp.derived_by_arg >= 0)
+				if (sp.derived_by_arg2 >= 0)
+				{
+					// Layout mirrors the derivative matrix one index deeper, i.e.
+					// second_derivative_tensor[(i_res*nargs + j_arg)*nargs + k_arg]; see jitbridge.h.
+					int nargs = GiNaC::ex_to<GiNaC::lst>(sp.invok.op(1)).nops();
+					c.s << "d2multi_ret_" << index << "[" << nargs * nargs << "*" << sp.retindex << "+" << nargs << "*" << sp.derived_by_arg << "+" << sp.derived_by_arg2 << "]";
+				}
+				else if (sp.derived_by_arg >= 0)
 				{
 					//				  int nret=GiNaC::ex_to<GiNaC::numeric>(sp.invok.op(2)).to_int();
 					int nargs = GiNaC::ex_to<GiNaC::lst>(sp.invok.op(1)).nops();
@@ -11269,65 +11413,99 @@ namespace GiNaC
 			{
 				c.s << "<MULTIRET_CB: " << sp.invok << " at index " << sp.retindex << ">";
 			}
-			else
+			else if (sp.derived_by_arg2 < 0)
 			{
 				c.s << "<DERIVED MULTIRET_CB: " << sp.invok << " at index " << sp.retindex << " wrt. " << sp.derived_by_arg << ">";
+			}
+			else
+			{
+				c.s << "<2ND-DERIVED MULTIRET_CB: " << sp.invok << " at index " << sp.retindex << " wrt. " << sp.derived_by_arg << " and " << sp.derived_by_arg2 << ">";
 			}
 		}
 	}
 
-	// Chain rule for a multi-return callback's return value: only first derivatives are supported
-	// (differentiating an already-derived node, derived_by_arg>=0, raises an error - except w.r.t.
-	// the mass-matrix marker, which is trivially zero). For a plain (non-derived) node, differentiates
-	// every argument expression w.r.t. `s` and, for each nonzero argument derivative, asks the
-	// underlying callback whether it can supply a closed-form symbolic derivative
-	// (_get_symbolic_derivative); if not, falls back to a "derived by argument i" GiNaCMultiRetCallback
-	// node (whose value is the numerically-computed Jacobian entry dmulti_ret_.../nargs*retindex+i,
-	// filled in at runtime by the invoked C/Python callback itself) multiplied by the chain-rule factor.
+	// Chain rule for a multi-return callback's return value, to first and second order.
+	//
+	// For a plain (non-derived) node, every argument expression is differentiated w.r.t. `s` and, for
+	// each nonzero argument derivative, the underlying callback is asked whether it can supply a
+	// closed-form symbolic derivative (_get_symbolic_derivative); if not, the factor is a "derived by
+	// argument i" GiNaCMultiRetCallback node, whose value is the numerically-computed Jacobian entry
+	// dmulti_ret_...[nargs*retindex+i] that the invoked C/Python callback fills in at runtime.
+	//
+	// Differentiating such a derived node once more gives the second order. Only the
+	// sum_k (da_k/ds) * d2F/da_j da_k half appears here: the other half of
+	//   d2F/ds dt = sum_k (d2a_k/ds dt) dF/da_k + sum_{j,k} (da_j/ds)(da_k/dt) d2F/da_j da_k
+	// is produced by GiNaC's own product rule, which differentiates the (da_j/ds) factor sitting in
+	// front of this node. Every invocation for which a genuine second-derivative node is built is
+	// registered with the owning code, so that the Hessian routine emits the d2multi_ret_* tensor and
+	// the more expensive callback entry point ONLY where they are actually read.
+	//
+	// A third differentiation raises: the callback ABI carries no third-order tensor. Note that a
+	// callback answering _get_symbolic_derivative with a closed form never reaches that limit - its
+	// derivative is an ordinary GiNaC expression, which differentiates as many times as one likes.
 	template <>
 	GiNaC::ex GiNaCMultiRetCallback::derivative(const GiNaC::symbol &s) const
 	{
 		const auto &sp = get_struct();
-		if (sp.derived_by_arg >= 0)
+		// The mass-matrix marker is not an argument of anything: no invocation can depend on it, so
+		// the derivative is zero at every order rather than an unsupported one.
+		if (s == pyoomph::expressions::__partial_t_mass_matrix && sp.derived_by_arg >= 0)
 		{
-			if (s == pyoomph::expressions::__partial_t_mass_matrix)
-			{
-				return 0;
-			}
+			return 0;
+		}
+		if (sp.derived_by_arg2 >= 0)
+		{
 			std::ostringstream oss;
 			oss << std::endl
-				<< "happes when deriving " << (*this) << std::endl
+				<< "happens when deriving " << (*this) << std::endl
 				<< " by " << s;
-			throw_runtime_error("Multi-Return Callbacks can only be derived to the first order at the moment!" + oss.str());
+			throw_runtime_error("Multi-Return Callbacks can only be derived to the second order at the moment!" + oss.str());
 		}
-		else
+		GiNaC::ex args = sp.invok.op(1);
+		GiNaC::ex res = 0;
+		pyoomph::CustomMultiReturnExpressionBase *func = GiNaC::ex_to<GiNaC::GiNaCCustomMultiReturnExpressionWrapper>(sp.invok.op(0)).get_struct().cme;
+		std::vector<GiNaC::ex> argvect;
+		for (unsigned int i = 0; i < args.nops(); i++)
 		{
-			GiNaC::ex args = sp.invok.op(1);
-			GiNaC::ex res = 0;
-			pyoomph::CustomMultiReturnExpressionBase *func = GiNaC::ex_to<GiNaC::GiNaCCustomMultiReturnExpressionWrapper>(sp.invok.op(0)).get_struct().cme;
-			std::vector<GiNaC::ex> argvect;
-			for (unsigned int i = 0; i < args.nops(); i++)
+			argvect.push_back(args.op(i));
+		}
+		for (unsigned int i = 0; i < args.nops(); i++)
+		{
+			GiNaC::ex inner = GiNaC::diff(args.op(i), s);
+			if (GiNaC::is_zero(inner))
+				continue;
+			if (sp.derived_by_arg < 0)
 			{
-				argvect.push_back(args.op(i));
-			}
-			for (unsigned int i = 0; i < args.nops(); i++)
-			{
-				GiNaC::ex inner = GiNaC::diff(args.op(i), s);
-				if (!GiNaC::is_zero(inner))
+				std::pair<bool, GiNaC::ex> symderiv = func->_get_symbolic_derivative(argvect, sp.retindex, i);
+				if (symderiv.first)
 				{
-					std::pair<bool, GiNaC::ex> symderiv = func->_get_symbolic_derivative(argvect, sp.retindex, i);
-					if (symderiv.first)
-					{
-						res += inner * symderiv.second;
-					}
-					else
-					{
-						res += inner * GiNaCMultiRetCallback(pyoomph::MultiRetCallback(sp.code, sp.invok, sp.retindex, i));
-					}
+					res += inner * symderiv.second;
+				}
+				else
+				{
+					res += inner * GiNaCMultiRetCallback(pyoomph::MultiRetCallback(sp.code, sp.invok, sp.retindex, i));
 				}
 			}
-			return res;
+			else
+			{
+				// Only the j<=k half is ever asked for or stored, matching the canonicalisation done by
+				// the MultiRetCallback constructor and the symmetry the callback's tensor must have.
+				const int j_arg = std::min(sp.derived_by_arg, (int)i);
+				const int k_arg = std::max(sp.derived_by_arg, (int)i);
+				std::pair<bool, GiNaC::ex> symderiv2 = func->_get_symbolic_second_derivative(argvect, sp.retindex, j_arg, k_arg);
+				if (symderiv2.first)
+				{
+					res += inner * symderiv2.second;
+				}
+				else
+				{
+					if (sp.code)
+						sp.code->register_multi_ret_second_derivative(sp.invok);
+					res += inner * GiNaCMultiRetCallback(pyoomph::MultiRetCallback(sp.code, sp.invok, sp.retindex, j_arg, k_arg));
+				}
+			}
 		}
+		return res;
 	}
 
 	// Custom substitution: applies `m` to the callback's invocation arguments; if that substitution
@@ -11352,7 +11530,7 @@ namespace GiNaC
 		}
 		else
 		{
-			return GiNaCMultiRetCallback(pyoomph::MultiRetCallback(sp.code, invok, sp.retindex, sp.derived_by_arg));
+			return GiNaCMultiRetCallback(pyoomph::MultiRetCallback(sp.code, invok, sp.retindex, sp.derived_by_arg, sp.derived_by_arg2));
 		}
 	}
 

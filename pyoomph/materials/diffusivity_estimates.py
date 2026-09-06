@@ -386,7 +386,8 @@ def thermodynamic_factor_matrix_finite_difference(mixture: "MixtureLiquidPropert
 
     This is the branch for multi-return activity coefficients, which cannot be differentiated
     symbolically at all: their derivatives exist only while the Jacobian code is generated, from the
-    expanded node, and only to first order. Differentiating the unexpanded invocation raises
+    expanded node (to first and second order, so an analytic Hessian is fine, but only
+    there). Differentiating the unexpanded invocation raises
     (``python_multi_cb_function``'s partial derivative in ``src/expressions.cpp``); before that error
     existed it built a node that no printer could render, and the failure surfaced only as a C file
     the compiler rejects.
