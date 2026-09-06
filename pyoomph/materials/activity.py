@@ -487,6 +487,11 @@ class UNIFACMultiReturnExpression(CustomMultiReturnExpression):
             self.thetas_pure[c.name]=self.unifac_mix.generate_ln_residual_thetas(c, True)            
         
         self.molefraction_limit_epsilon=1e-9
+        #: Emit the exact Jacobian into the generated C instead of ending it with
+        #: FILL_MULTI_RET_JACOBIAN_BY_FD. Exact rather than accurate to about sqrt(epsilon), and one
+        #: pass instead of one full model evaluation per argument - at the price of a longer C file
+        #: and a longer compile. Set it to False to get the finite-differenced Jacobian back.
+        self.analytic_c_jacobian:bool=True
     
     def get_num_returned_scalars(self, nargs: int) -> int:
         if nargs!=len(self.argument_order)+(1 if self._constant_temperature_in_K is None else 0):
@@ -494,6 +499,11 @@ class UNIFACMultiReturnExpression(CustomMultiReturnExpression):
         return len(self.argument_order_with_passive)
     
     def generate_c_code(self) -> str:
+        if self.analytic_c_jacobian:
+            return self._generate_c_code_analytic()
+        return self._generate_c_code_fd()
+
+    def _generate_c_code_fd(self) -> str:
         #static void multi_ret_ccode_0(int flag, double *arg_list, double *result_list, double *derivative_matrix,int nargs,int nret)
         T_index=len(self.argument_order)    
         reduced_rs=numpy.array(self.rs)
@@ -623,6 +633,173 @@ class UNIFACMultiReturnExpression(CustomMultiReturnExpression):
             """
         return res
     
+    def _generate_c_code_analytic(self) -> str:
+        """The same model as :py:meth:`_generate_c_code_fd`, emitted together with its exact Jacobian.
+
+        The finite-difference variant re-evaluates the whole UNIFAC model once per argument and is
+        accurate to about sqrt(epsilon); this propagates the derivatives alongside the value through
+        the very same expressions in a single pass, so it is both cheaper and exact. The bookkeeping
+        is done by CDual/CDualExpressionGenerator, which are the same ones AIOMFAC uses - see
+        pyoomph.materials.activity_electrolyte.
+
+        The mole fractions the model is written in are not the arguments themselves: they are
+        clipped away from 0 and 1 and rescaled when they sum to more than one. That mapping is
+        piecewise, so it cannot be resolved while generating code. The Jacobian is therefore emitted
+        with respect to the clipped mole fractions and pushed through the mapping by a short runtime
+        loop at the end - see the chain rule spelled out there.
+        """
+        from .activity_electrolyte import CDual, CExpr, CDualExpressionGenerator, _c
+
+        T_index=len(self.argument_order)
+        nret=len(self.argument_order_with_passive)
+        nargs=T_index+(0 if self._constant_temperature_in_K is not None else 1)
+        expo=self.server.modified_volume_fraction_exponent
+        groups=list(self._allgroups.keys())
+        ng=len(groups)
+
+        gen=CDualExpressionGenerator(nargs,None,prefix="unifac")
+
+        # A constant folds to a Python float here rather than to C text, which is what keeps the
+        # temperature-independent part of the model out of the generated file entirely.
+        def sub(x:Any)->Any:
+            return gen.subexpression(x) if isinstance(x,(CDual,CExpr)) else x
+        def ln(x:Any)->Any:
+            return gen.ln(x) if isinstance(x,(CDual,CExpr)) else float(numpy.log(x))
+        def exp(x:Any)->Any:
+            return gen.exp(x) if isinstance(x,(CDual,CExpr)) else float(numpy.exp(x))
+        def is_zero(x:Any)->bool:
+            return not isinstance(x,(CDual,CExpr)) and float(x)==0.0
+        def add_all(terms:list[Any])->Any:
+            out=terms[0]
+            for t in terms[1:]:
+                out=out+t
+            return out
+
+        molefracs=[gen._seed(i,"molefracs["+str(i)+"]") for i in range(T_index)]
+        T:Any=self._constant_temperature_in_K if self._constant_temperature_in_K is not None \
+            else gen._seed(T_index,"arg_list["+str(T_index)+"]")
+
+        # sum_i coeff_i*x_i over all components, with the passive one eliminated by x_p=1-sum(x)
+        def reduced_sum(coeffs:Sequence[float])->Any:
+            out:Any=coeffs[-1]
+            for i in range(T_index):
+                if coeffs[i]!=coeffs[-1]:
+                    out=out+(coeffs[i]-coeffs[-1])*molefracs[i]
+            return out
+
+        V=sub(reduced_sum(self.rs))
+        F=sub(reduced_sum(self.qs))
+        F_over_V=sub(F/V)
+        if expo!=1:
+            rs_exp=[float(numpy.power(r,expo)) for r in self.rs]
+            V_exp=sub(reduced_sum(rs_exp))
+        else:
+            rs_exp=list(self.rs)
+            V_exp=V
+
+        # ln_combinatorial
+        Z=self.server.coordination_number
+        ln_gamma:list[Any]=[]
+        for i,c in enumerate(self.argument_order_with_passive):
+            V_over_F=sub((self.rs[i]/self.qs[i])*F_over_V)
+            r_over_V=sub(rs_exp[i]/V_exp)
+            ln_gamma.append(1.0-r_over_V+ln(r_over_V)-Z/2.0*self.qs[i]*(1.0-V_over_F+ln(V_over_F)))
+
+        # The group fractions Thetas at this composition
+        thetas:list[Any]=[sub(reduced_sum([self._nu[c][sgn] for c in self.argument_order_with_passive]))
+                          for sgn in groups]
+        theta_denom=sub(add_all(thetas))
+        thetas=[sub(t/theta_denom*self._group_Qs[g]) for t,g in zip(thetas,groups)]
+        theta_denom=sub(add_all(thetas))
+        thetas=[sub(t/theta_denom) for t in thetas]
+
+        # Interaction table. With a fixed temperature this is entirely constant.
+        interact:list[list[Any]]=[]
+        for gi in groups:
+            row:list[Any]=[]
+            for gj in groups:
+                arg:Any=0.0
+                if self._As[gi][gj]!=0:
+                    arg=arg+self._As[gi][gj]/T
+                if self._Bs[gi][gj]!=0:
+                    arg=arg+self._Bs[gi][gj]
+                if self._Cs[gi][gj]!=0:
+                    arg=arg+self._Cs[gi][gj]*T
+                row.append(sub(exp(-arg)))
+            interact.append(row)
+
+        denomM=[sub(add_all([thetas[m]*interact[m][mi] for m in range(ng)])) for mi in range(ng)]
+
+        def GammaKPart(k:int,theta:list[Any],denoms:list[Any])->Any:
+            logarg=add_all([theta[m]*interact[m][k] for m in range(ng) if not is_zero(theta[m])])
+            linarg=add_all([theta[m]*interact[k][m]/denoms[m] for m in range(ng) if not is_zero(theta[m])])
+            return ln(logarg)+linarg
+
+        Gamma=[sub(GammaKPart(k,thetas,denomM)) for k in range(ng)]
+
+        results:list[Any]=[]
+        for i,c in enumerate(self.argument_order_with_passive):
+            thetas_pure=[self.thetas_pure[c][g] for g in groups]
+            denomMpure=[sub(add_all([thetas_pure[m]*interact[m][mi] for m in range(ng)
+                                     if thetas_pure[m]!=0])) for mi in range(ng)]
+            terms=[ln_gamma[i]]
+            for k,g in enumerate(groups):
+                if self._nu[c][g]>0:
+                    terms.append(self._nu[c][g]*self._group_Qs[g]
+                                 *(sub(GammaKPart(k,thetas_pure,denomMpure))-Gamma[k]))
+            # named, so that the exponential and its argument are computed once instead of
+            # being pasted out again in every row of the Jacobian
+            results.append(sub(exp(add_all(terms))))
+
+        lines=["// Make sure the mole fractions are normalized",
+               "PYOOMPH_AQUIRE_ARRAY(double, molefracs,"+str(T_index)+");",
+               # molefrac_clip is the clipped but not yet rescaled mole fraction and molefrac_free
+               # says whether the clip was active, i.e. whether the argument still moves it. Both
+               # are only needed for the chain rule at the end.
+               "PYOOMPH_AQUIRE_ARRAY(double, molefrac_clip,"+str(T_index)+");",
+               "PYOOMPH_AQUIRE_ARRAY(double, molefrac_free,"+str(T_index)+");",
+               "const double molefraction_limit_epsilon="+str(self.molefraction_limit_epsilon)+";",
+               "double molar_sum=0.0;",
+               "for (int i=0;i<"+str(T_index)+";i++)",
+               "{",
+               "    if (arg_list[i]<molefraction_limit_epsilon) { molefrac_clip[i]=molefraction_limit_epsilon; molefrac_free[i]=0.0; }",
+               "    else if (arg_list[i]>1.0-molefraction_limit_epsilon) { molefrac_clip[i]=1.0-molefraction_limit_epsilon; molefrac_free[i]=0.0; }",
+               "    else { molefrac_clip[i]=arg_list[i]; molefrac_free[i]=1.0; }",
+               "    molar_sum+=arg_list[i];",
+               "}",
+               # molefracs[i] = chain_A*molefrac_clip[i], and d(chain_A)/d(arg_list[j]) = -chain_B
+               # for every j, because molar_sum is the plain sum of the arguments.
+               "double chain_A=1.0, chain_B=0.0;",
+               "if (molar_sum>1.0-molefraction_limit_epsilon)",
+               "{",
+               "    chain_A=(1.0-molefraction_limit_epsilon)/molar_sum;",
+               "    chain_B=(1.0-molefraction_limit_epsilon)/(molar_sum*molar_sum);",
+               "}",
+               "for (int i=0;i<"+str(T_index)+";i++) molefracs[i]=chain_A*molefrac_clip[i];"]
+        lines+=gen.lines
+        for i,r in enumerate(results):
+            lines.append("result_list["+str(i)+"] = "+_c(r.value if isinstance(r,CDual) else r)+";")
+        lines.append("if (flag)")
+        lines.append("{")
+        for i,r in enumerate(results):
+            for j in range(nargs):
+                g=r.grad[j] if isinstance(r,CDual) else 0.0
+                lines.append("    derivative_matrix["+str(i*nargs+j)+"] = "+_c(g)+";")
+        if T_index>0:
+            # So far the columns hold d(result)/d(molefracs). With
+            #   molefracs[i] = chain_A*molefrac_clip[i],  d molefracs[i]/d arg_list[j]
+            #     = chain_A*molefrac_free[j]*delta_ij - chain_B*molefrac_clip[i]
+            # the chain rule collapses to one dot product per result. The temperature column, if
+            # there is one, is already with respect to its argument and stays untouched.
+            lines+=["    for (int i=0;i<"+str(nret)+";i++)",
+                    "    {",
+                    "        double dot=0.0;",
+                    "        for (int k=0;k<"+str(T_index)+";k++) dot += derivative_matrix[i*"+str(nargs)+"+k]*molefrac_clip[k];",
+                    "        for (int j=0;j<"+str(T_index)+";j++) derivative_matrix[i*"+str(nargs)+"+j] = chain_A*molefrac_free[j]*derivative_matrix[i*"+str(nargs)+"+j] - chain_B*dot;",
+                    "    }"]
+        lines.append("}")
+        return "\n            ".join(lines)+"\n            "
+
     def eval(self, flag: int, arg_list: NPFloatArray, result_list: NPFloatArray, derivative_matrix: NPFloatArray) -> None:
        # print("CALLED WITH",arg_list)
         V=0
