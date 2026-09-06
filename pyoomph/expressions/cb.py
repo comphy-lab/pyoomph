@@ -539,6 +539,17 @@ class CustomMultiReturnExpression(_pyoomph.CustomMultiReturnExpression):
     # usual arg_list/result_list/derivative_matrix/nargs/nret:
     #   second_derivative_tensor[(i*nargs + j)*nargs + k] = d^2 result[i] / d arg[j] d arg[k]
     # which has to be filled symmetrically in j and k.
+    #
+    # This body has to fill result_list and derivative_matrix as well, and they arrive UNSET: it is
+    # a separate function, not a continuation of generate_c_code(), so nothing has run that body
+    # yet. Unless the second derivatives are cheaper to get alongside the value, open with
+    #   CURRENT_MULTIRET_FUNCTION(PYOOMPH_MULTIRET_FLAG_DERIVATIVES, arg_list, result_list, derivative_matrix, nargs, nret);
+    # which calls this callback's own generate_c_code() function - the macro is defined around both
+    # functions for exactly this. Forgetting it does not fail to compile and does not warn: the
+    # Hessian is then built on an uninitialised value and Jacobian, and only a Hessian-vs-finite-
+    # difference check (Problem.debug_analytic_hessian_by_fd) tells you. The default
+    # FILL_MULTI_RET_HESSIAN_BY_FD body below starts with that same call.
+    #
     # Only consulted for a callback that also has generate_c_code(): with no C implementation at
     # all there is no generated function to put this in, and everything - values, Jacobian and
     # second derivatives alike - goes back into Python through eval()/eval_second_derivatives().
