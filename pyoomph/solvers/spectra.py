@@ -218,8 +218,10 @@ class SpectraEigenSolver(GenericEigenSolver):
                 # still applies its own mtype -2 guard on the diagonal.
                 return PardisoInvOp(A,None,None,mode=mode),complex_op
             except Exception as e:
-                # Not just an ImportError: pyoomph.solvers.pardiso imports perfectly well without MKL
-                # and only fails when the shared library is actually loaded, which happens here.
+                # Deliberately not just ImportError. Missing MKL does raise at import - solvers/pardiso
+                # loads libmkl_rt at module level and raises RuntimeError("Pardiso not found") there,
+                # which is also what makes _have_pardiso() in pyoomph/__init__.py an honest probe - but
+                # a Pardiso that imports can still fail here, on the factorisation itself.
                 if not quiet:
                     print("Spectra: MKL Pardiso is not usable ("+str(e)+"), factorising with SuperLU instead")
         return _SpluInvOp(A),complex_op

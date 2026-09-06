@@ -415,7 +415,7 @@ class GenericLinearSystemSolver:
 		msg=("NOTE: the linear solver '"+str(getattr(self,"idname",type(self).__name__))+"' is not "
 			 "MPI-parallel, so the assembled system ("+str(n)+" dofs) is gathered onto rank 0 and solved "
 			 "there while the other "+str(get_mpi_nproc()-1)+" rank(s) wait. Assembly stays parallel; the "
-			 "solve does not scale. Use petsc_mumps for a genuinely distributed solve.")
+			 "solve does not scale. Use petsc_mumps or mumps for a genuinely distributed solve.")
 		# Freeing the other cores only helps if rank 0 is allowed to use them, and Open MPI binds by
 		# core at -n 2 and by socket above it. pyoomph cannot change that from inside the process:
 		# binding is applied by mpirun before exec.

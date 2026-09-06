@@ -303,6 +303,23 @@ def _have_pardiso() -> bool:
 		return False
 
 
+# Why the standalone MUMPS was not taken, for _warn_suboptimal_solver() to quote. Two different
+# things to fix hide behind "not available": the pyoomph_mumps package is not installed at all, or it
+# is installed but was built with the other MPI setting than pyoomph, which solvers/mumps.py refuses
+# at import time rather than letting the two MPI stubs collide.
+_mumps_unavailable_reason:Optional[str]=None
+
+def _have_mumps() -> bool:
+	global _mumps_unavailable_reason
+	try:
+		from .solvers.mumps import MumpsLinearSolver #type:ignore
+		_mumps_unavailable_reason=None
+		return True
+	except BaseException as e:
+		_mumps_unavailable_reason="%s: %s"%(type(e).__name__,e)
+		return False
+
+
 def _have_spectra() -> bool:
 	try:
 		from .solvers.spectra import SpectraEigenSolver
@@ -357,6 +374,13 @@ def _set_petsc_mumps_linear_solver() -> bool:
 	return True
 
 
+def _set_mumps_linear_solver() -> bool:
+	if not _have_mumps():
+		return False
+	set_default_linear_solver("mumps")
+	return True
+
+
 def _set_superlu_linear_fallback() -> None:
 	from .solvers.scipy import SuperLUSerial #type:ignore
 	set_default_linear_solver("superlu")
@@ -374,9 +398,14 @@ def _warn_suboptimal_solver(name:str) -> None:
 	# same sentence as one that was never there, and the difference decides whether the reader should
 	# go and install something or go and fix an environment variable.
 	why=("\nPETSc/MUMPS was not used because "+_petsc_mumps_unavailable_reason) if _petsc_mumps_unavailable_reason else ""
+	# Same argument for the standalone MUMPS, which is tried just before this warning is reached: a
+	# pyoomph_mumps that is installed but built with the other MPI setting is a one-line rebuild, and
+	# reads identically to not having it at all unless the reason is quoted.
+	why+=("\nThe standalone MUMPS ('mumps', from the pyoomph_mumps package) was not used because "+_mumps_unavailable_reason) if _mumps_unavailable_reason else ""
 	warnings.warn(
 		"pyoomph is falling back to the '"+name+"' solver, since no better solver was found. For better performance, consider "
-		"installing "+suggestion+" -- see https://pyoomph.readthedocs.io/en/latest/tutorial/installation/ for "
+		"installing "+suggestion+" or the pyoomph_mumps package -- see "
+		"https://pyoomph.readthedocs.io/en/latest/tutorial/installation/ for "
 		"instructions."+why,
 		RuntimeWarning,
 		stacklevel=2,
@@ -399,8 +428,9 @@ def _warn_no_mpi_capable_solver(name:str) -> None:
 		"pyoomph is running with multiple MPI processes, but no distributed direct solver was found, so "
 		"'"+name+"' will be used. It is not MPI-parallel: the assembled system is gathered onto rank 0 and "
 		"solved there while the other ranks wait, so the assembly scales but the solve does not, and rank 0 "
-		"needs the whole matrix in memory. Install PETSc/SLEPc with MUMPS support for a genuinely "
-		"distributed solve (then --petsc_mumps / the automatic default applies) -- see "
+		"needs the whole matrix in memory. Install PETSc/SLEPc with MUMPS support, or the pyoomph_mumps "
+		"package, for a genuinely distributed solve (then --petsc_mumps / --mumps / the automatic "
+		"default applies) -- see "
 		"https://pyoomph.readthedocs.io/en/latest/tutorial/installation/petscslepc.html",
 		RuntimeWarning,
 		stacklevel=2,
@@ -409,37 +439,48 @@ def _warn_no_mpi_capable_solver(name:str) -> None:
 
 # Under MPI (mpirun -n N, N>1) the platform-preferred serial solvers still work -- the base solver class
 # gathers the system onto rank 0 for them -- but they do not scale: only the assembly is parallel.
-# PETSc+MUMPS is the only distributed-capable direct solver pyoomph ships, so it becomes the default
-# whenever it is present, regardless of platform. Falls through to the normal serial cascade (with a
-# warning saying what that costs) if it is missing.
-if _running_under_mpi() and _set_petsc_mumps_linear_solver():
+# PETSc+MUMPS and the standalone MUMPS ("mumps", from the separate pyoomph_mumps package) are the two
+# distributed-capable direct solvers pyoomph ships, so one of them becomes the default whenever it is
+# present, regardless of platform. PETSc first only because it has been the MPI default all along and
+# an existing installation should not change solver under anybody; both factorise distributed.
+# Falls through to the normal serial cascade (with a warning saying what that costs) if neither is
+# there.
+#
+# In the serial cascades below, "mumps" sits after the platform's preferred choice and BEFORE
+# accelerate/superlu: it is a real sparse direct solver with its own ordering and out-of-core-capable
+# working space, so it beats both, and unlike petsc_mumps it needs no PETSc stack.
+if _running_under_mpi() and (_set_petsc_mumps_linear_solver() or _set_mumps_linear_solver()):
 	pass
 elif _is_macos and _is_arm64:
 	if not _set_petsc_mumps_linear_solver():
-		if _set_accelerate_linear_solver():
-			_warn_suboptimal_solver("accelerate")
-		else:
-			_set_superlu_linear_fallback()
-			_warn_suboptimal_solver("superlu")
-elif _is_macos:
-	if not _set_pardiso_linear_solver():
-		if not _set_petsc_mumps_linear_solver():
+		if not _set_mumps_linear_solver():
 			if _set_accelerate_linear_solver():
 				_warn_suboptimal_solver("accelerate")
 			else:
 				_set_superlu_linear_fallback()
 				_warn_suboptimal_solver("superlu")
+elif _is_macos:
+	if not _set_pardiso_linear_solver():
+		if not _set_petsc_mumps_linear_solver():
+			if not _set_mumps_linear_solver():
+				if _set_accelerate_linear_solver():
+					_warn_suboptimal_solver("accelerate")
+				else:
+					_set_superlu_linear_fallback()
+					_warn_suboptimal_solver("superlu")
 else:
 	if not _set_pardiso_linear_solver():
 		if not _set_petsc_mumps_linear_solver():
-			_set_superlu_linear_fallback()
-			_warn_suboptimal_solver("superlu")
+			if not _set_mumps_linear_solver():
+				_set_superlu_linear_fallback()
+				_warn_suboptimal_solver("superlu")
 
 
-# Eigensolver default: SLEPc with MUMPS first, then Spectra, then Pardiso, then ARPACK (i.e. what
-# --arpack selects, scipy's ARPACK, rather than the ARPACK shipped with Pardiso). Accelerate stays
-# ahead of scipy on macOS, where it is the platform-native option and the only fast one left once
-# Pardiso is out - on arm64 Macs there is no MKL at all.
+# Eigensolver default: SLEPc with MUMPS first, then Spectra with whichever direct factorisation is
+# available (MKL Pardiso if there is one, else MUMPS via pyoomph_mumps, else scipy's SuperLU), then
+# Pardiso, then ARPACK (i.e. what --arpack selects, scipy's ARPACK, rather than the ARPACK shipped
+# with Pardiso). Accelerate stays ahead of scipy on macOS, where it is the platform-native option and
+# the only fast one left once Pardiso is out - on arm64 Macs there is no MKL at all.
 #
 # Spectra outranks Pardiso because "pardiso" and "accelerate" are scipy's ARPACK with a different
 # factorisation behind it, and that backend raises on any target at all. Spectra targets both real and
@@ -456,6 +497,17 @@ else:
 def _autodetect_eigen_solver() -> CoreEigenSolverEnum:
 	if _have_petsc_mumps():
 		return "slepc_mumps"
+	# Spectra is compiled into pyoomph, so _have_spectra() is true on every build and the interesting
+	# question below it is not WHICH eigensolver but which factorisation of J - sigma*M it gets: the
+	# Arnoldi iteration is Spectra's either way, and the factorisation is the whole cost. "spectra"
+	# uses MKL Pardiso and falls back to scipy's SuperLU, "mumps" (MumpsSpectraEigenSolver, from the
+	# separate pyoomph_mumps package) always uses MUMPS. So MUMPS is worth taking exactly when MKL is
+	# not there - between the two Spectra backends, not after them, since a rung below "spectra" could
+	# never be reached.
+	if _have_spectra() and _have_pardiso():
+		return "spectra"
+	if _have_mumps():
+		return "mumps"
 	if _have_spectra():
 		return "spectra"
 	if _have_pardiso():
@@ -469,7 +521,10 @@ set_default_eigen_solver_resolver(_autodetect_eigen_solver)
 if _running_under_mpi():
 	from .solvers.generic import get_default_linear_solver as _get_default_linear_solver
 	_chosen=_get_default_linear_solver()
-	if _chosen not in ("petsc_mumps","petsc"):
+	# "mumps" belongs here as much as the PETSc ones: MumpsLinearSolver sets
+	# solves_natively_distributed and hands MUMPS each rank's own row block (ICNTL(18)=3), so warning
+	# that the solve is not parallel would be false.
+	if _chosen not in ("petsc_mumps","petsc","mumps"):
 		from .generic.mpi import get_mpi_rank as _get_mpi_rank #type:ignore
 		if _get_mpi_rank()==0:  # one warning per run, not one per rank
 			_warn_no_mpi_capable_solver(str(_chosen))
