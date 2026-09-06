@@ -443,6 +443,26 @@ namespace pyoomph
 		// Set while a speculative unit split is performed, i.e. when a failure is an expected outcome rather than an error
 		// (see decidable_condition_sign). It only silences the diagnostics below, the return value is unaffected.
 		static bool quiet_unit_collection = false;
+
+		// True if any registered base unit occurs anywhere in "e". Done as a single traversal: asking
+		// has(e, bu) per base unit walks the whole expression once for each of the ~50 registered
+		// units, and since collect_base_units() asks this at every function node it meets, that made
+		// the unit analysis quadratic in the size of a large residual.
+		static bool contains_base_unit(const GiNaC::ex &e)
+		{
+			for (GiNaC::const_preorder_iterator i = e.preorder_begin(); i != e.preorder_end(); ++i)
+			{
+				if (!GiNaC::is_a<GiNaC::symbol>(*i))
+					continue;
+				for (auto &bu : base_units)
+				{
+					if (i->is_equal(bu.second))
+						return true;
+				}
+			}
+			return false;
+		}
+
 		bool collect_base_units(GiNaC::ex arg, GiNaC::ex &factor, GiNaC::ex &units, GiNaC::ex &rest)
 		{
 			if (pyoomph_verbose)
@@ -731,15 +751,7 @@ namespace pyoomph
 					// in place (factor*units folded back into the argument) since we cannot know how the function combines
 					// its arguments dimensionally.
 					// Test if there are units left in the function args
-					bool units_left = false;
-					for (auto &bu : base_units)
-					{
-						if (GiNaC::has(cl, bu.second))
-						{
-							units_left = true;
-							break;
-						}
-					}
+					bool units_left = contains_base_unit(cl);
 					if (!units_left)
 					{
 						rest *= cl;
@@ -863,12 +875,8 @@ namespace pyoomph
 			// TODO Check the rest for missing units
 			// Sanity check: "rest" must end up truly dimensionless -- if any base unit symbol still occurs in it, something
 			// above failed to fully factor out the units, so report failure rather than return an inconsistent split
-			for (auto &bu : base_units)
-			{
-				//		if (bu.second==cl.op(i))  {units*=cl.op(i); found=true; break;}
-				if (GiNaC::has(rest, bu.second))
-					return false;
-			}
+			if (contains_base_unit(rest))
+				return false;
 
 			// Check whether the factor is positive, try to go for the positive one
 			//std::cout << "FACTOR " << factor << std::endl;
@@ -2104,7 +2112,12 @@ namespace pyoomph
 				return wrapped; // Simplify these
 			else
 			{
-				GiNaC::ex evm = wrapped.evalm();
+				// evalm() is only used to find out whether the argument is (or evaluates to) a matrix - the scalar
+				// branch below re-wraps the original expression. evalm() rebuilds the entire tree, which expands the
+				// shared subtrees of a DAG into separate copies, so calling it on every nested subexpression() blows
+				// up exponentially. Everything that can produce a matrix here (matrix literals, grad, unitvect,
+				// inverse_matrix, ...) reports a noncommutative return type, so a commutative argument can skip it.
+				GiNaC::ex evm = (wrapped.return_type() == GiNaC::return_types::commutative ? wrapped : wrapped.evalm());
 				if (GiNaC::is_a<GiNaC::matrix>(evm))
 				{
 					GiNaC::matrix inp = GiNaC::ex_to<GiNaC::matrix>(evm);
@@ -2281,29 +2294,42 @@ namespace pyoomph
 		// GiNaC map_function that walks an expression tree and, for every subexpression(x) leaf found, checks whether x has
 		// a nonzero imaginary part; if so, replaces that single subexpression() by a pair
 		// subexpression(real_part(x)) + I*subexpression(imag_part(x)), so that downstream real-only code generation can
-		// handle the real and imaginary contributions as two separate named subexpressions
+		// handle the real and imaginary contributions as two separate named subexpressions.
+		// The argument of a subexpression() is descended into exactly once and the result is reused: mapping it a second
+		// time doubles the work per nesting level, and since rebuilding a subexpression() re-triggers subexpression_eval()
+		// (which calls evalm() over the whole argument), nested subexpressions otherwise blow up exponentially. Results are
+		// additionally memoised, so a subtree shared by several parents is only walked once.
 		class SubExpressionsToRealAndImag : public GiNaC::map_function
 		{
+		protected:
+			GiNaC::exmap cache;
 		public:
 			GiNaC::ex operator()(const GiNaC::ex & inp) override
 			{
+				GiNaC::exmap::const_iterator found = cache.find(inp);
+				if (found != cache.end())
+					return found->second;
+				GiNaC::ex result;
 				if (is_ex_the_function(inp, expressions::subexpression))
 				{
 					GiNaC::ex mapped_ex = inp.op(0).map(*this);
 					if (GiNaC::is_zero(GiNaC::imag_part(mapped_ex)))
 					{
-						return inp.map(*this);
+						// Purely real: keep the subexpression() wrapping, but do not rebuild it when nothing changed
+						result = (mapped_ex.is_equal(inp.op(0)) ? inp : pyoomph::expressions::subexpression(mapped_ex));
 					}
 					else
 					{
-						return (pyoomph::expressions::subexpression(GiNaC::real_part(mapped_ex)) + GiNaC::I * pyoomph::expressions::subexpression(GiNaC::imag_part(mapped_ex))).map(*this);
+						// mapped_ex is already fully processed, so the split pair must not be mapped again
+						result = pyoomph::expressions::subexpression(GiNaC::real_part(mapped_ex)) + GiNaC::I * pyoomph::expressions::subexpression(GiNaC::imag_part(mapped_ex));
 					}
-
 				}
-				else 
+				else
 				{
-					return inp.map(*this);
+					result = inp.map(*this);
 				}
+				cache[inp] = result;
+				return result;
 			}
 		};
 
@@ -4019,8 +4045,56 @@ namespace pyoomph
 			return python_multi_cb_indexed_result(func, index).hold();
 		}
 
+		// A multi-return callback is real by construction: the ABI hands it a double* and takes a
+		// double* back, so it can neither receive nor return an imaginary part. Without saying so,
+		// GiNaC's defaults treat the node as possibly complex and leave real_part(...) unevaluated
+		// while imag_part(...) does not collapse to zero. Taking a real part DISTRIBUTES over
+		// products and sums, so
+		//     real_part(F*u)  ->  real_part(F)*real_part(u) - imag_part(F)*imag_part(u)
+		// kept a spurious imag_part(F) factor and real_part could not be moved across a callback.
+		//
+		// Same defect absolute() and signum() above had, same triple as the answer. It also makes
+		// this node agree with the EXPANDED one it is rewritten into for code generation:
+		// GiNaCMultiRetCallback is a pyginacstruct, whose real_part()/imag_part()/conjugate()
+		// already return itself/0/itself.
+		//
+		// Scope, measured rather than assumed: no azimuthal or Cartesian normal-mode result depends
+		// on this today. That expansion does not route the residual through GiNaC's real_part - it
+		// derives two separate named residual contributions by expansion mode - and a user-written
+		// real_part() reaches the expanded node before anything is printed. An m=1 sweep over
+		// sqrt(F), subexpression(1/sqrt(F)), F^(3/2), absolute(F), real_part(F*u) and imag_part(F*u),
+		// with and without a moving mesh, gave byte-identical eigenvalues with and without these
+		// hooks. They close the symbolic gap; they do not repair a wrong number.
+		//
+		// Only the indexed result is registered: it is the scalar that appears in a residual.
+		// python_multi_cb_function evaluates to a GiNaC::lst of every return value, and a real part
+		// of a list is not a thing anyone forms.
+		static bool python_multi_cb_indexed_result_info(const ex &func, const ex &index, unsigned inf)
+		{
+			return inf == info_flags::real;
+		}
+
+		static ex python_multi_cb_indexed_result_real_part(const ex &func, const ex &index)
+		{
+			return python_multi_cb_indexed_result(func, index);
+		}
+
+		static ex python_multi_cb_indexed_result_imag_part(const ex &func, const ex &index)
+		{
+			return 0;
+		}
+
+		static ex python_multi_cb_indexed_result_conjugate(const ex &func, const ex &index)
+		{
+			return python_multi_cb_indexed_result(func, index);
+		}
+
 		REGISTER_FUNCTION(python_multi_cb_indexed_result, eval_func(python_multi_cb_indexed_result_eval).derivative_func(python_multi_cb_indexed_result_deriv).expl_derivative_func(python_multi_cb_indexed_result_expl_deriv) //.evalf_func(python_cb_function_evalf).print_func<print_csrc_float>(python_cb_function_csrc_float).print_func<print_csrc_double>(python_cb_function_csrc_float)
 																										 //            .print_func<print_python>(python_cb_function_print_python)
+																										 .info_func(python_multi_cb_indexed_result_info)
+																										 .real_part_func(python_multi_cb_indexed_result_real_part)
+																										 .imag_part_func(python_multi_cb_indexed_result_imag_part)
+																										 .conjugate_func(python_multi_cb_indexed_result_conjugate)
 		)
 
 		// The following ginac_*() placeholders each stay held until "need_to_hold" is false (i.e. all pyoomph placeholders

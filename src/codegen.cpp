@@ -826,6 +826,16 @@ namespace pyoomph
 	// cancelled symbolically by GiNaC outside of the subexpression boundary.
 	GiNaC::ex DrawUnitsOutOfSubexpressions::operator()(const GiNaC::ex &inp)
 	{
+		GiNaC::exmap::const_iterator cached = cache.find(inp);
+		if (cached != cache.end())
+			return cached->second;
+		GiNaC::ex result = this->do_map(inp);
+		cache[inp] = result;
+		return result;
+	}
+
+	GiNaC::ex DrawUnitsOutOfSubexpressions::do_map(const GiNaC::ex &inp)
+	{
 		//	std::cout << "INP " <<inp << std::endl;
 		if (is_ex_the_function(inp, expressions::subexpression))
 		{
@@ -857,7 +867,10 @@ namespace pyoomph
 		else if (is_ex_the_function(inp, expressions::Diff))
 		{
 			GiNaC::ex factor, unit, rest;
-			GiNaC::ex arg = inp.map(*this).op(0); // Descent recursively through nested subexpressions
+			// Map the node once and take both operands off the result: mapping it a second time for
+			// op(1) below would walk the whole (already processed) tree again
+			GiNaC::ex mapped = inp.map(*this);
+			GiNaC::ex arg = mapped.op(0); // Descent recursively through nested subexpressions
 			if (!expressions::collect_base_units(arg, factor, unit, rest))
 			{
 				std::ostringstream oss;
@@ -868,7 +881,7 @@ namespace pyoomph
 				throw_runtime_error("Cannot extract the unit from the derivative numerator:" + oss.str());
 			}
 			GiNaC::ex factor2, unit2, rest2;
-			GiNaC::ex arg2 = inp.map(*this).op(1); // Descent recursively through nested subexpressions
+			GiNaC::ex arg2 = mapped.op(1); // Descent recursively through nested subexpressions
 			if (!expressions::collect_base_units(arg2, factor2, unit2, rest2))
 			{
 				std::ostringstream oss;
@@ -4295,12 +4308,19 @@ namespace pyoomph
 	{
 	protected:
 		FiniteElementCode *code;
+		// Results are memoised: an expression tree is a DAG, and mapping it without a cache both walks
+		// each shared subtree once per parent and rebuilds it into separate copies, which turns a
+		// subexpression()-heavy residual into an exponentially larger tree.
+		GiNaC::exmap cache;
 
 	public:
 		MeshToCoordinateShapes(FiniteElementCode *code_) : code(code_) {}
 		GiNaC::ex operator()(const GiNaC::ex &inp) override
 		{
-			std::vector<std::string> dirs{"x", "y", "z"};
+			GiNaC::exmap::const_iterator cached = cache.find(inp);
+			if (cached != cache.end())
+				return cached->second;
+			static const std::vector<std::string> dirs{"x", "y", "z"};
 			if (GiNaC::is_a<GiNaC::GiNaCShapeExpansion>(inp))
 			{
 				auto &shapeexp = (GiNaC::ex_to<GiNaC::GiNaCShapeExpansion>(inp)).get_struct();
@@ -4328,7 +4348,9 @@ namespace pyoomph
 				}
 			}
 
-			return inp.map(*this);
+			GiNaC::ex res = inp.map(*this);
+			cache[inp] = res;
+			return res;
 		}
 	};
 
@@ -5246,9 +5268,30 @@ namespace pyoomph
 		}
 		GiNaC::lst sublist;
 		__phase_timer *__t_bu = new __phase_timer("base_unit_has_loop");
+		// Which base units actually survive is settled by a single traversal. Asking expa.has(bu) per
+		// base unit walks the whole expression once per unit - and expairseq::op() rebuilds each
+		// operand as the traversal descends, so on a large residual those ~50 passes dominate
+		// add_residual.
+		std::set<std::string> surviving_units;
+		if (may_be_dimensional && !units_proven_to_cancel)
+		{
+			for (GiNaC::const_preorder_iterator i = expa.preorder_begin(); i != expa.preorder_end(); ++i)
+			{
+				if (!GiNaC::is_a<GiNaC::symbol>(*i))
+					continue;
+				for (auto &bu : base_units)
+				{
+					if (i->is_equal(bu.second))
+					{
+						surviving_units.insert(bu.first);
+						break;
+					}
+				}
+			}
+		}
 		for (auto &bu : base_units)
 		{
-			if (may_be_dimensional && !units_proven_to_cancel && expa.has(bu.second))
+			if (may_be_dimensional && !units_proven_to_cancel && surviving_units.count(bu.first))
 			{
 				// Last chance: the units may still cancel once collected
 				GiNaC::ex factor, unit, rest;

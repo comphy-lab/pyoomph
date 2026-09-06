@@ -441,10 +441,15 @@ namespace pyoomph
    {
    protected:
       FiniteElementCode *code;
+      // Results are memoised: an expression tree is a DAG, and mapping it without a cache walks each
+      // shared subtree once per parent and rebuilds it into separate copies, so a residual with many
+      // nested subexpression() markers costs exponentially much.
+      GiNaC::exmap cache;
 
    public:
       DrawUnitsOutOfSubexpressions(FiniteElementCode *code_) : code(code_) {}
       GiNaC::ex operator()(const GiNaC::ex &inp) override;
+      GiNaC::ex do_map(const GiNaC::ex &inp);
    };
 
    // GiNaC::map_function that strips expressions::subexpression(...) markers back out again (replacing
