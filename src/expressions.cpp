@@ -3877,6 +3877,81 @@ namespace pyoomph
 
 		REGISTER_FUNCTION(python_cb_function, eval_func(python_cb_function_eval).evalf_func(python_cb_function_evalf).print_func<print_csrc_float>(python_cb_function_csrc_float).print_func<print_csrc_double>(python_cb_function_csrc_float).expl_derivative_func(python_cb_function_expl_deriv).print_func<print_python>(python_cb_function_print_python).real_part_func(python_cb_function_real_part).imag_part_func(python_cb_function_imag_part))
 
+		// A multi-return callback has no symbolic derivative to hand out at this level. Its
+		// derivatives exist only during Jacobian code generation, where the EXPANDED node
+		// (GiNaCMultiRetCallback, see codegen.cpp) supplies them to first order - either from the
+		// callback's own _get_symbolic_derivative or, failing that, from the numerical Jacobian the
+		// invoked C/Python callback fills in at runtime. Code generation therefore never reaches the
+		// two functions below: SubstitutePlaceholders rewrites every python_multi_cb_function() into
+		// GiNaCMultiRetCallback nodes before the Jacobian is derived from the residual.
+		//
+		// Differentiating the UNEXPANDED invocation - which is what a diff() or symbolic_diff() from
+		// Python does - built a D[1](python_multi_cb_function)(...) node that no printer can render.
+		// The failure then surfaced only at JIT time, as a C file the compiler rejects with the
+		// callback's address printed into it, and nothing about that points back at the diff() that
+		// caused it. So raise here, where the mistake is made.
+		//
+		// These have to be the PARTIAL derivative (derivative_func), not expl_derivative_func:
+		// function::derivative() wraps the explicit one in a catch(...) and silently falls back to
+		// the chain rule, so an exception thrown there is swallowed and the bad node is built anyway.
+		// The chain rule calls pderivative() only for arguments whose own derivative is nonzero,
+		// which is exactly the right condition: differentiating with respect to something the
+		// callback never sees stays zero and raises nothing.
+
+		// The explicit derivative exists only to recognise that zero case, since the partial one is
+		// not told WHAT is being differentiated against, only which argument slot.
+		// function::derivative() tries the explicit derivative first, so returning 0 here
+		// short-circuits the chain rule entirely.
+		static ex python_multi_cb_function_expl_deriv(const ex &func, const ex &arglst, const ex &numret, const symbol &deriv_arg)
+		{
+			lst l = ex_to<lst>(arglst);
+			for (unsigned i = 0; i < l.nops(); i++)
+			{
+				if (!l.op(i).diff(deriv_arg).is_zero())
+				{
+					// Something really is being differentiated. Let the chain rule take over, which
+					// reaches the partial derivative below and raises there.
+					throw std::runtime_error("not an explicit derivative");
+				}
+			}
+			return 0;
+		}
+
+		// The index is a constant, so the whole derivative is the one of the invocation - which is
+		// either zero or raises below.
+		static ex python_multi_cb_indexed_result_expl_deriv(const ex &func, const ex &index, const symbol &deriv_arg)
+		{
+			return func.diff(deriv_arg);
+		}
+
+		// The partial derivative, reached through the chain rule only for an argument that really
+		// does depend on the differentiation variable. This is where the error belongs.
+		static ex python_multi_cb_function_deriv(const ex &func, const ex &arglst, const ex &numret, unsigned deriv_param)
+		{
+			std::ostringstream oss;
+			oss << std::endl
+				<< "happens when deriving " << python_multi_cb_function(func, arglst, numret) << std::endl
+				<< " with respect to its argument " << deriv_param;
+			throw_runtime_error("A multi-return expression cannot be differentiated symbolically. Its "
+								"derivatives are only available while the Jacobian code is generated, and only "
+								"to first order. Build the expression without a multi-return callback if you "
+								"need to differentiate it yourself - for activity coefficients, that is "
+								"set_activity_coefficients_by_unifac(..., use_multi_return=False)." +
+								oss.str());
+			return 0;
+		}
+
+		// Unreachable in practice - the chain rule differentiates the invocation first, which raises
+		// above - but registered all the same, so that no path builds a D[...](indexed_result) node.
+		static ex python_multi_cb_indexed_result_deriv(const ex &func, const ex &index, unsigned deriv_param)
+		{
+			std::ostringstream oss;
+			oss << std::endl
+				<< "happens when deriving " << python_multi_cb_indexed_result(func, index);
+			throw_runtime_error("A multi-return expression cannot be differentiated symbolically." + oss.str());
+			return 0;
+		}
+
 		// eval_func for python_multi_cb_function(func, arglst, numret): if all arguments are already numeric, immediately
 		// invokes the multi-return callback (see below) and packs the numret results into a GiNaC::lst; otherwise the call
 		// stays held (resolved later, e.g. during code generation or once the arguments become numeric)
@@ -3925,7 +4000,7 @@ namespace pyoomph
 			return python_multi_cb_function(func, arglst, numret).hold();
 		}
 
-		REGISTER_FUNCTION(python_multi_cb_function, eval_func(python_multi_cb_function_eval) //.evalf_func(python_cb_function_evalf).print_func<print_csrc_float>(python_cb_function_csrc_float).print_func<print_csrc_double>(python_cb_function_csrc_float).expl_derivative_func(python_cb_function_expl_deriv)
+		REGISTER_FUNCTION(python_multi_cb_function, eval_func(python_multi_cb_function_eval).derivative_func(python_multi_cb_function_deriv).expl_derivative_func(python_multi_cb_function_expl_deriv) //.evalf_func(python_cb_function_evalf).print_func<print_csrc_float>(python_cb_function_csrc_float).print_func<print_csrc_double>(python_cb_function_csrc_float)
 																							 //            .print_func<print_python>(python_cb_function_print_python)
 		)
 
@@ -3942,7 +4017,7 @@ namespace pyoomph
 			return python_multi_cb_indexed_result(func, index).hold();
 		}
 
-		REGISTER_FUNCTION(python_multi_cb_indexed_result, eval_func(python_multi_cb_indexed_result_eval) //.evalf_func(python_cb_function_evalf).print_func<print_csrc_float>(python_cb_function_csrc_float).print_func<print_csrc_double>(python_cb_function_csrc_float).expl_derivative_func(python_cb_function_expl_deriv)
+		REGISTER_FUNCTION(python_multi_cb_indexed_result, eval_func(python_multi_cb_indexed_result_eval).derivative_func(python_multi_cb_indexed_result_deriv).expl_derivative_func(python_multi_cb_indexed_result_expl_deriv) //.evalf_func(python_cb_function_evalf).print_func<print_csrc_float>(python_cb_function_csrc_float).print_func<print_csrc_double>(python_cb_function_csrc_float)
 																										 //            .print_func<print_python>(python_cb_function_print_python)
 		)
 
