@@ -726,7 +726,6 @@ class UNIFACMultiReturnExpression(CustomMultiReturnExpression):
         call_args=[var("molefrac_"+c,domain=domain) for c in self.argument_order]
         if self._constant_temperature_in_K is None:
             call_args.append(var("temperature",domain=domain))
-        print("CALL ARGS",call_args)
         return self.__call__(*call_args)[self.argument_order_with_passive.index(component)]
 
 

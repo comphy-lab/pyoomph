@@ -31,6 +31,7 @@ import os
 import copy
 import math
 import itertools
+import warnings
 from pathlib import Path
 from collections import OrderedDict as OrderDict
 
@@ -465,7 +466,7 @@ class MaterialProperties:
             rangs[n]=rang
         return result,unit,rangs,consts
 
-    def sample_all_properties_to_text_files(self,dirname:str,_sort:str="len",_newlines:bool=True,**kwargs:ExpressionOrNum):
+    def sample_all_properties_to_text_files(self,dirname:str,_sort:str="len",_newlines:bool=True,_skip_undefined:bool=True,**kwargs:ExpressionOrNum):
         """
         This function will sample all properties of this material to text files. You can either pass single values, e.g. ``massfrac_water=0.5,temperature=300*kelvin``, or ranges, e.g. ``massfrac_water=numpy.linspace(0,1,100),temperature=[300*kelvin,400*kelvin]``. The function will then sample all properties at these conditions and write them to text files in the given directory.
 
@@ -473,22 +474,33 @@ class MaterialProperties:
             dirname: Directory to create the text files
             _sort: How to sort the output files. Can be ``"len"`` or ``"name"`` to sort by the length of the ranges or the names of the variables, or ``"len_rev"`` or ``"name_rev"`` to sort in reverse order.
             _newlines: Add a new line after each set of values in the text files.
+            _skip_undefined: Skip properties that are not defined for this material (or that cannot be evaluated) with a warning instead of raising an error.
         """
         if not os.path.exists(dirname):
             Path(dirname).mkdir(parents=True, exist_ok=True)
         for k,v in self._output_properties.items():
             expr:"str | ExpressionOrNum"
-            if v is None:
-                expr=k # the property is the field of that name
-            elif callable(v):
-                computed=v(self)
-                if computed is None:
-                    continue
-                expr=computed
-            else:
-                expr=v
-            print("Sampling property "+k+" to text file...")
-            self.sample_property_to_text_file(os.path.join(dirname,k+".txt"),expr,_name=k,_sort=_sort,_newlines=_newlines,**kwargs)
+            try:
+                if v is None:
+                    expr=k # the property is the field of that name
+                    if not hasattr(self,expr):
+                        raise RuntimeError("Cannot find the property "+str(expr)+" in "+str(self))
+                elif callable(v):
+                    computed=v(self)
+                    if computed is None:
+                        continue
+                    expr=computed
+                else:
+                    expr=v
+                print("Sampling property "+k+" to text file...")
+                self.sample_property_to_text_file(os.path.join(dirname,k+".txt"),expr,_name=k,_sort=_sort,_newlines=_newlines,**kwargs)
+            except Exception as e:
+                if not _skip_undefined:
+                    raise
+                partial=os.path.join(dirname,k+".txt")
+                if os.path.exists(partial):
+                    os.remove(partial)
+                warnings.warn("Skipping the property "+str(k)+" of "+str(self)+", since it could not be sampled: "+str(e))
 
 
     def sample_property_to_text_file(self,fname:str,expr:str | ExpressionOrNum,_name:str | None=None,_sort:str="len",_newlines:bool=True,**kwargs:PropertySampleRangeType):
@@ -1883,6 +1895,20 @@ class PureLiquidProperties(BaseLiquidProperties):
         self._UNIFAC_groups:dict[str,dict[str,int]]={}
         #: Latent heat of evaporation of the pure liquid
         self.latent_heat_of_evaporation:ExpressionNumOrNone=None
+        #: Molar volume at the normal boiling point, e.g. by the additive Le Bas increments
+        #: (59.2*(centi*meter)**3/mol for ethanol). Used by the Wilke-Chang correlation in
+        #: :py:meth:`MixtureLiquidProperties.set_estimate_diffusivities`. When ``None``, it falls
+        #: back to :py:attr:`molar_mass`/:py:attr:`mass_density`, which is the liquid volume at room
+        #: temperature and therefore a few to ~30 percent too small for hydrogen-bonded species.
+        self.molar_volume_for_Wilke_Chang_eq:ExpressionNumOrNone=None
+        #: Association factor of the Wilke-Chang correlation, used when this liquid acts as the
+        #: solvent. When ``None``, a default is looked up by component name (2.6 water,
+        #: 1.9 methanol, 1.5 ethanol) and is 1.0 for everything else.
+        self.association_factor_for_Wilke_Chang_eq:float | None=None
+        #: Self-diffusivity of the pure liquid. Only used by the ``"darken"`` method of
+        #: :py:meth:`MixtureLiquidProperties.set_estimate_diffusivities`, which estimates it from
+        #: Stokes-Einstein with the mixture viscosity when it is not set.
+        self.self_diffusivity:ExpressionNumOrNone=None
         self._output_properties=self._output_properties.copy()
         self._output_properties["vapor_pressure_"+self.name]=lambda props : self.get_vapor_pressure_for(self.name)
 
@@ -2820,6 +2846,139 @@ class MixtureLiquidProperties(BaseLiquidProperties,BaseMixedProperties):
             if p_pure is not None:
                 gamma=self.activity_coefficients.get(c,1)
                 self.vapor_pressure_for[c]=gamma*var("molefrac_"+c)*p_pure
+
+    def set_estimate_diffusivities(self,method:Literal["vignes","stokes_einstein","darken","given"]="vignes",*,
+                                   maxwell_stefan_diffusivities:"dict[tuple[str,str],ExpressionOrNum] | None"=None,
+                                   infinite_dilution_diffusivities:"dict[tuple[str,str],ExpressionOrNum] | None"=None,
+                                   thermodynamic_factor:bool=True,
+                                   thermodynamic_factor_mode:Literal["auto","symbolic","finite_difference"]="auto",
+                                   fd_epsilon:float=1e-6,
+                                   min_thermodynamic_factor:float | None=None,
+                                   thermodynamic_factor_shift:float=0.0,
+                                   viscosity:"ExpressionOrNum | Literal['mixture','pure']"="mixture",
+                                   temperature:ExpressionNumOrNone=None,
+                                   overwrite:bool=False,
+                                   use_subexpressions:bool=True,
+                                   max_components:int=6)->"dict[tuple[str,str],ExpressionOrNum]":
+        r"""
+        Estimates the diffusivities of this mixture from its activity coefficients.
+
+        Measured diffusivities of liquid mixtures are rare, but where an activity model is set, the
+        thermodynamic part of the diffusivity is already known and only the Maxwell-Stefan part has
+        to be correlated. This assembles
+
+        .. math:: [D] = \frac{1}{\bar{M}}\,[C]\,[B]^{-1}\,[\Gamma]\,[A]
+
+        and writes it into the diffusion table, i.e. exactly the Fickian, mass-average-frame matrix
+        that :py:meth:`~pyoomph.materials.generic.BaseMixedProperties.get_diffusive_mass_flux_for`
+        expects, over the non-passive components. :math:`[\Gamma]` is the thermodynamic factor
+        :math:`\Gamma_{ij}=\delta_{ij}+x_i\partial\ln\gamma_i/\partial x_j` (with the passive mole
+        fraction eliminated), :math:`[B]` the Maxwell-Stefan matrix, and :math:`[A]`, :math:`[C]` and
+        :math:`\bar{M}` are the reference-frame and mole-to-mass conversions, which follow from the
+        definitions alone. See :py:mod:`pyoomph.materials.diffusivity_estimates` for the details.
+
+        A binary reduces to the familiar :math:`D=\mathcal{D}_{12}\Gamma`.
+
+        Example::
+
+            mix=Mixture(get_pure_liquid("water")+0.4*get_pure_liquid("12hexanediol"))
+            mix.set_activity_coefficients_by_unifac("AIOMFAC")
+            mix.set_estimate_diffusivities()
+
+        .. warning::
+
+            This is an *estimate*. The Maxwell-Stefan part is a correlation, good to some tens of
+            percent at best, and the Wilke-Chang correlation is considerably worse than that when
+            water is the *solute*. Where a measurement exists, use
+            :py:meth:`~pyoomph.materials.generic.BaseMixedProperties.set_diffusion_coefficient`.
+
+        .. warning::
+
+            :math:`[\Gamma]` is not positive definite inside a miscibility gap, and neither is the
+            resulting matrix -- water/1,2-hexanediol already has :math:`\Gamma=0.27` at a mass
+            fraction of 0.4. That is the model reporting that the mixture demixes there, not a
+            numerical artefact, so it is not clipped by default. Use
+            :py:func:`~pyoomph.materials.diffusivity_estimates.scan_thermodynamic_factor` to find
+            where it happens.
+
+        Args:
+            method: How the Maxwell-Stefan diffusivities are obtained.
+
+                * ``"vignes"``: the Wesselingh-Krishna generalization of the Vignes interpolation
+                  between the infinite-dilution values, which come from the Wilke-Chang correlation.
+                * ``"stokes_einstein"``: :math:`k_\mathrm{B}T/(6\pi\mu\bar{r}_{ij})` with the mean of
+                  the two hydrodynamic radii.
+                * ``"darken"``: :math:`x_jD_i^\mathrm{self}+x_iD_j^\mathrm{self}`, from
+                  :py:attr:`PureLiquidProperties.self_diffusivity` where set and from Stokes-Einstein
+                  otherwise.
+                * ``"given"``: every pair has to be supplied in ``maxwell_stefan_diffusivities``.
+            maxwell_stefan_diffusivities: Overrides individual Maxwell-Stefan diffusivities, keyed by
+                the component pair. They are symmetric, so either order may be given.
+            infinite_dilution_diffusivities: Overrides individual infinite-dilution diffusivities
+                feeding the Vignes interpolation. The key ``(i,j)`` means ``i`` dilute in ``j``, which
+                is *not* symmetric.
+            thermodynamic_factor: Set to ``False`` for the ideal-mixture estimate, i.e.
+                :math:`[\Gamma]=[I]`.
+            thermodynamic_factor_mode: ``"auto"`` differentiates the activity coefficients
+                symbolically, unless they are multi-return expressions (the default of
+                :py:meth:`set_activity_coefficients_by_unifac` from three components on), in which
+                case a central difference is taken. Multi-return expressions cannot be differentiated
+                symbolically at all -- the generated C code would not compile -- so ``"symbolic"``
+                raises for them rather than failing later.
+            fd_epsilon: Mole-fraction step of that central difference.
+            min_thermodynamic_factor: Bounds :math:`\Gamma` from below. Binary mixtures only, since
+                bounding a matrix means bounding its eigenvalues.
+            thermodynamic_factor_shift: Adds this multiple of the identity to :math:`[\Gamma]`. This
+                is a regularization with no thermodynamic content whatsoever.
+            viscosity: The viscosity entering the correlations. ``"mixture"`` uses this mixture's own
+                :py:attr:`dynamic_viscosity`, which is what makes the result composition dependent;
+                ``"pure"`` uses the pure solvent of each pair, i.e. the literal correlation. An
+                expression is used as given.
+            temperature: When given, the result is frozen at this temperature instead of following
+                the temperature field.
+            overwrite: By default a diffusivity that is already set is kept. Note that this can leave
+                a matrix that is partly measured and partly estimated, which is warned about.
+            use_subexpressions: Wrap the repeated parts in
+                :py:func:`~pyoomph.expressions.generic.subexpression`. These expressions are large;
+                switch it off only for debugging.
+            max_components: Refuse to build the symbolic inverse beyond this many components.
+
+        Returns:
+            The diffusivities that were written, keyed by the component pair.
+        """
+        from .diffusivity_estimates import fickian_mass_diffusivity_matrix
+        if self.get_ions():
+            raise NotImplementedError("Estimating diffusivities of a solution with dissolved ions is "
+                                      "not supported: the ionic activity coefficients are molality "
+                                      "based and the ions have their own transport coefficients, see "
+                                      "get_ion_diffusivity.")
+        T:ExpressionOrNum=var("temperature") if temperature is None else temperature
+        res=fickian_mass_diffusivity_matrix(self,method,
+                maxwell_stefan_diffusivities=maxwell_stefan_diffusivities,
+                infinite_dilution_diffusivities=infinite_dilution_diffusivities,
+                thermodynamic_factor=thermodynamic_factor,
+                thermodynamic_factor_mode=thermodynamic_factor_mode,fd_epsilon=fd_epsilon,
+                min_thermodynamic_factor=min_thermodynamic_factor,
+                thermodynamic_factor_shift=thermodynamic_factor_shift,
+                viscosity=viscosity,temperature=T,use_subexpressions=use_subexpressions,
+                max_components=max_components)
+        written:dict[tuple[str,str],ExpressionOrNum]={}
+        kept:list[tuple[str,str]]=[]
+        for (n1,n2),D in sorted(res.items()):
+            if not overwrite and self.get_diffusion_coefficient(n1,n2) is not None:
+                kept.append((n1,n2,))
+                continue
+            self.set_diffusion_coefficient(n1,n2,D)
+            written[(n1,n2,)]=D
+        if kept:
+            msg="The diffusivities "+", ".join(str(k) for k in kept)+" of '"+self.describe()+"' were "
+            if written:
+                msg+=("already set and are kept, so the matrix is now partly estimated and partly "
+                      "not, which is not a consistent one. ")
+            else:
+                msg+=("already set, so nothing was estimated at all. ")
+            warnings.warn(msg+"Pass overwrite=True to replace them as well.")
+        return written
 
 
 class MixtureGasProperties(BaseGasProperties,BaseMixedProperties):
