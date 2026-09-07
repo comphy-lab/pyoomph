@@ -871,13 +871,18 @@ namespace pyoomph
 			{
 				n_cbu_calls++;
 				__t_cbu0 = std::chrono::steady_clock::now();
+				// Announced before the call, so that a split which never returns is still
+				// identifiable - which is the shape this pass keeps failing in. Only for arguments
+				// large enough to be that split; a residual has many small ones.
+				if (marg.nops() > 200)
+					std::cerr << "[add_residual]   ph:units large split #" << n_cbu_calls << " entering "
+							  << GiNaC::ex_to<GiNaC::basic>(marg).class_name() << " nops " << marg.nops()
+							  << " masked_total " << masker.n_masked() << std::endl;
 			}
 			bool __cbu_ok = expressions::collect_base_units(marg, factor, unit, rest);
 			if (__time_add_residual())
 			{
-				// A single slow unit split is the signature this pass keeps producing, and it is
-				// invisible in the phase total. Report the argument's top-level shape with it: what
-				// costs minutes here is one add with tens of thousands of terms, not many small ones.
+				// ... and reported again with its duration when it does return.
 				double __dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - __t_cbu0).count();
 				if (__dt > 0.5)
 					std::cerr << "[add_residual]   ph:units slow split #" << n_cbu_calls << " " << __dt

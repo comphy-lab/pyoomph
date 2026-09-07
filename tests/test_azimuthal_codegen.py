@@ -45,6 +45,7 @@
 
 from pyoomph import *
 from pyoomph.expressions import *
+from pyoomph.expressions.units import meter, second
 from pyoomph.equations.ALE import LaplaceSmoothedMesh
 from pyoomph.meshes.simplemeshes import RectangularQuadMesh
 
@@ -235,3 +236,72 @@ def test_augmented_azimuthal_jacobian_is_exact_with_a_complex_mass_matrix():
                 worst, worst_at = rel, "%s column %d" % (lab(j), j)
         p.set_current_dofs(x0)
         assert worst < 1e-5, "augmented Jacobian disagrees with a finite difference: %.3e at %s" % (worst, worst_at)
+
+
+def test_deeply_nested_dimensional_subexpressions_build_under_azimuthal_stability():
+    """A dimensional subexpr() chain of nesting depth 4 and fan-out 2, i.e. 16 markers as a tree.
+
+    Under azimuthal_stability=True every marker is split into a real and an imaginary one, and the
+    unit analysis in add_residual used to re-traverse the whole nesting once per level. Measured on
+    this construction, add_residual per contribution (PYOOMPH_TIME_ADD_RESIDUAL=1):
+
+        depth   before    after
+          4     0.68 s    0.011 s
+          5     2.74 s    0.061 s
+          6    30.7  s    0.088 s
+
+    No wall-clock bound is asserted here, because it would not measure this: what is left of
+    initialise() for this construction is the *code writer*, which has the same DAG-as-tree problem
+    and still grows by an order of magnitude per level (7.6 s / 76 s / 887 s at depths 4 / 5 / 6).
+    See dev_docs/subexpression_unit_analysis_stall.md.
+
+    What is checked is that the element builds, loads and assembles: a placeholder symbol left
+    behind by the masking, or a unit left inside a marker, does not survive code generation.
+    """
+    import numpy
+
+    depth = 4
+
+    class Eq(Equations):
+        def define_fields(self):
+            self.define_scalar_field("u", "C2", scale=meter, testscale=1 / meter)
+
+        def define_residuals(self):
+            u, v = var_and_test("u")
+            e = subexpression(u + 1 * meter)
+            for _ in range(depth):
+                e = subexpression(e * e / (1 * meter) + 0.5 * e * exp(-u / (1 * meter)))
+            self.add_residual(weak(e, v) + weak(grad(u), grad(v)) * meter * meter)
+
+    class P(Problem):
+        def define_problem(self):
+            self.set_coordinate_system("axisymmetric")
+            self.set_scaling(spatial=meter, temporal=second)
+            self.add_mesh(RectangularQuadMesh(N=2, size=[1 * meter, 1 * meter],
+                                              lower_left=[1 * meter, 0]))
+            self.add_equations((Eq() + DirichletBC(u=0) @ "bottom") @ "domain")
+
+    with P() as p:
+        p.setup_for_stability_analysis(azimuthal_stability=True, analytic_hessian=False)
+        p.initialise()
+        n = p.ndof()
+        rng = numpy.random.default_rng(5)
+        x0 = numpy.array(p.get_current_dofs()[0]) + 0.01 * rng.standard_normal(n)
+        p.set_current_dofs(x0)
+        r, J = p.assemble_jacobian(with_residual=True)
+        r = numpy.array(r)
+        assert numpy.all(numpy.isfinite(r))
+        assert numpy.all(numpy.isfinite(numpy.asarray(J.todense())))
+
+        d = rng.standard_normal(n)
+        d /= numpy.linalg.norm(d)
+        eps = 1e-7
+        p.set_current_dofs(x0 + eps * d)
+        rp = numpy.array(p.get_residuals())
+        p.set_current_dofs(x0 - eps * d)
+        rm = numpy.array(p.get_residuals())
+        p.set_current_dofs(x0)
+        fd = (rp - rm) / (2 * eps)
+        ana = J @ d
+        rel = numpy.max(numpy.abs(ana - fd)) / max(numpy.max(numpy.abs(fd)), 1e-30)
+        assert rel < 1e-5, "Jacobian disagrees with a finite difference: rel=%.3e" % rel
