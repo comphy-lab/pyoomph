@@ -29,6 +29,7 @@ the useful part. Code examples in `examples/` are runnable companions, not snipp
 | [internal_facet_fields.md](internal_facet_fields.md) | Unknowns on the interior-facet skeleton (HDG traces, mortar multipliers): per-facet storage, the pinned opposite dummy, 3d enumeration, and how the fields survive adaptation, remeshing, `--distribute` and a state file. |
 | [mesh_data_cache.md](mesh_data_cache.md) | Typed cache keys, and merging a distributed mesh's data into one global view. |
 | [axisymmetric_topological_changes.md](axisymmetric_topological_changes.md) | Pinch-off and coalescence of an axisymmetric free surface: morphological detection, the volume-matched surgery, the zeta chart that carries the fields across, and what the thresholds may be set to. |
+| [axisymm_reconnection_coalescence_4.md](axisymm_reconnection_coalescence_4.md) | Why `test_the_event_remesh_reproduces_the_serial_one[coalescence-4]` was red: the nearest-node fallback blend of the fresh bridge was computed from each rank's own share of the old mesh, so the answer depended on the partition. The measurement that pinned it to four nodes, and the global MINLOC resolution that fixed it. |
 
 ## MPI
 
