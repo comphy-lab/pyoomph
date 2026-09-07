@@ -241,46 +241,50 @@ namespace pyoomph
 	// wrappers and multi-ret invocation arguments, which a plain preorder walk would treat as opaque.
 	void FiniteElementCode::register_global_parameters_in(const GiNaC::ex &e, std::set<unsigned> &used_local_indices)
 	{
-		std::set<const GiNaC::basic *> visited;
+		DagVisitedSet visited;
 		register_global_parameters_in(e, used_local_indices, visited);
 	}
 
-	// A residual with nested subexpression() markers is a DAG, and the recursion below is the only
-	// part of this scan that leaves the (marker-opaque) preorder iterator, so without a visited set a
-	// marker reachable by k paths is descended into k times - exponential in the nesting depth, which
-	// is what made this one of the three hot frames of write_code on the deeply nested azimuthal case.
-	// The visited set is keyed on node identity: the DAG shares the actual GiNaC nodes, so a pointer
-	// compare is exact here, and skipping a body already descended into is provably lossless because
-	// the registration it performs happened on the first visit (in the same first-encounter order).
-	void FiniteElementCode::register_global_parameters_in(const GiNaC::ex &e, std::set<unsigned> &used_local_indices, std::set<const GiNaC::basic *> &visited)
+	// A residual is a DAG - that is what subexpression() is for - and this used to be a
+	// const_preorder_iterator loop, i.e. a TREE walk: a node reachable by k paths was visited k times,
+	// exponentially many in the nesting depth. Note that the markers are NOT opaque here: inside
+	// write_code the residual still holds plain expressions::subexpression() FUNCTION applications
+	// (SubExpressionsToStructs only turns them into GiNaCSubExpression structs further down), so the
+	// generic descent below walks straight through them and the explosion is theirs.
+	//
+	// So it is an explicit descent with a visited set keyed on node identity: the DAG shares the
+	// actual GiNaC nodes, so a pointer compare is exact. Skipping a node already seen is provably
+	// lossless - this only collects into a set, and the registration side effect happened on the
+	// first visit, in the same first-encounter order.
+	void FiniteElementCode::register_global_parameters_in(const GiNaC::ex &e, std::set<unsigned> &used_local_indices, DagVisitedSet &visited)
 	{
-		for (GiNaC::const_preorder_iterator i = e.preorder_begin(); i != e.preorder_end(); ++i)
+		if (!visited.visit(e))
+			return;
+		if (GiNaC::is_a<GiNaC::GiNaCGlobalParameterWrapper>(e))
 		{
-			if (GiNaC::is_a<GiNaC::GiNaCGlobalParameterWrapper>(*i))
+			const auto &p = GiNaC::ex_to<GiNaC::GiNaCGlobalParameterWrapper>(e).get_struct();
+			unsigned global_index = p.cme->get_global_index();
+			if (!global_parameter_to_local_indices.count(global_index))
 			{
-				const auto &p = GiNaC::ex_to<GiNaC::GiNaCGlobalParameterWrapper>(*i).get_struct();
-				unsigned global_index = p.cme->get_global_index();
-				if (!global_parameter_to_local_indices.count(global_index))
-				{
-					unsigned local_index = global_parameter_to_local_indices.size();
-					local_parameter_symbols.push_back(*i);
-					global_parameter_to_local_indices.insert(std::make_pair(global_index, local_index));
-				}
-				used_local_indices.insert(global_parameter_to_local_indices[global_index]);
+				unsigned local_index = global_parameter_to_local_indices.size();
+				local_parameter_symbols.push_back(e);
+				global_parameter_to_local_indices.insert(std::make_pair(global_index, local_index));
 			}
-			else if (GiNaC::is_a<GiNaC::GiNaCSubExpression>(*i))
-			{
-				const GiNaC::ex &body = GiNaC::ex_to<GiNaC::GiNaCSubExpression>(*i).get_struct().expr;
-				if (visited.insert(&GiNaC::ex_to<GiNaC::basic>(body)).second)
-					register_global_parameters_in(body, used_local_indices, visited);
-			}
-			else if (GiNaC::is_a<GiNaC::GiNaCMultiRetCallback>(*i))
-			{
-				GiNaC::ex body = GiNaC::ex_to<GiNaC::GiNaCMultiRetCallback>(*i).get_struct().invok.op(1);
-				if (visited.insert(&GiNaC::ex_to<GiNaC::basic>(body)).second)
-					register_global_parameters_in(body, used_local_indices, visited);
-			}
+			used_local_indices.insert(global_parameter_to_local_indices[global_index]);
+			return;
 		}
+		if (GiNaC::is_a<GiNaC::GiNaCSubExpression>(e))
+		{
+			register_global_parameters_in(GiNaC::ex_to<GiNaC::GiNaCSubExpression>(e).get_struct().expr, used_local_indices, visited);
+			return;
+		}
+		if (GiNaC::is_a<GiNaC::GiNaCMultiRetCallback>(e))
+		{
+			register_global_parameters_in(GiNaC::ex_to<GiNaC::GiNaCMultiRetCallback>(e).get_struct().invok.op(1), used_local_indices, visited);
+			return;
+		}
+		for (size_t i = 0; i < e.nops(); i++)
+			register_global_parameters_in(e.op(i), used_local_indices, visited);
 	}
 
 	// Screens the symbolic source expression(s) of ONE generated C function for global parameters
@@ -4347,7 +4351,7 @@ namespace pyoomph
 	std::set<ShapeExpansion> FiniteElementCode::get_all_shape_expansions_in(GiNaC::ex inp, bool merge_no_jacobian, bool merge_expansion_modes, bool merge_no_hessian)
 	{
 		std::set<ShapeExpansion> res;
-		std::set<const GiNaC::basic *> visited;
+		DagVisitedSet visited;
 		gather_shape_expansions_in(inp, res, visited);
 
 		if (merge_no_jacobian || merge_expansion_modes || merge_no_hessian)
@@ -4377,41 +4381,33 @@ namespace pyoomph
 		return res;
 	}
 
-	// The raw collection half, with the visited set that keeps a shared subexpression() body from
-	// being descended into once per path through the DAG (see register_global_parameters_in above for
-	// why pointer identity is the right key). The flag merging stays in the wrapper: it only ever
-	// clears flags, so doing it once on the union is the same set as doing it on every sub-result and
-	// again at the end, which is what the recursive version did.
-	void FiniteElementCode::gather_shape_expansions_in(const GiNaC::ex &inp, std::set<ShapeExpansion> &res, std::set<const GiNaC::basic *> &visited)
+	// The raw collection half: an explicit descent with a visited set instead of the former
+	// const_preorder_iterator loop, so that a node shared by several paths of the residual DAG is
+	// visited once rather than once per path (see register_global_parameters_in above for why pointer
+	// identity is the right key, and why the markers are transparent here). The flag merging stays in
+	// the wrapper: it only ever clears flags, so doing it once on the union is the same set as doing
+	// it on every sub-result and again at the end, which is what the recursive version did.
+	void FiniteElementCode::gather_shape_expansions_in(const GiNaC::ex &inp, std::set<ShapeExpansion> &res, DagVisitedSet &visited)
 	{
-		for (GiNaC::const_preorder_iterator i = inp.preorder_begin(); i != inp.preorder_end(); ++i)
+		if (!visited.visit(inp))
+			return;
+		if (GiNaC::is_a<GiNaC::GiNaCShapeExpansion>(inp))
 		{
-			//			std::cout << *i << std::endl;
-			if (GiNaC::is_a<GiNaC::GiNaCShapeExpansion>(*i))
-			{
-				auto &shapeexp = (GiNaC::ex_to<GiNaC::GiNaCShapeExpansion>(*i)).get_struct();
-				//&		  	std::cout << "FOUND SHAPE EXPANSION  " << &shapeexp << std::endl;
-				res.insert(shapeexp);
-			}
-			else if (GiNaC::is_a<GiNaC::GiNaCSubExpression>(*i))
-			{
-				GiNaC::GiNaCSubExpression se = GiNaC::ex_to<GiNaC::GiNaCSubExpression>(*i);
-				const GiNaC::ex &body = se.get_struct().expr;
-				if (visited.insert(&GiNaC::ex_to<GiNaC::basic>(body)).second)
-					gather_shape_expansions_in(body, res, visited);
-			}
-			else if (GiNaC::is_a<GiNaC::GiNaCMultiRetCallback>(*i))
-			{
-				//std::cout << "GOT MULTIRET CB "  << (*i) << std::endl;
-				
-				GiNaC::GiNaCMultiRetCallback se = GiNaC::ex_to<GiNaC::GiNaCMultiRetCallback>(*i);
-				//std::cout << "GOT MULTIRET CB " << "INVOK "  << (se.get_struct().invok) << std::endl;
-				//std::cout << "GOT MULTIRET CB " << "INVOK OP1 "  << (se.get_struct().invok.op(1)) << std::endl;
-				GiNaC::ex body = se.get_struct().invok.op(1);
-				if (visited.insert(&GiNaC::ex_to<GiNaC::basic>(body)).second)
-					gather_shape_expansions_in(body, res, visited);
-			}
+			res.insert((GiNaC::ex_to<GiNaC::GiNaCShapeExpansion>(inp)).get_struct());
+			return;
 		}
+		if (GiNaC::is_a<GiNaC::GiNaCSubExpression>(inp))
+		{
+			gather_shape_expansions_in(GiNaC::ex_to<GiNaC::GiNaCSubExpression>(inp).get_struct().expr, res, visited);
+			return;
+		}
+		if (GiNaC::is_a<GiNaC::GiNaCMultiRetCallback>(inp))
+		{
+			gather_shape_expansions_in(GiNaC::ex_to<GiNaC::GiNaCMultiRetCallback>(inp).get_struct().invok.op(1), res, visited);
+			return;
+		}
+		for (size_t i = 0; i < inp.nops(); i++)
+			gather_shape_expansions_in(inp.op(i), res, visited);
 	}
 
 	// Collects every distinct TestFunction structure appearing anywhere in expression `inp` (simple
