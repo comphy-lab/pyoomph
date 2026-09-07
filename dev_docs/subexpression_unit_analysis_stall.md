@@ -1,12 +1,11 @@
 # Code generation stalls on a deeply nested subexpression under azimuthal stability
 
-Status: **the unit analysis is fixed; the reported case still does not finish.** `add_residual` was
-the wall and no longer is — it is flat in the nesting depth now, measured over three orders of
-magnitude. Two further walls were found underneath it and are *not* fixed: GiNaC's own
-`collect_common_factors` on a marker argument with 14806 terms (the droplet), and the code writer,
-which has the same DAG-as-tree problem `add_residual` had (the synthetic case). Written 2026-09-06
-against `e7408619`, rewritten 2026-09-07 against `6cec0346`. This document owns the reasoning;
-`code_generation.md` owns the unit-check pipeline it happens in.
+Status: **fixed.** The reported droplet builds and solves. Three walls were found, one behind the
+other, and all three are gone: `add_residual` walking the residual DAG as a tree (§4), the azimuthal
+real/imaginary split multiplying products out until a marker argument held 14806 terms (§5.1), and
+the code writer having the same DAG-as-tree problem `add_residual` had (§5.3). Written 2026-09-06
+against `e7408619`, rewritten 2026-09-07 against `6cec0346` and again against `7297d5e9`. This
+document owns the reasoning; `code_generation.md` owns the unit-check pipeline it happens in.
 
 ## 1. The symptom, and what it is not
 
@@ -15,13 +14,13 @@ with
 
     p.setup_for_stability_analysis(azimuthal_stability=True, analytic_hessian=False)
 
-never returns from `p.initialise()`. It is **not** a deadlock, not the solver, and not MPI: the
-process is at 100 % CPU in `FiniteElementCode::add_residual` for the `liquid_gas` interface's
+never returned from `p.initialise()` (until `451bd795`; §5.1). It was **not** a deadlock, not the solver, and not MPI: the
+process sat at 100 % CPU in `FiniteElementCode::add_residual` for the `liquid_gas` interface's
 mass-transfer residual, built at `pyoomph/materials/mass_transfer.py:194`
 (`ieqs.add_residual(weak(j - rhs, jtest))`).
 
-The same script **without** `azimuthal_stability=True` completes in about two minutes. That
-difference is the whole of the diagnosis: azimuthal stability is what routes the residual through
+The same script **without** `azimuthal_stability=True` completed throughout (about a minute). That
+difference was the whole of the diagnosis: azimuthal stability is what routes the residual through
 `split_subexpressions_in_real_and_imaginary_parts`, which rebuilds every `subexpression()` in it.
 
 ## 2. Why this class of bug exists at all
@@ -102,61 +101,86 @@ i.e. flat instead of about a factor of ten per nesting level. The same case with
 `tests/test_azimuthal_codegen.py::test_deeply_nested_dimensional_subexpressions_build_under_azimuthal_stability`
 pins the depth-4 case.
 
-## 5. What is still open, in the order it was met
+## 5. What was found underneath it, and what fixed it
 
-### 5.1 The droplet: one `collect_base_units` call on a 14806-term sum
+Both walls of the first version of this section are gone, and only one of the two candidate
+remedies is what removed them. Measured 2026-09-07 against `7297d5e9`.
 
-With the masking in place the droplet's mass-transfer residual now spends its time in a **single**
-`collect_base_units()` call. `PYOOMPH_TIME_ADD_RESIDUAL=1` announces any split whose argument has more
-than 200 operands *before* the call and reports any split over half a second when it returns; the
-sequence for that residual is
+### 5.1 The droplet: the split was multiplying products out, and now does not
 
-    ph:units slow split  #22  1.03 s  add nops 322    masked_total 19
-    ph:units slow split  #29  1.29 s  add nops 752    masked_total 24
-    ...
-    ph:units large split #37  entering add nops 14806 masked_total 32   <- never returned (16 min)
+The 14806-term sum was not something `collect_base_units` had to be made to survive - it was
+something the azimuthal split had no business producing. `SubExpressionsToRealAndImag` rewrites each
+complex marker into `subexpression(real_part(m)) + I*subexpression(imag_part(m))`, so its markers are
+real **by construction**; GiNaC could not see that, because `subexpression()` had no `real_part_func`
+and therefore fell back to `basic::real_part`, i.e. a held `real_part_function(marker)`. With every
+already-split factor looking fully complex, `mul::find_real_imag` ends in `rp.expand()`/`ip.expand()`
+and turns a product of *n* such factors into `2*4^(n-1)` terms inside the next marker's argument -
+measured `n=7 -> 8192`, `n=8 -> 32768`. That is where the droplet's chain of 32, 322, 752, 14806 came
+from, and the answer to question 3 of the old list ("where does a 14806-term marker argument come
+from?") is: from here.
 
-Each term is a product of 10-14 atoms, and the term counts of the marker chain go 32, 322, 752,
-14806. At 752 terms the split costs 1.3 s, i.e. 1.7 ms per term; a linear extrapolation would give
-25 s for 14806, and it ran for more than sixteen minutes, so the cost is at least quadratic in the
-number of terms. The remaining quadratic is inside GiNaC: `collect_base_units()` opens with
-`collect_common_factors(expand(arg))`, and `find_common_factor -> to_polynomial ->
-replace_with_symbol` (`ginac/normal.cpp`) scans its `repl` vector **linearly** for every node it has
-to replace. Masking does not help there, because the terms still contain non-symbol atoms (field
-placeholders, functions) that `to_polynomial` must replace, so `repl` grows with the number of terms.
+`subexpression()` now carries a `real_part_func`/`imag_part_func` pair backed by a memoised
+`subexpression_wrapped_is_real()` (`src/expressions.cpp`). Each factor's real and imaginary parts
+become single markers rather than held pairs, i.e. `2^(n-1)` terms, and GiNaC's own
+`real_part_function` already reports `imag_part == 0`, so the property propagates up the nesting by
+induction and every level of the split stays short. The memo is not optional: the question is
+answered per marker by asking it of every nested marker, over a DAG.
+`PYOOMPH_DISABLE_REIM_FOLD=1` restores the old, unknowing behaviour and is the A/B lever.
 
-What has *not* been tried, in the order it is worth trying:
+It uncovered a genuine GiNaC bug on the way. `power::real_part()`/`imag_part()` build their binomial
+expansion with `pow(a, NN-n)`, and a binomial expansion needs the `0^0 == 1` convention for its end
+terms, which GiNaC's `pow()` refuses - so as soon as a basis has an *exactly* zero real or imaginary
+part (which is what the fold newly makes possible) the whole expression dies with
+`power::eval(): pow(0,0) is undefined`. `pow(I*x,2).real_part()` reproduces it without pyoomph.
+`citools/patches/ginac-binomial-real-imag-pow00.patch` uses the convention for the end terms only;
+it is worth sending upstream.
 
-1. Find out whether `collect_common_factors` is needed at all in `collect_base_units`. The `add`
-   branch already handles a sum term by term and insists the terms agree on their unit, which is the
-   correct semantics; the common-factor collection only changes *which* factor is pulled out. Skipping
-   it (or skipping it above some term count) would change the split wherever a common factor exists,
-   so it needs the same generated-C audit as §7.
-2. Failing that, patch the vendored GiNaC so `replace_with_symbol` looks its `repl` entries up by
-   hash rather than by a linear `is_equal` scan. It is a self-contained change and would help every
-   caller of `normal()`/`collect_common_factors`, but it is a change to vendored third-party code
-   (`src/thirdparty/INFO_oomph-lib` conventions apply).
-3. Ask where a 14806-term marker argument comes from in the first place. It is an *expanded* sum, and
-   nothing in `add_residual` expands it — it arrives that way from `expand_placeholders` and the
-   azimuthal split. If the split can keep it factored, none of the above is needed.
+Measured, droplet with `--quick-test` and the complex PETSc: it reaches **and completes** the first
+Newton solve, in 42 s wall and 308 MB peak RSS, with `add_residual` 20.8 s over 88 contributions and
+`write_code` 3.9 s. The largest sum reaching `collect_base_units` in the whole run is **69** terms,
+against 14806, and no split is announced as large (>200 operands) at all.
 
-### 5.2 The synthetic case: the code writer has the same DAG-as-tree problem
+### 5.2 The `collect_common_factors` gate: implemented, and it never fires
 
-Once `add_residual` is flat, what is left of `initialise()` for the synthetic case is
-`FiniteElementCode::write_code` — the "Generating equation C code" step — and it still grows by an
-order of magnitude per nesting level:
+Item 1 of the old list was done anyway - `collect_base_units` skips
+`GiNaC::collect_common_factors` above `PYOOMPH_UNIT_CCF_MAX_TERMS` terms (default 2000), and once
+tripped the decision holds for the whole subtree, because the per-term recursive calls are where the
+time actually went. The rationale is sound (the `add` branch handles a sum term by term and only the
+*choice* of hoisted factor changes) and 6/6 gdb samples of the never-returning split were inside
+`collect_common_factors`.
 
-| depth | `add_residual` (both contributions) | `initialise()` | generated `domain.c` |
-|-------|-------------------------------------|----------------|----------------------|
-| 4     | 0.02 s | 7.6 s   | 67 kB |
-| 5     | 0.12 s | 76.5 s  | 73 kB |
-| 6     | 0.18 s | 887.6 s | 78 kB |
+But with 5.1 in place nothing reaches the threshold: the largest sum in the whole reference set has
+**48** terms and the droplet's largest has 69, so the generated C is byte-identical to the ungated
+build (`PYOOMPH_UNIT_CCF_MAX_TERMS=100000`) on all 28 files of the six cases. Forcing the gate on
+everything (`=1`) still builds, loads and assembles every case and moves the C by 0.05-2 % in size,
+which is what says the skip is a factoring choice and not a semantic one. It is kept as a bound on a
+pathology of the same class, not as the fix for this one. Item 2 of the old list - hashing GiNaC's
+`replace_with_symbol` lookup - was therefore **not** done and is not needed by anything measured.
 
-The *output* grows linearly, so this is not the emitted code getting bigger; it is the derivative and
-printing passes walking the DAG as a tree. Nobody has instrumented that half yet. Peak RSS at depth 6
-is 2.3 GB.
+### 5.3 The synthetic case: flat, and it was the code writer
 
-### 5.3 Smaller, known, not done
+The order-of-magnitude-per-level growth of `initialise()` was the emission half, exactly as
+suspected, and nine commits (`e5685a7c`..`373b8fa0`) took it apart: every remaining tree walk over
+the residual DAG in `write_code` - the two collectors, `MakeResidualSteady`, the marker derivative,
+the subexpression-to-struct mapper, three preorder scans and the `dResidual/dParameter` substitution
+- is now a DAG walk or memoised, and a residual is no longer differentiated by a parameter it does
+not contain. Their commit bodies carry the per-phase numbers.
+
+The result, `PYOOMPH_TIME_ADD_RESIDUAL=1 PYOOMPH_TIME_WRITE_CODE=1`, fresh directory per run:
+
+| depth | `initialise()` | wall | peak RSS | `add_residual` (all) | `write_code` (all) | `domain.c` |
+|-------|---------------|------|----------|----------------------|--------------------|------------|
+| 3 | 0.79 s | 1.89 s | 162 MB | 0.052 s | 0.019 s | 49.0 kB |
+| 4 | 0.91 s | 1.96 s | 162 MB | 0.082 s | 0.021 s | 50.4 kB |
+| 5 | 0.90 s | 1.91 s | 162 MB | 0.088 s | 0.011 s | 51.8 kB |
+| 6 | 0.83 s | 1.87 s | 162 MB | 0.113 s | 0.013 s | 53.1 kB |
+| 7 | 1.02 s | 2.07 s | 162 MB | 0.312 s | 0.014 s | 54.5 kB |
+
+against 0.66 / 6.7 / 76.7 / 887.6 s and 2.3 GB at depths 3 to 6 in round 1, i.e. a factor of about
+11 per level. Most of what is left is the C compiler. The Jacobian agrees with a central difference
+to 2.4e-9 at depth 7.
+
+### 5.4 Smaller, known, not done
 
 - `expand_all_and_ensure_nondimensional` (`src/codegen.cpp`) runs `repl.expand().evalm().normal()` on
   the **unmasked** result of its own `DrawUnitsOutOfSubexpressions`. It is the same hazard class. It
@@ -165,12 +189,14 @@ is 2.3 GB.
   components, not for whole residuals.
 - `warn_on_large_numerical_factor`'s `expand()` at the end of `add_residual` is unmasked too, and is
   off by default.
+- The GiNaC patch is local to the vendored build and has not been sent upstream.
 
 ## 6. Reproducing, and the two traps
 
 The script is `~/docs/mypapers/nonmonotonic_final_rebuttal/codes/run_droplet_evap.py`. Copy it to a
 fresh directory (it writes state/dump files and takes a shortcut when it finds them) and add
-`--quick-test`. It reaches the killer residual in about 80 s.
+`--quick-test`. It used to reach the killer residual in about 80 s and stop there; it now runs the
+whole `--quick-test` in 42 s, so it is a regression check rather than a reproduction.
 
 The synthetic case is a fan-out-2 chain of dimensional markers; it is written out in
 `tests/test_azimuthal_codegen.py::test_deeply_nested_dimensional_subexpressions_build_under_azimuthal_stability`,
@@ -210,4 +236,7 @@ factor permutations; the azimuthal case additionally renumbers `_jc` temporaries
 type of `subexpression()` on its own left the generated C byte-identical.
 
 The no-azimuthal droplet run converged to `1.13894e-12` after `e7408619` against `1.1425e-12` before,
-with an identical step count.
+with an identical step count, and to `1.14952e-12` after `7297d5e9`, still in the same 8 steps. The
+**azimuthal** run, which is the one that never got there, converges to `1.12467e-12` in those same 8
+steps and matches the non-azimuthal intermediate residuals exactly down to step 7 (`2.35951e-08`).
+Movement in the last digits of a quantity at the round-off floor is not a regression signal.

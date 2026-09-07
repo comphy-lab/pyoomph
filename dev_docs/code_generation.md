@@ -1705,6 +1705,8 @@ All change how pyoomph gets there or what it reports, never what it computes.
 | `PYOOMPH_UNIT_FASTCHECK` | ask `collect_base_units` before normalising, for dimensional contributions — off by default (§2.2) |
 | `PYOOMPH_PARANOID_UNIT_PRESCAN` | do the skipped normalisation anyway and raise if it disagrees; covers both the prescan and the fast check |
 | `PYOOMPH_DISABLE_UNIT_MASK` | do not hide already-analysed nested `subexpression()` markers behind placeholder symbols during `add_residual` (§2.2b) |
+| `PYOOMPH_UNIT_CCF_MAX_TERMS` | term count above which `collect_base_units` skips `GiNaC::collect_common_factors` (default 2000, and nothing measured comes near it - the largest sum in the reference set has 48 terms). `=1` forces the skip everywhere, which is how it gets exercised. See [subexpression_unit_analysis_stall.md](subexpression_unit_analysis_stall.md) §5.2 |
+| `PYOOMPH_DISABLE_REIM_FOLD` | stop `subexpression()` reporting the real/imaginary part of a marker whose content is provably real, i.e. restore the behaviour in which the azimuthal split multiplies products out into `2*4^(n-1)` terms. Only affects azimuthal models; see [subexpression_unit_analysis_stall.md](subexpression_unit_analysis_stall.md) §5.1 |
 | `PYOOMPH_DISABLE_EXPAND_MEMO` | turn off the placeholder-expansion memo (on by default, §3) |
 | `PYOOMPH_POISON_UNREQUIRED` | signalling NaN into every shape buffer the pass did not require; `=all` is the positive control. See [assembly_overhead.md](assembly_overhead.md) §3.1 - it is what found the Hessian flag defect of §9.4.15 |
 | `PYOOMPH_DISABLE_SHAPE_FAMILY_SPLIT`, `PYOOMPH_*_HANG_FILL_CACHE`, `PYOOMPH_DISABLE_ASSEMBLY_EXTDATA_SPLIT` | the assembly-overhead levers, [assembly_overhead.md](assembly_overhead.md) §6 |
