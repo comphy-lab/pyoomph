@@ -16,6 +16,11 @@ precedence over upstream branch/release instructions in this checkout:
 - Use `comphy/VERIFICATION.md` for bounded candidate checks. Never replace a
   running simulation's environment. Daily tracking never changes downstream
   project lockfiles.
+- Release preparation and publishing use the **CoMPhy release** workflow and
+  `comphy/release.py`. Preparation creates a review bundle only. Publication
+  requires the exact tag, commit and notes to be approved through the protected
+  `comphy-release` environment. Setting up release tooling is not approval to
+  publish an inferred version. Calendar tags follow `COMPHY.md`.
 - Keep generally useful fixes focused and tested. Document maintained changes
   in `COMPHY-CHANGES.md`; preserve upstream authorship and licence.
 - Documentation boundary (`documentation-boundary-v1`): component documents

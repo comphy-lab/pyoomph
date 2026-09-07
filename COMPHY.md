@@ -35,8 +35,10 @@ and runs [the bounded verification procedure](comphy/VERIFICATION.md). A
 scheduled run reuses an existing candidate SHA and checks it again until it is
 promoted, so an interrupted build cannot leave a candidate permanently untested.
 Manual dispatch also checks a current `comphy` with no pending update.
-No Action promotes candidates, tags releases,
-updates downstream lockfiles, installs on compute hosts or opens upstream PRs.
+The maintenance Action never promotes candidates, tags releases, updates
+downstream lockfiles, installs on compute hosts or opens upstream PRs. The
+separate **CoMPhy release** Action can promote and publish an explicitly
+approved snapshot, as described below.
 
 The `comphy-sync` artifact records source SHAs, mirror changes and candidate
 identity. `comphy-verification` retains test evidence and the built wheel for
@@ -63,6 +65,55 @@ badge. Run **CoMPhy upstream maintenance** manually after an interruption.
    tested commit. Record the upstream SHA, candidate SHA, build configuration,
    test run URL, wheel checksum and CoMPhy change summary in its release notes.
    Attach the verification receipt and wheel; never move an existing tag.
+
+## Release workflow
+
+Open [CoMPhy release](https://github.com/comphy-lab/pyoomph/actions/workflows/comphy-release.yml)
+on the `comphy` branch. Supply a new `comphy-YYYY.MM.DD.N` tag, the full tested
+candidate SHA, and the successful **CoMPhy upstream maintenance** run ID.
+
+Use **prepare** first. This mode reads the original run and downloads its
+artifacts, verifies the candidate identity and wheel checksum, and produces a
+`comphy-release-proposal` artifact. It creates no Git tag or GitHub Release and
+does not move `comphy`. Review its `RELEASE-NOTES.md`, `manifest.json`,
+`SHA256SUMS`, verification receipt and exact wheel. A stale candidate can be
+inspected, but cannot be promoted by the publisher; obtain a fresh maintenance
+result after intervening changes to `comphy`.
+
+To release the reviewed version, run the same workflow with **publish** and
+the exact tag/SHA/run ID. The preparation job presents the complete proposal
+again before the publishing job waits for `VatsalSy` to approve the protected
+`comphy-release` environment. Approve only after checking that run's proposal.
+The approval applies to that specific version and its notes, not future releases.
+
+After approval the publisher rechecks the original evidence and current branch,
+fast-forwards `comphy` if the candidate is still eligible, creates an annotated
+tag and draft release, uploads and verifies the exact tested assets, and only
+then publishes. Repository release immutability freezes both assets and tag.
+Keep that repository setting enabled: the workflow token cannot read admin
+settings, so the publisher confirms immutability on the final release readback.
+The release retains provenance and verification evidence beyond the Actions
+artifact retention period. No source rebuild takes place during publication.
+
+If publication is interrupted, retain the existing tag/draft and the exact
+proposal bundle. Use **Re-run failed jobs** on that same publishing run: the
+successful preparation job and its proposal artifact are reused. A fresh
+dispatch or rerun of all jobs correctly refuses an existing tag. The publisher
+accepts only a matching retry; unrelated tags,
+different notes or checksums, and changed targets are refused. Never delete or
+move a release tag to repair a failed attempt. For a changed release, choose a
+new tag and prepare a new proposal.
+
+The CI wheel is built on Ubuntu 24.04 for Python 3.13 with OpenMPI 4. It is a
+tested build artifact, not a promise of binary compatibility with every Linux
+host. Source installations must preserve their own MPI/build settings.
+These release checks establish bounded serial regressions and provenance;
+they do not establish distributed-MPI correctness or campaign validation.
+
+The implementation is `comphy/release.py`; its offline guard and recovery
+tests are run with `python3 -m unittest discover -s comphy -p test_release.py -v`.
+This repository-specific publisher supports the calendar tags above and never
+calls or publishes through upstream's release workflows.
 
 Review inherited workflows during integration. Upstream publishing/build
 workflows are disabled in this fork at bootstrap; newly introduced upstream

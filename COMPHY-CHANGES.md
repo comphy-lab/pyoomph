@@ -6,6 +6,7 @@ private simulation records. Full history and authorship remain in Git.
 | Change | Purpose | Evidence | Upstream status |
 | --- | --- | --- | --- |
 | Fork maintenance | Pristine mirrors, explicit integration candidates, bounded checks and reproducible releases. | Offline Git integration tests and CoMPhy maintenance run artifacts. | Fork-specific; no upstream submission requested. |
+| Release publishing | Prepare a versioned proposal from tested assets; publish after explicit approval with immutable tags and assets. | Offline release guard/recovery tests and the CoMPhy release preparation workflow. | Fork-specific; no upstream submission requested. |
 
 Bootstrap base: upstream `main` at
 `4f286f7317b06a6e8bf5b068532300d5790d5968` (1 September 2026).

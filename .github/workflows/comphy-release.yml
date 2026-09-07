@@ -1,0 +1,104 @@
+name: CoMPhy release
+run-name: CoMPhy release ${{ inputs.tag }} (${{ inputs.mode }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Prepare a review bundle, or publish after environment approval
+        type: choice
+        options: [prepare, publish]
+        default: prepare
+        required: true
+      tag:
+        description: Exact new tag, comphy-YYYY.MM.DD.N
+        type: string
+        required: true
+      candidate_sha:
+        description: Full commit SHA from the successful maintenance receipt
+        type: string
+        required: true
+      verification_run:
+        description: Successful CoMPhy upstream maintenance run ID
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: comphy-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: github.repository == 'comphy-lab/pyoomph' && github.ref == 'refs/heads/comphy'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Test release guards without external writes
+        run: python3 -m unittest discover -s comphy -p test_release.py -v
+      - name: Prepare exact release proposal
+        id: proposal
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          VERIFICATION_RUN: ${{ inputs.verification_run }}
+        run: |
+          python3 comphy/release.py prepare --tag "$RELEASE_TAG" \
+            --candidate-sha "$CANDIDATE_SHA" --verification-run "$VERIFICATION_RUN" \
+            --output release-bundle
+      - name: Show the proposal for review
+        env:
+          RELEASE_MODE: ${{ inputs.mode }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          bundle = Path('release-bundle')
+          manifest = json.loads((bundle / 'manifest.json').read_text())
+          eligibility = manifest['eligibility']
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as summary:
+              print((bundle / 'RELEASE-NOTES.md').read_text(), file=summary)
+              print('\nEligibility: **' + eligibility['state'] + '**.', file=summary)
+              print('\nDownload **comphy-release-proposal** to review the manifest and checksums.', file=summary)
+          if os.environ['RELEASE_MODE'] == 'publish' and not eligibility['promotable']:
+              raise SystemExit('Candidate is stale; obtain a fresh maintenance result before publishing.')
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always() && steps.proposal.outcome == 'success'
+        with:
+          name: comphy-release-proposal
+          path: release-bundle/
+          if-no-files-found: error
+          retention-days: 90
+
+  publish:
+    needs: prepare
+    if: inputs.mode == 'publish'
+    environment:
+      name: comphy-release
+      url: https://github.com/comphy-lab/pyoomph/actions/runs/${{ github.run_id }}
+    permissions:
+      contents: write
+      actions: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: comphy-release-proposal
+          path: release-bundle
+      - name: Publish the approved immutable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PYOOMPH_RELEASE_APPROVED: '1'
+        run: python3 comphy/release.py publish --bundle release-bundle
