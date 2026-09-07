@@ -305,3 +305,45 @@ def test_deeply_nested_dimensional_subexpressions_build_under_azimuthal_stabilit
         ana = J @ d
         rel = numpy.max(numpy.abs(ana - fd)) / max(numpy.max(numpy.abs(fd)), 1e-30)
         assert rel < 1e-5, "Jacobian disagrees with a finite difference: rel=%.3e" % rel
+
+
+# The azimuthal real/imaginary split (SubExpressionsToRealAndImag, src/expressions.cpp) memoises its
+# results in a GiNaC::exmap. GiNaC hashes and compares numbers by VALUE, not by representation
+# (numeric::calchash: "3 and 3.0 share the same hashvalue"), so an exact -2 and an inexact -2.0 were
+# one and the same key there - and ex::compare() unifies two ex's it finds equal by rebinding one's
+# pointer to the other's, so merely *looking up* the exact -2 that is the exponent of a power
+# rewrote that power to X^(-2.0) in place. That is not cosmetic: power::real_part() uses its
+# integer-binomial branch only for exponent.info(integer), so an inexact exponent sends it to the
+# polar form |X|^c*cos(c*atan2(b,a)+...), and a dimensional basis inside an atan2 makes the unit
+# analysis of a residual fail with "The added residual contribution is not dimensionless". Five
+# parameter sets of an evaporating-droplet stability run died there.
+#
+# Both halves are pinned below: numbers must survive the split with their exactness intact, and
+# GiNaC's real_part()/imag_part() must use the binomial branch for an inexact whole-number exponent
+# too (citools/patches/ginac-inexact-whole-number-exponent.patch).
+
+def _split(expr):
+    from pyoomph import _pyoomph_core
+    return _pyoomph_core.GiNaC_split_subexpressions_in_real_and_imaginary_parts(expr)
+
+
+def _symbol(name):
+    from pyoomph import _pyoomph_core
+    return _pyoomph_core.GiNaC_new_symbol(name)
+
+
+def test_azimuthal_split_keeps_exact_and_inexact_numbers_apart():
+    """An exact integer exponent must stay exact when a float of the same value is also present."""
+    x, y = _symbol("x"), _symbol("y")
+
+    # -2.0 (a material constant, say) and the exponent -2 meet in one expression.
+    got = str(_split(-2.0 * x + (x + y) ** (-2)))
+    assert "**(-2.0)" not in got and "^(-2.0)" not in got, \
+        "the exact exponent -2 came back inexact: " + got
+    # ...and not the other way round either: the float must not be exactified.
+    assert "(2.0)" in got, "the inexact coefficient -2.0 came back exact: " + got
+
+    # Same in a product, where GiNaC stores the exponent as a mul coefficient instead.
+    got = str(_split((-2.0 * x) * (x + y) ** (-2)))
+    assert "**(-2.0)" not in got and "^(-2.0)" not in got, got
+    assert "(2.0)" in got, got

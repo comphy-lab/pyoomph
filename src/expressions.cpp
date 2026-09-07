@@ -2496,6 +2496,22 @@ namespace pyoomph
 		public:
 			GiNaC::ex operator()(const GiNaC::ex & inp) override
 			{
+				// A number is never looked up in, nor entered into, the cache - and the lookup is the
+				// dangerous half. GiNaC hashes and compares numbers by value, not by representation
+				// (numeric::calchash: "3 and 3.0 share the same hashvalue"), so an exact -2 and an
+				// inexact -2.0 are one and the same key here. Worse, ex::compare() *unifies* two ex's
+				// it finds equal by rebinding one's pointer to the other's (ex.h, ex::share), so a
+				// mere cache lookup of the exact -2 that is the exponent of a power rewrites that
+				// power to X^(-2.0) IN PLACE, and the cache then hands back the inexact number too.
+				// An inexact whole-number exponent is not cosmetic: power::real_part() takes its
+				// integer-binomial branch only for exponent.info(integer), which an inexact -2.0 is
+				// not, so it falls through to the polar form and puts the (dimensional) basis inside
+				// an atan2, where the unit analysis cannot separate the units - the evaporating
+				// droplet died in add_residual with "the added residual contribution is not
+				// dimensionless" on exactly this. Same reasoning as ReplaceFieldsToNonDimFields and
+				// SubexpressionMasker, both of which already refuse to cache a number.
+				if (GiNaC::is_a<GiNaC::numeric>(inp))
+					return inp;
 				GiNaC::exmap::const_iterator found = cache.find(inp);
 				if (found != cache.end())
 					return found->second;

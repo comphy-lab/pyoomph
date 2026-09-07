@@ -1007,6 +1007,12 @@ namespace pyoomph
 			n_calls++;
 			distinct_nodes.insert(inp.gethash());
 		}
+		// Never look a number up in the cache: GiNaC compares numbers by value, so an exact -2 and an
+		// inexact -2.0 are the same key, and ex::compare() unifies what it finds equal by rebinding
+		// one ex to the other - so the lookup alone can turn an exact exponent inexact in place. See
+		// the long comment on SubExpressionsToRealAndImag in expressions.cpp.
+		if (GiNaC::is_a<GiNaC::numeric>(inp))
+			return inp;
 		GiNaC::exmap::const_iterator cached = cache.find(inp);
 		if (cached != cache.end())
 		{
@@ -1255,6 +1261,11 @@ namespace pyoomph
 		// harmless at all for the generated C source: an exponent that comes back inexact makes
 		// print_simplest_form's ExactifyWholeNumberExponents necessary, and without it a reciprocal
 		// x^(-1) is printed as a multiplication by x. A leaf costs nothing to expand anyway.
+		// The lookup is the dangerous half, not the answer: ex::compare() unifies two ex's it finds
+		// equal by rebinding one's pointer to the other's (ex.h, ex::share), so looking an exact -2
+		// up against a stored -2.0 rewrites the power it is the exponent of to X^(-2.0) IN PLACE.
+		// That is what broke the azimuthal split's own cache; see SubExpressionsToRealAndImag in
+		// expressions.cpp.
 		if (GiNaC::is_a<GiNaC::numeric>(inp))
 			return do_replace(inp);
 		const unsigned h = inp.gethash();
@@ -4602,6 +4613,10 @@ namespace pyoomph
 		MeshToCoordinateShapes(FiniteElementCode *code_) : code(code_) {}
 		GiNaC::ex operator()(const GiNaC::ex &inp) override
 		{
+			// Numbers bypass the cache; a lookup of one can rewrite an exact number inexact in place.
+			// See the comment on SubExpressionsToRealAndImag in expressions.cpp.
+			if (GiNaC::is_a<GiNaC::numeric>(inp))
+				return inp;
 			GiNaC::exmap::const_iterator cached = cache.find(inp);
 			if (cached != cache.end())
 				return cached->second;
