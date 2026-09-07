@@ -826,9 +826,18 @@ namespace pyoomph
 	// cancelled symbolically by GiNaC outside of the subexpression boundary.
 	GiNaC::ex DrawUnitsOutOfSubexpressions::operator()(const GiNaC::ex &inp)
 	{
+		if (__time_add_residual())
+		{
+			n_calls++;
+			distinct_nodes.insert(inp.gethash());
+		}
 		GiNaC::exmap::const_iterator cached = cache.find(inp);
 		if (cached != cache.end())
+		{
+			if (__time_add_residual())
+				n_hits++;
 			return cached->second;
+		}
 		GiNaC::ex result = this->do_map(inp);
 		cache[inp] = result;
 		return result;
@@ -849,6 +858,8 @@ namespace pyoomph
 				std::cout << "PROCESSING " << inp << std::endl
 						  << "YIELDS " << arg << std::endl
 						  << std::endl;
+			if (__time_add_residual())
+				n_cbu_calls++;
 			if (!expressions::collect_base_units(arg, factor, unit, rest))
 			{
 				std::ostringstream oss;
@@ -871,6 +882,8 @@ namespace pyoomph
 			// op(1) below would walk the whole (already processed) tree again
 			GiNaC::ex mapped = inp.map(*this);
 			GiNaC::ex arg = mapped.op(0); // Descent recursively through nested subexpressions
+			if (__time_add_residual())
+				n_cbu_calls++;
 			if (!expressions::collect_base_units(arg, factor, unit, rest))
 			{
 				std::ostringstream oss;
@@ -882,6 +895,8 @@ namespace pyoomph
 			}
 			GiNaC::ex factor2, unit2, rest2;
 			GiNaC::ex arg2 = mapped.op(1); // Descent recursively through nested subexpressions
+			if (__time_add_residual())
+				n_cbu_calls++;
 			if (!expressions::collect_base_units(arg2, factor2, unit2, rest2))
 			{
 				std::ostringstream oss;
@@ -5174,6 +5189,12 @@ namespace pyoomph
 			__phase_timer __t("DrawUnitsOutOfSubexpressions");
 			DrawUnitsOutOfSubexpressions units_out_of_subexpressions(this);
 			repl = units_out_of_subexpressions(expanded);
+			if (__time_add_residual())
+				std::cerr << "[add_residual]   ph:units calls " << units_out_of_subexpressions.get_n_calls()
+						  << " memo_hits " << units_out_of_subexpressions.get_n_hits()
+						  << " distinct " << units_out_of_subexpressions.get_n_distinct()
+						  << " cbu_calls " << units_out_of_subexpressions.get_n_cbu_calls()
+						  << " masked " << units_out_of_subexpressions.get_n_masked() << std::endl;
 		}
 		// `expa` is read only by the base-unit check below; the residual actually stored is
 		// repl.subs(sublist). Normalising a residual with rational nonlinearities puts all the

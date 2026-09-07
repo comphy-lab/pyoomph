@@ -26,6 +26,7 @@ The main author may be contacted at c.diddens@utwente.nl
 #include <vector>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include "expressions.hpp"
 #include "jitbridge.h"
 
@@ -445,11 +446,27 @@ namespace pyoomph
       // shared subtree once per parent and rebuilds it into separate copies, so a residual with many
       // nested subexpression() markers costs exponentially much.
       GiNaC::exmap cache;
+      // Diagnostics, only maintained under PYOOMPH_TIME_ADD_RESIDUAL (printed by add_residual):
+      // how often the mapper was entered, how often the memo answered, how many distinct nodes were
+      // seen (by hash) and how often collect_base_units() was actually called. The gap between
+      // "calls" and "distinct" is the DAG-as-tree blowup this mapper used to pay in full.
+      unsigned long n_calls = 0;
+      unsigned long n_hits = 0;
+      unsigned long n_cbu_calls = 0;
+      std::unordered_set<unsigned> distinct_nodes;
+      // Number of nested subexpression() markers replaced by a placeholder symbol before the unit
+      // analysis (see the masking pass below); stays 0 while masking is disabled.
+      unsigned long n_masked = 0;
 
    public:
       DrawUnitsOutOfSubexpressions(FiniteElementCode *code_) : code(code_) {}
       GiNaC::ex operator()(const GiNaC::ex &inp) override;
       GiNaC::ex do_map(const GiNaC::ex &inp);
+      unsigned long get_n_calls() const { return n_calls; }
+      unsigned long get_n_hits() const { return n_hits; }
+      unsigned long get_n_distinct() const { return distinct_nodes.size(); }
+      unsigned long get_n_cbu_calls() const { return n_cbu_calls; }
+      unsigned long get_n_masked() const { return n_masked; }
    };
 
    // GiNaC::map_function that strips expressions::subexpression(...) markers back out again (replacing
