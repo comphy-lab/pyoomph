@@ -8013,6 +8013,11 @@ namespace pyoomph
 				// found zero.
 				std::set<unsigned> params_in_residual;
 				register_global_parameters_in(steady_residual, params_in_residual);
+				// One ambient-flag configuration for the whole loop (nothing below touches the codegen
+				// flags), so the derivative of a marker can be memoised across it - see
+				// expressions::SubexpressionDerivativeCacheScope. Without it the diff below walks the
+				// residual DAG as a tree.
+				expressions::SubexpressionDerivativeCacheScope __subexpr_deriv_cache_scope;
 				for (unsigned int i = 0; i < local_parameter_symbols.size(); i++) // Only parameters in Residuals releveant (e.g. not in integral expressions)
 				{
 					if (!params_in_residual.count(i))

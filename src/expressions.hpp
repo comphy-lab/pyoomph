@@ -619,6 +619,30 @@ namespace pyoomph
 
     DECLARE_FUNCTION_1P(subexpression) // Wraps an expression so it is factored out as a named local subexpression in the generated code instead of being inlined everywhere it is used
 
+    // RAII switch that memoises the derivative of a subexpression() marker for the duration of ONE
+    // symbolic differentiation pass.
+    //
+    // subexpression_expl_deriv() is `subexpression(wrapped.diff(deriv_arg))`, and GiNaC::diff is not
+    // memoised: a marker reachable by k paths through the residual DAG is differentiated k times, and
+    // every one of those rebuilds re-fires the evaluating subexpression() on the way out. That is the
+    // dominant cost of write_code on a deeply nested model.
+    //
+    // The derivative is NOT a function of (marker, symbol) alone - ShapeExpansion::derivative reads
+    // the ambient codegen flags (__deriv_subexpression_wrto, __derive_only_by_expansion_mode,
+    // __ignore_dpsi_coord_diffs_in_jacobian, __in_hessian, __in_pitchfork_symmetry_constraint) - so
+    // the cache may not outlive one flag configuration. Hence the scope: there is no cache at all
+    // unless one of these is alive, and it is discarded when it ends. Nest them freely; an inner
+    // scope gets its own table and restores the outer one.
+    class SubexpressionDerivativeCacheScope
+    {
+      void *prev;
+    public:
+      SubexpressionDerivativeCacheScope();
+      ~SubexpressionDerivativeCacheScope();
+      SubexpressionDerivativeCacheScope(const SubexpressionDerivativeCacheScope &) = delete;
+      SubexpressionDerivativeCacheScope &operator=(const SubexpressionDerivativeCacheScope &) = delete;
+    };
+
     DECLARE_FUNCTION_1P(get_real_part) // Real part of a (possibly complex-valued) expression
     DECLARE_FUNCTION_1P(get_imag_part) // Imaginary part of a (possibly complex-valued) expression
     DECLARE_FUNCTION_1P(split_subexpressions_in_real_and_imaginary_parts) // Rewrites any subexpression() leaves inside the argument into separate real/imaginary subexpression() leaves

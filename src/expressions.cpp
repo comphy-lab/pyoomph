@@ -2208,9 +2208,33 @@ namespace pyoomph
 			throw_runtime_error("Cannot derive a subexpression");
 		}
 
+		// Memo table of SubexpressionDerivativeCacheScope (expressions.hpp), which is where the reasoning
+		// about its lifetime lives. Hash bucket confirmed by is_equal, the same idiom as
+		// ReplaceFieldsToNonDimFields; keyed on the pair (wrapped argument, differentiation symbol),
+		// since one pass differentiates by several symbols and markers of different codes hash alike.
+		struct SubexpressionDerivCache
+		{
+			struct Entry
+			{
+				GiNaC::ex wrapped, wrto, value;
+			};
+			std::unordered_map<unsigned, std::vector<Entry>> memo;
+		};
+		static thread_local SubexpressionDerivCache *__subexpr_deriv_cache = NULL;
+
 		static ex subexpression_expl_deriv(const ex &wrapped, const symbol &deriv_arg)
 		{
-			return subexpression(wrapped.diff(deriv_arg));
+			if (!__subexpr_deriv_cache)
+				return subexpression(wrapped.diff(deriv_arg));
+			const unsigned h = wrapped.gethash();
+			auto &bucket = __subexpr_deriv_cache->memo[h];
+			for (auto &e : bucket)
+				if (e.wrapped.is_equal(wrapped) && e.wrto.is_equal(deriv_arg))
+					return e.value;
+			ex res = subexpression(wrapped.diff(deriv_arg));
+			// Re-fetch: the recursive diff above can have inserted into the same table.
+			__subexpr_deriv_cache->memo[h].push_back(SubexpressionDerivCache::Entry{wrapped, deriv_arg, res});
+			return res;
 		}
 
 		// A held subexpression() is always scalar: subexpression_eval above pushes a matrix argument down
@@ -2220,6 +2244,17 @@ namespace pyoomph
 		// that question of its argument. The dynamic answer is already commutative, so the canonical
 		// ordering of products is unchanged.
 		REGISTER_FUNCTION(subexpression, eval_func(subexpression_eval).evalf_func(subexpression_evalf).derivative_func(subexpression_deriv).expl_derivative_func(subexpression_expl_deriv).set_return_type(GiNaC::return_types::commutative))
+
+		SubexpressionDerivativeCacheScope::SubexpressionDerivativeCacheScope() : prev(__subexpr_deriv_cache)
+		{
+			__subexpr_deriv_cache = new SubexpressionDerivCache();
+		}
+
+		SubexpressionDerivativeCacheScope::~SubexpressionDerivativeCacheScope()
+		{
+			delete __subexpr_deriv_cache;
+			__subexpr_deriv_cache = static_cast<SubexpressionDerivCache *>(prev);
+		}
 
 		////////////////
 
