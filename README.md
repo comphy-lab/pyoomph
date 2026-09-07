@@ -1,3 +1,10 @@
+# CoMPhy maintained fork
+
+See [COMPHY.md](COMPHY.md) for branch policy, daily upstream tracking, tested
+versions, installation and contributions. `comphy` is our maintained branch;
+`main` and `develop` mirror upstream. Upstream contributions require an
+explicit request and are separate from maintaining this fork.
+
 # Description
 
 pyoomph is an object-oriented multi-physics finite element framework.

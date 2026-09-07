@@ -1,0 +1,124 @@
+name: CoMPhy upstream maintenance
+
+on:
+  schedule:
+    - cron: '23 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: comphy-maintenance
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'comphy-lab/pyoomph' && github.ref == 'refs/heads/comphy'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    outputs:
+      candidate_sha: ${{ steps.report.outputs.candidate_sha }}
+      verify: ${{ steps.report.outputs.verify }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Test maintenance logic without GitHub writes
+        run: python3 -m unittest discover -s comphy -p test_sync.py -v
+      - name: Mirror upstream and prepare candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 comphy/sync.py --publish --report receipts/sync.json
+      - name: Select candidate checks
+        id: report
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          report = json.loads(Path('receipts/sync.json').read_text())
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              print('candidate_sha=' + report['candidate_sha'], file=out)
+              verify = report['status'] == 'candidate' or os.environ['EVENT_NAME'] == 'workflow_dispatch'
+              print('verify=' + str(verify).lower(), file=out)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
+              print('### Upstream tracking\n```json\n' + json.dumps(report, indent=2) + '\n```', file=out)
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: comphy-sync
+          path: receipts/sync.json
+          if-no-files-found: error
+          retention-days: 90
+
+  verify:
+    needs: sync
+    if: needs.sync.outputs.verify == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      OMP_NUM_THREADS: '2'
+      OPENBLAS_NUM_THREADS: '2'
+      MKL_NUM_THREADS: '2'
+      CMAKE_BUILD_PARALLEL_LEVEL: '2'
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+    steps:
+      - name: Checkout trusted verification driver
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: control
+          persist-credentials: false
+      - name: Checkout exact candidate
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.sync.outputs.candidate_sha }}
+          path: candidate
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.13'
+      - name: Install compiler and runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build ccache libgmp-dev libopenmpi-dev openmpi-bin libglu1-mesa libgl1 autoconf automake libtool pkg-config m4 bison flex texinfo
+          python -m venv build-env
+          build-env/bin/python -m pip install 'pip==25.2' 'scikit-build-core==0.11.6' 'nanobind==2.9.2' 'numpy>=1.24.4' 'mpi4py>=4,<5'
+          mkdir -p receipts
+          build-env/bin/python -m pip freeze > receipts/build-packages.txt
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .ccache
+          key: comphy-ubuntu24-py313-${{ needs.sync.outputs.candidate_sha }}
+          restore-keys: comphy-ubuntu24-py313-
+      - name: Build the candidate wheel with MPI
+        working-directory: candidate
+        run: |
+          ../build-env/bin/python -m pip wheel . --no-deps --no-build-isolation --wheel-dir ../wheelhouse \
+            --config-settings=build.tool-args=-j2 \
+            --config-settings=cmake.define.CMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            --config-settings=cmake.define.PYOOMPH_USE_MPI=ON \
+            --config-settings=cmake.define.PYOOMPH_COPY_STUBS_TO_SOURCE_TREE=OFF
+      - name: Exercise installed wheel
+        env:
+          CANDIDATE_SHA: ${{ needs.sync.outputs.candidate_sha }}
+        run: |
+          python control/comphy/verify.py --wheel wheelhouse/pyoomph-*.whl \
+            --candidate-sha "$CANDIDATE_SHA" --source candidate --report receipts/verification.json
+      - name: Retain candidate evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: comphy-verification
+          path: |
+            receipts/
+            wheelhouse/
+            candidate/build/wheel/CMakeCache.txt
+          if-no-files-found: warn
+          retention-days: 90

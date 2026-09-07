@@ -1,3 +1,28 @@
+# CoMPhy fork policy
+
+Read `COMPHY.md` and `COMPHY-CHANGES.md` for fork maintenance. These rules take
+precedence over upstream branch/release instructions in this checkout:
+
+- GitHub `comphy-lab/pyoomph` is the workshop. `comphy` is the maintained
+  default branch; `main` and `develop` are pristine upstream mirrors.
+- Never write to `cdiddens/pyoomph` or `pyoomph/pyoomph` (including PRs,
+  issues or comments) without Vatsal's explicit request for that action.
+  Fork maintenance and a CoMPhy release do not authorise an upstream PR.
+- Fetch upstream anonymously. Its local push URL must be disabled; default
+  pushes go to the CoMPhy fork. Automation uses only the fork-scoped token.
+- Prepare upstream integration as a merge candidate, test its exact SHA,
+  then promote after review. No automatic conflict resolution, force-pushes,
+  rebases of published history, moving release tags or production installs.
+- Use `comphy/VERIFICATION.md` for bounded candidate checks. Never replace a
+  running simulation's environment. Daily tracking never changes downstream
+  project lockfiles.
+- Keep generally useful fixes focused and tested. Document maintained changes
+  in `COMPHY-CHANGES.md`; preserve upstream authorship and licence.
+- Documentation boundary (`documentation-boundary-v1`): component documents
+  are public-candidate. Private simulation records, paths and provisional
+  findings belong in the private project context until Vatsal approves both
+  their content and public target.
+
 # pyoomph — reference for AI coding assistants
 
 This file is a condensed, code-verified reference for AI assistants helping a user
