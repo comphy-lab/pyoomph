@@ -7798,7 +7798,13 @@ namespace pyoomph
 		auto print_named_ex_map = [&](const std::map<std::string, GiNaC::ex> &m)
 		{ for (auto &kv : m) { os << kv.first << "="; print_ex(kv.second); } };
 
-		os << "FMT10\n"; // Bump whenever this function's coverage/format changes
+		os << "FMT11\n"; // Bump whenever this function's coverage/format changes
+		// FMT11: the two switches of the azimuthal real/imaginary split are covered -
+		// PYOOMPH_DISABLE_REIM_FOLD (whether subexpression() reports the real/imaginary part of a
+		// provably real marker, which changes how far the split expands products) and
+		// PYOOMPH_UNIT_CCF_MAX_TERMS (the term count above which collect_base_units skips
+		// collect_common_factors). Both change what write_code() emits - measured, on the two
+		// azimuthal reference cases and the synthetic one - so both have to be in here.
 		// FMT10: the hanging-node split (split_rjm_by_hang, PYOOMPH_DISABLE_HANG_SPLIT) is covered, and
 		// so is PYOOMPH_DISABLE_RJM_SPLIT, which decides the same kind of thing and was missing.
 		// FMT9: the Z2 compound-flux grouping and its per-group normalization/weight are covered
@@ -7820,7 +7826,9 @@ namespace pyoomph
 		   << " sw_no_unit_prescan=" << (getenv("PYOOMPH_DISABLE_UNIT_PRESCAN") != NULL)
 		   << " sw_no_rjm_split=" << (getenv("PYOOMPH_DISABLE_RJM_SPLIT") != NULL)
 		   << " sw_no_hang_split=" << (getenv("PYOOMPH_DISABLE_HANG_SPLIT") != NULL)
-		   << " sw_no_unit_mask=" << !__unit_mask_on << "\n";
+		   << " sw_no_unit_mask=" << !__unit_mask_on
+		   << " sw_no_reim_fold=" << (getenv("PYOOMPH_DISABLE_REIM_FOLD") != NULL)
+		   << " sw_ccf_max=" << (getenv("PYOOMPH_UNIT_CCF_MAX_TERMS") ? getenv("PYOOMPH_UNIT_CCF_MAX_TERMS") : "default") << "\n";
 		os << "dim=" << nodal_dim << " lagr_dim=" << lagr_dim << " max_dt_order=" << max_dt_order << " integration_order=" << integration_order << "\n";
 		os << "generate_hessian=" << generate_hessian << " assemble_hessian_by_symmetry=" << assemble_hessian_by_symmetry << "\n";
 		os << "analytical_jacobian=" << analytical_jacobian << " analytical_position_jacobian=" << analytical_position_jacobian << "\n";
