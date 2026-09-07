@@ -440,6 +440,29 @@ namespace pyoomph
 		// arg == factor*units*rest. Returns false (and leaves an error on stderr) if "arg" is not unit-consistent, e.g. if
 		// it adds/subtracts terms carrying different units.
 		// TODO: Not sure whether this is correct in all cases
+		// Set while a speculative unit split is performed, i.e. when a failure is an expected outcome rather than an error
+		// (see decidable_condition_sign). It only silences the diagnostics below, the return value is unaffected.
+		static bool quiet_unit_collection = false;
+
+		// True if any registered base unit occurs anywhere in "e". Done as a single traversal: asking
+		// has(e, bu) per base unit walks the whole expression once for each of the ~50 registered
+		// units, and since collect_base_units() asks this at every function node it meets, that made
+		// the unit analysis quadratic in the size of a large residual.
+		static bool contains_base_unit(const GiNaC::ex &e)
+		{
+			for (GiNaC::const_preorder_iterator i = e.preorder_begin(); i != e.preorder_end(); ++i)
+			{
+				if (!GiNaC::is_a<GiNaC::symbol>(*i))
+					continue;
+				for (auto &bu : base_units)
+				{
+					if (i->is_equal(bu.second))
+						return true;
+				}
+			}
+			return false;
+		}
+
 		bool collect_base_units(GiNaC::ex arg, GiNaC::ex &factor, GiNaC::ex &units, GiNaC::ex &rest)
 		{
 			if (pyoomph_verbose)
@@ -494,7 +517,7 @@ namespace pyoomph
 					GiNaC::ex sunits = 1;
 					if (!collect_base_units(cl.op(0), sfactor, sunits, srest))
 					{
-						std::cerr << "Problem collecting units in " << cl.op(0) << std::endl;
+						if (!quiet_unit_collection) std::cerr << "Problem collecting units in " << cl.op(0) << std::endl;
 						return false;
 					}
 					if (pyoomph_verbose)
@@ -521,7 +544,7 @@ namespace pyoomph
 						GiNaC::ex sunits = 1;
 						if (!collect_base_units(cl.op(i), sfactor, sunits, srest))
 						{
-							std::cerr << "Problem collecting units in " << cl.op(i) << std::endl;
+							if (!quiet_unit_collection) std::cerr << "Problem collecting units in " << cl.op(i) << std::endl;
 							return false;
 						}
 						sunits=GiNaC::expand(sunits);
@@ -531,7 +554,7 @@ namespace pyoomph
 						{
 							if (!common_unit.is_equal(sunits))
 							{
-								std::cerr << "Problem: Adding/subtracting different units [" << common_unit << "] and [" << sunits << "] in " << cl << std::endl;
+								if (!quiet_unit_collection) std::cerr << "Problem: Adding/subtracting different units [" << common_unit << "] and [" << sunits << "] in " << cl << std::endl;
 								return false;
 							}
 						}
@@ -559,7 +582,7 @@ namespace pyoomph
 					GiNaC::ex sunits = 1;
 					if (!collect_base_units(cl.op(0), sfactor, sunits, srest))
 					{
-						std::cerr << "Problem collecting units in subexpression " << cl.op(0) << std::endl;
+						if (!quiet_unit_collection) std::cerr << "Problem collecting units in subexpression " << cl.op(0) << std::endl;
 						return false;
 					}
 					units *= sunits;
@@ -657,17 +680,20 @@ namespace pyoomph
 						}
 					}
 				}
-				else if (is_ex_the_function(cl, expressions::piecewise_geq0))
+				else if (is_ex_the_function(cl, expressions::piecewise_geq0) || is_ex_the_function(cl, expressions::piecewise_gt0))
 				{
-					// piecewise_geq0(cond,a,b): the units of the three arguments are unrelated to each other. Only the
-					// *sign* of cond decides the branch and base units are positive by construction, so cond's unit and
-					// its (nonnegative) scale can be divided out without changing the outcome. The two branch values are
-					// alternatives of the same quantity, so they must agree in units - that unit is the result's unit.
+					// piecewise_geq0(cond,a,b) and its strict twin piecewise_gt0: the units of the three arguments are
+					// unrelated to each other. Only the *sign* of cond decides the branch and base units are positive by
+					// construction, so cond's unit and its (nonnegative) scale can be divided out without changing the
+					// outcome. The two branch values are alternatives of the same quantity, so they must agree in units -
+					// that unit is the result's unit.
+					const bool strict = is_ex_the_function(cl, expressions::piecewise_gt0);
 					GiNaC::ex cfactor = 1, cunits = 1, crest = 1;
 					if (!collect_base_units(cl.op(0), cfactor, cunits, crest))
 					{
 						std::ostringstream oss;
-						oss << "Cannot extract the unit from the condition of " << cl << " , i.e. from " << cl.op(0);
+						oss << "Cannot extract the unit from the condition of " << cl << " , i.e. from " << cl.op(0) << std::endl;
+						oss << "If this stems from a comparison, mind that both sides must have the same unit.";
 						throw_runtime_error(oss.str());
 					}
 					// cfactor is numeric here (a symbolic prefactor would have been folded into crest) and only its sign
@@ -712,9 +738,10 @@ namespace pyoomph
 						units *= common_unit;
 						units = GiNaC::expand(units);
 						factor *= dominant_factor;
-						rest *= pyoomph::expressions::piecewise_geq0(cond_rest,
-																	 branch_rest[0] * branch_scale[0] / dominant_factor,
-																	 branch_rest[1] * branch_scale[1] / dominant_factor);
+						GiNaC::ex tb = branch_rest[0] * branch_scale[0] / dominant_factor;
+						GiNaC::ex fb = branch_rest[1] * branch_scale[1] / dominant_factor;
+						rest *= (strict ? pyoomph::expressions::piecewise_gt0(cond_rest, tb, fb)
+										: pyoomph::expressions::piecewise_geq0(cond_rest, tb, fb));
 					}
 				}
 				else if (GiNaC::is_a<GiNaC::function>(cl))
@@ -724,15 +751,7 @@ namespace pyoomph
 					// in place (factor*units folded back into the argument) since we cannot know how the function combines
 					// its arguments dimensionally.
 					// Test if there are units left in the function args
-					bool units_left = false;
-					for (auto &bu : base_units)
-					{
-						if (GiNaC::has(cl, bu.second))
-						{
-							units_left = true;
-							break;
-						}
-					}
+					bool units_left = contains_base_unit(cl);
 					if (!units_left)
 					{
 						rest *= cl;
@@ -751,7 +770,7 @@ namespace pyoomph
 							GiNaC::ex sunits = 1;
 							if (!collect_base_units(cl.op(i), sfactor, sunits, srest))
 							{
-								std::cerr << "Problem collecting units in arg " << i << ", i.e. " << cl.op(i) << std::endl
+								if (!quiet_unit_collection) std::cerr << "Problem collecting units in arg " << i << ", i.e. " << cl.op(i) << std::endl
 										  << " of " << std::endl
 										  << cl << std::endl;
 								return false;
@@ -856,12 +875,8 @@ namespace pyoomph
 			// TODO Check the rest for missing units
 			// Sanity check: "rest" must end up truly dimensionless -- if any base unit symbol still occurs in it, something
 			// above failed to fully factor out the units, so report failure rather than return an inconsistent split
-			for (auto &bu : base_units)
-			{
-				//		if (bu.second==cl.op(i))  {units*=cl.op(i); found=true; break;}
-				if (GiNaC::has(rest, bu.second))
-					return false;
-			}
+			if (contains_base_unit(rest))
+				return false;
 
 			// Check whether the factor is positive, try to go for the positive one
 			//std::cout << "FACTOR " << factor << std::endl;
@@ -2097,7 +2112,12 @@ namespace pyoomph
 				return wrapped; // Simplify these
 			else
 			{
-				GiNaC::ex evm = wrapped.evalm();
+				// evalm() is only used to find out whether the argument is (or evaluates to) a matrix - the scalar
+				// branch below re-wraps the original expression. evalm() rebuilds the entire tree, which expands the
+				// shared subtrees of a DAG into separate copies, so calling it on every nested subexpression() blows
+				// up exponentially. Everything that can produce a matrix here (matrix literals, grad, unitvect,
+				// inverse_matrix, ...) reports a noncommutative return type, so a commutative argument can skip it.
+				GiNaC::ex evm = (wrapped.return_type() == GiNaC::return_types::commutative ? wrapped : wrapped.evalm());
 				if (GiNaC::is_a<GiNaC::matrix>(evm))
 				{
 					GiNaC::matrix inp = GiNaC::ex_to<GiNaC::matrix>(evm);
@@ -2142,6 +2162,13 @@ namespace pyoomph
 
 		////////////////
 
+		// True if a real/imaginary-part split left something standing that GiNaC could not resolve, i.e. if the result
+		// still contains a real_part()/imag_part() node. Those have no C counterpart, so such a result must not be used.
+		static bool has_unresolved_part(const ex &e)
+		{
+			return GiNaC::has(e, GiNaC::real_part_function(GiNaC::wild())) || GiNaC::has(e, GiNaC::imag_part_function(GiNaC::wild()));
+		}
+
 		// eval_func for get_real_part(): numeric/constant arguments are evaluated directly via GiNaC::real_part; matrices are
 		// handled entrywise. While the argument still contains unresolved pyoomph placeholders (need_to_hold), GiNaC's own
 		// real_part() is applied instead, since it distributes automatically over +,-,*,/ and can be pushed arbitrarily deep
@@ -2175,7 +2202,18 @@ namespace pyoomph
 					return GiNaC::real_part(wrapped);
 				}
 				else
-					return get_real_part(wrapped).hold();
+				{
+					// GiNaC's real_part() also handles a fully resolved argument: it distributes over +,-,*,/ and
+					// dispatches to each function's real_part_func, the hooks of the custom callbacks included. Take that
+					// result whenever the split came out complete. Holding instead is only worth it while something
+					// remains unresolved and a later stage may still do better, since a held get_real_part() can neither
+					// be separated into units nor be printed as C - a residual containing one used to be rejected with
+					// "The units of 1 term(s) cannot be separated from the rest at all".
+					GiNaC::ex res = GiNaC::real_part(wrapped);
+					if (has_unresolved_part(res))
+						return get_real_part(wrapped).hold();
+					return res;
+				}
 			}
 		}
 
@@ -2223,7 +2261,13 @@ namespace pyoomph
 				else if (need_to_hold(wrapped))
 					return GiNaC::imag_part(wrapped);
 				else
-					return get_imag_part(wrapped).hold();
+				{
+					// Same as in get_real_part_eval above
+					GiNaC::ex res = GiNaC::imag_part(wrapped);
+					if (has_unresolved_part(res))
+						return get_imag_part(wrapped).hold();
+					return res;
+				}
 			}
 		}
 
@@ -2250,29 +2294,42 @@ namespace pyoomph
 		// GiNaC map_function that walks an expression tree and, for every subexpression(x) leaf found, checks whether x has
 		// a nonzero imaginary part; if so, replaces that single subexpression() by a pair
 		// subexpression(real_part(x)) + I*subexpression(imag_part(x)), so that downstream real-only code generation can
-		// handle the real and imaginary contributions as two separate named subexpressions
+		// handle the real and imaginary contributions as two separate named subexpressions.
+		// The argument of a subexpression() is descended into exactly once and the result is reused: mapping it a second
+		// time doubles the work per nesting level, and since rebuilding a subexpression() re-triggers subexpression_eval()
+		// (which calls evalm() over the whole argument), nested subexpressions otherwise blow up exponentially. Results are
+		// additionally memoised, so a subtree shared by several parents is only walked once.
 		class SubExpressionsToRealAndImag : public GiNaC::map_function
 		{
+		protected:
+			GiNaC::exmap cache;
 		public:
 			GiNaC::ex operator()(const GiNaC::ex & inp) override
 			{
+				GiNaC::exmap::const_iterator found = cache.find(inp);
+				if (found != cache.end())
+					return found->second;
+				GiNaC::ex result;
 				if (is_ex_the_function(inp, expressions::subexpression))
 				{
 					GiNaC::ex mapped_ex = inp.op(0).map(*this);
 					if (GiNaC::is_zero(GiNaC::imag_part(mapped_ex)))
 					{
-						return inp.map(*this);
+						// Purely real: keep the subexpression() wrapping, but do not rebuild it when nothing changed
+						result = (mapped_ex.is_equal(inp.op(0)) ? inp : pyoomph::expressions::subexpression(mapped_ex));
 					}
 					else
 					{
-						return (pyoomph::expressions::subexpression(GiNaC::real_part(mapped_ex)) + GiNaC::I * pyoomph::expressions::subexpression(GiNaC::imag_part(mapped_ex))).map(*this);
+						// mapped_ex is already fully processed, so the split pair must not be mapped again
+						result = pyoomph::expressions::subexpression(GiNaC::real_part(mapped_ex)) + GiNaC::I * pyoomph::expressions::subexpression(GiNaC::imag_part(mapped_ex));
 					}
-
 				}
-				else 
+				else
 				{
-					return inp.map(*this);
+					result = inp.map(*this);
 				}
+				cache[inp] = result;
+				return result;
 			}
 		};
 
@@ -3222,51 +3279,78 @@ namespace pyoomph
 									   .evalf_func(maximum_evalf)
 									   .set_return_type(GiNaC::return_types::commutative))
 
-		// piecewise_geq0(cond,a,b): returns a if cond>=0, else b. The zero case used to be decided the other way round here
-		// (by the strict numeric::is_positive()) than in the generated code, so an already numeric cond==0 gave b while the
-		// very same expression gave a once it had passed through code generation. Relational conditions (cond as a GiNaC::relational, e.g.
-		// from Python's <,<=,>,>= comparisons) are not supported here -- see the disabled block below explaining why
-		// (Python operator overloads would need extra work); only a numeric/constant condition is evaluated directly,
-		// otherwise the call stays held and is only resolved at code-generation time via a C ternary (see
-		// piecewise_geq0_csrc_float below).
-		static ex piecewise_geq0_eval(const ex &cond, const ex &a, const ex &b)
+		// Decides the sign of a condition that may still carry units. A dimensional condition like 2*second is not a
+		// GiNaC::numeric, so testing is_a<numeric>() alone would leave e.g. conditional(var("t")<2*second,...)("t"=4*second)
+		// unresolved. Base units are positive symbols, hence only the numeric factor and the dimensionless remainder of the
+		// unit split carry the sign. to_double() (i.e. the real part) rather than is_positive()/is_negative(), which are
+		// false for anything not real and would send a complex-typed but real-valued condition down the wrong branch.
+		bool decidable_condition_sign(const GiNaC::ex &cond, int &sign)
 		{
-			/*throw_runtime_error("PIECEWISE does not work right now: Reason: condition -> relational is problematic. It will require to overload all the ==, >=, ... operators in python");
-			if (!GiNaC::is_a<GiNaC::relational>(cond))
-			{
-				throw_runtime_error("piecewise(condition, true_result, false_result) requires the condition to be a relational");
-			}
-			GiNaC::relational rel = GiNaC::ex_to<GiNaC::relational>(cond);
-			GiNaC::ex diff = rel.lhs() - rel.rhs();
-			GiNaC::ex_to<GiNaC::numeric>(diff);
-			*/			
-			/*
-			GiNaC::numeric B=GiNaC::ex_to<GiNaC::numeric>(rel.op(1));
-
-				   case info_flags::relation_equal:
-					   return o==equal;
-				   case info_flags::relation_not_equal:
-					   return o==not_equal;
-				   case info_flags::relation_less:
-					   return o==less;
-				   case info_flags::relation_less_or_equal:
-					   return o==less_or_equal;
-				   case info_flags::relation_greater:
-					   return o==greater;
-				   case info_flags::relation_greater_or_equal:
-					   return o==greater_or_equal;
-			*/
+			GiNaC::ex value;
 			if (GiNaC::is_a<GiNaC::numeric>(cond) || GiNaC::is_a<GiNaC::constant>(cond))
 			{
-				// to_double() (the real part of a complex numeric) rather than is_positive()/is_negative(), which are false
-				// for anything not real and would send a complex-typed but real-valued condition down the wrong branch
-				if (GiNaC::to_double(GiNaC::ex_to<GiNaC::numeric>(cond.evalf())) < 0)
-					return b;
-				else
-					return a;
+				value = cond;
 			}
-			// TODO: SIMPLIFICATION HERE IF POSSIBLE
+			else
+			{
+				GiNaC::ex factor = 1, units = 1, rest = 1;
+				// A condition that is not unit-separable (mismatching units, or a field whose unit is only known once the
+				// scales are known) is simply not decidable here. This is the common case for a held condition, so the
+				// split is done quietly; nonmatching units are still rejected later on, namely by the
+				// piecewise_geq0/piecewise_gt0 branch of collect_base_units during code generation.
+				bool ok;
+				quiet_unit_collection = true;
+				try
+				{
+					ok = collect_base_units(cond, factor, units, rest);
+				}
+				catch (const std::exception &)
+				{
+					ok = false;
+				}
+				quiet_unit_collection = false;
+				if (!ok)
+					return false;
+				value = factor * rest;
+			}
+			GiNaC::ex num = value.evalf();
+			if (!GiNaC::is_a<GiNaC::numeric>(num))
+				return false;
+			double d = GiNaC::to_double(GiNaC::ex_to<GiNaC::numeric>(num));
+			sign = (d < 0 ? -1 : (d > 0 ? 1 : 0));
+			return true;
+		}
+
+		// piecewise_geq0(cond,a,b): returns a if cond>=0, else b, and piecewise_gt0(cond,a,b) its strict twin, returning a
+		// only if cond>0. The zero case of piecewise_geq0 used to be decided the other way round here (by the strict
+		// numeric::is_positive()) than in the generated code, so an already numeric cond==0 gave b while the very same
+		// expression gave a once it had passed through code generation.
+		//
+		// The condition is an ordinary expression compared against zero, never a GiNaC::relational, which no other pass of
+		// pyoomph understands. Python's <, <=, > and >= build a SymbolicCondition instead, which conditional() maps onto
+		// these two functions by moving everything to one side; a condition combined with ~, &, | or ^ becomes a single
+		// sign test on a 0/1 indicator built from the same two functions (see SymbolicCondition::as_conditional).
+		//
+		// A condition whose sign is decidable is folded away right here, otherwise the call stays held and is only resolved
+		// at code-generation time via a C ternary (see piecewise_geq0_csrc_float below).
+		static ex piecewise_geq0_eval(const ex &cond, const ex &a, const ex &b)
+		{
+			if (a.is_equal(b))
+				return a; // both branches agree, so the condition is irrelevant (frequent after differentiation)
+			int sign;
+			if (decidable_condition_sign(cond, sign))
+				return (sign < 0 ? b : a);
 			return piecewise_geq0(cond, a, b).hold();
+		}
+
+		static ex piecewise_gt0_eval(const ex &cond, const ex &a, const ex &b)
+		{
+			if (a.is_equal(b))
+				return a;
+			int sign;
+			if (decidable_condition_sign(cond, sign))
+				return (sign > 0 ? a : b);
+			return piecewise_gt0(cond, a, b).hold();
 		}
 
 		static void piecewise_geq0_csrc_float(const ex &cond, const ex &a, const ex &b, const print_context &c)
@@ -3280,16 +3364,187 @@ namespace pyoomph
 			c.s << ")";
 		}
 
+		static void piecewise_gt0_csrc_float(const ex &cond, const ex &a, const ex &b, const print_context &c)
+		{
+			c.s << "(";
+			cond.print(c);
+			c.s << " >0 ? ";
+			a.print(c);
+			c.s << " : ";
+			b.print(c);
+			c.s << ")";
+		}
+
 		static ex piecewise_geq0_expl_derivative(const ex &cond, const ex &a, const ex &b, const symbol &deriv_arg)
 		{
 			return piecewise_geq0(cond, a.diff(deriv_arg), b.diff(deriv_arg));
 		}
 
+		static ex piecewise_gt0_expl_derivative(const ex &cond, const ex &a, const ex &b, const symbol &deriv_arg)
+		{
+			return piecewise_gt0(cond, a.diff(deriv_arg), b.diff(deriv_arg));
+		}
+
+		// The condition only selects one of the two branches and is real by construction (only its sign is used), so
+		// taking the real/imaginary part or the conjugate simply distributes over the branches. Without these hooks the
+		// function stays held inside a real_part()/imag_part(), which the normal-mode (azimuthal/Cartesian-k) analysis
+		// then cannot resolve -- as for time_stepper_weight above, the split is what makes the generated code linkable.
+		static ex piecewise_geq0_real_part(const ex &cond, const ex &a, const ex &b) { return piecewise_geq0(cond, a.real_part(), b.real_part()); }
+		static ex piecewise_geq0_imag_part(const ex &cond, const ex &a, const ex &b) { return piecewise_geq0(cond, a.imag_part(), b.imag_part()); }
+		static ex piecewise_geq0_conjugate(const ex &cond, const ex &a, const ex &b) { return piecewise_geq0(cond, a.conjugate(), b.conjugate()); }
+		static ex piecewise_gt0_real_part(const ex &cond, const ex &a, const ex &b) { return piecewise_gt0(cond, a.real_part(), b.real_part()); }
+		static ex piecewise_gt0_imag_part(const ex &cond, const ex &a, const ex &b) { return piecewise_gt0(cond, a.imag_part(), b.imag_part()); }
+		static ex piecewise_gt0_conjugate(const ex &cond, const ex &a, const ex &b) { return piecewise_gt0(cond, a.conjugate(), b.conjugate()); }
+
 		REGISTER_FUNCTION(piecewise_geq0, eval_func(piecewise_geq0_eval)
 										 .print_func<print_csrc_float>(piecewise_geq0_csrc_float)
 										 .print_func<print_csrc_double>(piecewise_geq0_csrc_float)
 										 .expl_derivative_func(piecewise_geq0_expl_derivative)
+										 .real_part_func(piecewise_geq0_real_part)
+										 .imag_part_func(piecewise_geq0_imag_part)
+										 .conjugate_func(piecewise_geq0_conjugate)
 										 .set_return_type(GiNaC::return_types::commutative))
+
+		REGISTER_FUNCTION(piecewise_gt0, eval_func(piecewise_gt0_eval)
+										 .print_func<print_csrc_float>(piecewise_gt0_csrc_float)
+										 .print_func<print_csrc_double>(piecewise_gt0_csrc_float)
+										 .expl_derivative_func(piecewise_gt0_expl_derivative)
+										 .real_part_func(piecewise_gt0_real_part)
+										 .imag_part_func(piecewise_gt0_imag_part)
+										 .conjugate_func(piecewise_gt0_conjugate)
+										 .set_return_type(GiNaC::return_types::commutative))
+
+		std::string SymbolicCondition::opstring() const
+		{
+			switch (kind)
+			{
+			case rel_lt:
+				return "<";
+			case rel_le:
+				return "<=";
+			case rel_gt:
+				return ">";
+			case rel_ge:
+				return ">=";
+			case log_not:
+				return "~";
+			case log_and:
+				return "&";
+			case log_or:
+				return "|";
+			default:
+				return "^";
+			}
+		}
+
+		std::string SymbolicCondition::to_string() const
+		{
+			std::ostringstream oss;
+			GiNaC::print_python pypc(oss);
+			if (is_comparison())
+			{
+				(lhs + 0).print(pypc);
+				oss << " " << opstring() << " ";
+				(rhs + 0).print(pypc);
+			}
+			else if (kind == log_not)
+			{
+				oss << "~(" << children[0].to_string() << ")";
+			}
+			else
+			{
+				for (unsigned int i = 0; i < children.size(); i++)
+				{
+					if (i)
+						oss << " " << opstring() << " ";
+					oss << "(" << children[i].to_string() << ")";
+				}
+			}
+			return oss.str();
+		}
+
+		GiNaC::ex SymbolicCondition::oriented_condition() const
+		{
+			// oriented so that a positive value means the comparison holds
+			return (kind == rel_lt || kind == rel_le ? rhs - lhs : lhs - rhs);
+		}
+
+		GiNaC::ex SymbolicCondition::indicator() const
+		{
+			if (is_comparison())
+			{
+				GiNaC::ex cond = oriented_condition();
+				if (is_strict())
+					return 0 + pyoomph::expressions::piecewise_gt0(cond, 1, 0);
+				else
+					return 0 + pyoomph::expressions::piecewise_geq0(cond, 1, 0);
+			}
+			if (kind == log_not)
+				return 1 - children[0].indicator();
+			// Both operands are 0 or 1, so the boolean operations are ordinary arithmetic. All three combinations below
+			// are associative on {0,1}, hence folding pairwise over more than two children is correct.
+			GiNaC::ex res = children[0].indicator();
+			for (unsigned int i = 1; i < children.size(); i++)
+			{
+				GiNaC::ex q = children[i].indicator();
+				if (kind == log_and)
+					res = res * q;
+				else if (kind == log_or)
+					res = res + q - res * q;
+				else
+					res = res + q - 2 * res * q;
+			}
+			return res;
+		}
+
+		bool SymbolicCondition::to_bool() const
+		{
+			if (is_comparison())
+			{
+				int sign;
+				if (!decidable_condition_sign(oriented_condition(), sign))
+				{
+					std::ostringstream oss;
+					oss << "Cannot decide the condition " << to_string() << " : it is not numerically evaluable." << std::endl;
+					oss << "If you want to keep it symbolic, use conditional(" << to_string() << ", <value if true>, <value if false>) instead." << std::endl;
+					oss << "Note that Python's ternary 'a if cond else b' cannot be used here, since Python always casts the condition to a bool." << std::endl;
+					oss << "For the same reason, conditions must be combined with the operators ~, &, | and ^ (or logical_not, logical_and, logical_or, logical_xor)" << std::endl;
+					oss << "instead of not, and, or - and a chained comparison like 'a < b < c' must be written as (a < b) & (b < c).";
+					throw_runtime_error(oss.str());
+				}
+				return (is_strict() ? sign > 0 : sign >= 0);
+			}
+			if (kind == log_not)
+				return !children[0].to_bool();
+			// and/or short-circuit as their Python counterparts do, i.e. a decidable false in an "and" wins over an
+			// undecidable second operand
+			bool res = children[0].to_bool();
+			for (unsigned int i = 1; i < children.size(); i++)
+			{
+				if (kind == log_and && !res)
+					return false;
+				if (kind == log_or && res)
+					return true;
+				bool q = children[i].to_bool();
+				res = (kind == log_and ? (res && q) : (kind == log_or ? (res || q) : (res != q)));
+			}
+			return res;
+		}
+
+		GiNaC::ex SymbolicCondition::as_conditional(const GiNaC::ex &iftrue, const GiNaC::ex &iffalse) const
+		{
+			if (is_comparison())
+			{
+				GiNaC::ex cond = oriented_condition();
+				if (is_strict())
+					return 0 + pyoomph::expressions::piecewise_gt0(cond, iftrue, iffalse);
+				else
+					return 0 + pyoomph::expressions::piecewise_geq0(cond, iftrue, iffalse);
+			}
+			// A combined condition becomes a single sign test on its 0/1 indicator. The 1/2 offset is exact for an
+			// indicator that is either 0 or 1, and keeps the branch selection independent of >= versus > at the threshold.
+			return 0 + pyoomph::expressions::piecewise_gt0(indicator() - GiNaC::numeric(1, 2), iftrue, iffalse);
+		}
 
 		// erf()/erfc(): GiNaC has no error function of its own, but C99 does, and GiNaC's generic C printer emits any
 		// function under its own (lowercased) name -- so nothing beyond the derivative and a numerical evaluation is
@@ -3648,6 +3903,83 @@ namespace pyoomph
 
 		REGISTER_FUNCTION(python_cb_function, eval_func(python_cb_function_eval).evalf_func(python_cb_function_evalf).print_func<print_csrc_float>(python_cb_function_csrc_float).print_func<print_csrc_double>(python_cb_function_csrc_float).expl_derivative_func(python_cb_function_expl_deriv).print_func<print_python>(python_cb_function_print_python).real_part_func(python_cb_function_real_part).imag_part_func(python_cb_function_imag_part))
 
+		// A multi-return callback has no symbolic derivative to hand out at this level. Its
+		// derivatives exist only during Jacobian code generation, where the EXPANDED node
+		// (GiNaCMultiRetCallback, see codegen.cpp) supplies them to first and second order - either
+		// from the callback's own _get_symbolic_derivative/_get_symbolic_second_derivative or,
+		// failing that, from the numerical Jacobian and second-derivative tensor the invoked
+		// C/Python callback fills in at runtime. See dev_docs/multi_return_second_derivatives.md. Code generation therefore never reaches the
+		// two functions below: SubstitutePlaceholders rewrites every python_multi_cb_function() into
+		// GiNaCMultiRetCallback nodes before the Jacobian is derived from the residual.
+		//
+		// Differentiating the UNEXPANDED invocation - which is what a diff() or symbolic_diff() from
+		// Python does - built a D[1](python_multi_cb_function)(...) node that no printer can render.
+		// The failure then surfaced only at JIT time, as a C file the compiler rejects with the
+		// callback's address printed into it, and nothing about that points back at the diff() that
+		// caused it. So raise here, where the mistake is made.
+		//
+		// These have to be the PARTIAL derivative (derivative_func), not expl_derivative_func:
+		// function::derivative() wraps the explicit one in a catch(...) and silently falls back to
+		// the chain rule, so an exception thrown there is swallowed and the bad node is built anyway.
+		// The chain rule calls pderivative() only for arguments whose own derivative is nonzero,
+		// which is exactly the right condition: differentiating with respect to something the
+		// callback never sees stays zero and raises nothing.
+
+		// The explicit derivative exists only to recognise that zero case, since the partial one is
+		// not told WHAT is being differentiated against, only which argument slot.
+		// function::derivative() tries the explicit derivative first, so returning 0 here
+		// short-circuits the chain rule entirely.
+		static ex python_multi_cb_function_expl_deriv(const ex &func, const ex &arglst, const ex &numret, const symbol &deriv_arg)
+		{
+			lst l = ex_to<lst>(arglst);
+			for (unsigned i = 0; i < l.nops(); i++)
+			{
+				if (!l.op(i).diff(deriv_arg).is_zero())
+				{
+					// Something really is being differentiated. Let the chain rule take over, which
+					// reaches the partial derivative below and raises there.
+					throw std::runtime_error("not an explicit derivative");
+				}
+			}
+			return 0;
+		}
+
+		// The index is a constant, so the whole derivative is the one of the invocation - which is
+		// either zero or raises below.
+		static ex python_multi_cb_indexed_result_expl_deriv(const ex &func, const ex &index, const symbol &deriv_arg)
+		{
+			return func.diff(deriv_arg);
+		}
+
+		// The partial derivative, reached through the chain rule only for an argument that really
+		// does depend on the differentiation variable. This is where the error belongs.
+		static ex python_multi_cb_function_deriv(const ex &func, const ex &arglst, const ex &numret, unsigned deriv_param)
+		{
+			std::ostringstream oss;
+			oss << std::endl
+				<< "happens when deriving " << python_multi_cb_function(func, arglst, numret) << std::endl
+				<< " with respect to its argument " << deriv_param;
+			throw_runtime_error("A multi-return expression cannot be differentiated symbolically. Its "
+								"derivatives are only available while the element code is generated (there "
+								"to first and second order, which is enough for an analytic Hessian). Build "
+								"the expression without a multi-return callback if you need to differentiate "
+								"it yourself - for activity coefficients, that is "
+								"set_activity_coefficients_by_unifac(..., use_multi_return=False)." +
+								oss.str());
+			return 0;
+		}
+
+		// Unreachable in practice - the chain rule differentiates the invocation first, which raises
+		// above - but registered all the same, so that no path builds a D[...](indexed_result) node.
+		static ex python_multi_cb_indexed_result_deriv(const ex &func, const ex &index, unsigned deriv_param)
+		{
+			std::ostringstream oss;
+			oss << std::endl
+				<< "happens when deriving " << python_multi_cb_indexed_result(func, index);
+			throw_runtime_error("A multi-return expression cannot be differentiated symbolically." + oss.str());
+			return 0;
+		}
+
 		// eval_func for python_multi_cb_function(func, arglst, numret): if all arguments are already numeric, immediately
 		// invokes the multi-return callback (see below) and packs the numret results into a GiNaC::lst; otherwise the call
 		// stays held (resolved later, e.g. during code generation or once the arguments become numeric)
@@ -3696,7 +4028,7 @@ namespace pyoomph
 			return python_multi_cb_function(func, arglst, numret).hold();
 		}
 
-		REGISTER_FUNCTION(python_multi_cb_function, eval_func(python_multi_cb_function_eval) //.evalf_func(python_cb_function_evalf).print_func<print_csrc_float>(python_cb_function_csrc_float).print_func<print_csrc_double>(python_cb_function_csrc_float).expl_derivative_func(python_cb_function_expl_deriv)
+		REGISTER_FUNCTION(python_multi_cb_function, eval_func(python_multi_cb_function_eval).derivative_func(python_multi_cb_function_deriv).expl_derivative_func(python_multi_cb_function_expl_deriv) //.evalf_func(python_cb_function_evalf).print_func<print_csrc_float>(python_cb_function_csrc_float).print_func<print_csrc_double>(python_cb_function_csrc_float)
 																							 //            .print_func<print_python>(python_cb_function_print_python)
 		)
 
@@ -3713,8 +4045,56 @@ namespace pyoomph
 			return python_multi_cb_indexed_result(func, index).hold();
 		}
 
-		REGISTER_FUNCTION(python_multi_cb_indexed_result, eval_func(python_multi_cb_indexed_result_eval) //.evalf_func(python_cb_function_evalf).print_func<print_csrc_float>(python_cb_function_csrc_float).print_func<print_csrc_double>(python_cb_function_csrc_float).expl_derivative_func(python_cb_function_expl_deriv)
+		// A multi-return callback is real by construction: the ABI hands it a double* and takes a
+		// double* back, so it can neither receive nor return an imaginary part. Without saying so,
+		// GiNaC's defaults treat the node as possibly complex and leave real_part(...) unevaluated
+		// while imag_part(...) does not collapse to zero. Taking a real part DISTRIBUTES over
+		// products and sums, so
+		//     real_part(F*u)  ->  real_part(F)*real_part(u) - imag_part(F)*imag_part(u)
+		// kept a spurious imag_part(F) factor and real_part could not be moved across a callback.
+		//
+		// Same defect absolute() and signum() above had, same triple as the answer. It also makes
+		// this node agree with the EXPANDED one it is rewritten into for code generation:
+		// GiNaCMultiRetCallback is a pyginacstruct, whose real_part()/imag_part()/conjugate()
+		// already return itself/0/itself.
+		//
+		// Scope, measured rather than assumed: no azimuthal or Cartesian normal-mode result depends
+		// on this today. That expansion does not route the residual through GiNaC's real_part - it
+		// derives two separate named residual contributions by expansion mode - and a user-written
+		// real_part() reaches the expanded node before anything is printed. An m=1 sweep over
+		// sqrt(F), subexpression(1/sqrt(F)), F^(3/2), absolute(F), real_part(F*u) and imag_part(F*u),
+		// with and without a moving mesh, gave byte-identical eigenvalues with and without these
+		// hooks. They close the symbolic gap; they do not repair a wrong number.
+		//
+		// Only the indexed result is registered: it is the scalar that appears in a residual.
+		// python_multi_cb_function evaluates to a GiNaC::lst of every return value, and a real part
+		// of a list is not a thing anyone forms.
+		static bool python_multi_cb_indexed_result_info(const ex &func, const ex &index, unsigned inf)
+		{
+			return inf == info_flags::real;
+		}
+
+		static ex python_multi_cb_indexed_result_real_part(const ex &func, const ex &index)
+		{
+			return python_multi_cb_indexed_result(func, index);
+		}
+
+		static ex python_multi_cb_indexed_result_imag_part(const ex &func, const ex &index)
+		{
+			return 0;
+		}
+
+		static ex python_multi_cb_indexed_result_conjugate(const ex &func, const ex &index)
+		{
+			return python_multi_cb_indexed_result(func, index);
+		}
+
+		REGISTER_FUNCTION(python_multi_cb_indexed_result, eval_func(python_multi_cb_indexed_result_eval).derivative_func(python_multi_cb_indexed_result_deriv).expl_derivative_func(python_multi_cb_indexed_result_expl_deriv) //.evalf_func(python_cb_function_evalf).print_func<print_csrc_float>(python_cb_function_csrc_float).print_func<print_csrc_double>(python_cb_function_csrc_float)
 																										 //            .print_func<print_python>(python_cb_function_print_python)
+																										 .info_func(python_multi_cb_indexed_result_info)
+																										 .real_part_func(python_multi_cb_indexed_result_real_part)
+																										 .imag_part_func(python_multi_cb_indexed_result_imag_part)
+																										 .conjugate_func(python_multi_cb_indexed_result_conjugate)
 		)
 
 		// The following ginac_*() placeholders each stay held until "need_to_hold" is false (i.e. all pyoomph placeholders

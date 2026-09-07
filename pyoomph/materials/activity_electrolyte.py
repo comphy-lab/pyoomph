@@ -54,7 +54,7 @@ publications when publishing results based on them.
 
 import math
 
-from ..expressions.cb import CustomMultiReturnExpression
+from ..expressions.cb import CustomMultiReturnExpression, HyperDual
 from ..expressions import ExpressionNumOrNone, var
 from ..typings import *
 
@@ -330,6 +330,41 @@ class FloatExpressionGenerator:
         raise RuntimeError("mole fractions are supplied explicitly to this generator")
 
 
+class DualExpressionGenerator:
+    """An expression generator whose values carry their own derivatives.
+
+    The third back-end, alongside the float and the C one. Its values are
+    :py:class:`~pyoomph.expressions.cb.HyperDual` numbers, so running the very same model code
+    through it yields the EXACT Jacobian (and, if the seeds carry them, the second derivatives) of
+    the activity coefficients with respect to the mole fractions, molalities and temperature -
+    instead of the finite differences that cost one full model evaluation per argument and are
+    accurate to about sqrt(epsilon).
+
+    ``subexpression`` is the identity: a HyperDual already computes each shared quantity once, and
+    its derivatives with it.
+    """
+    def __init__(self, temperature_in_K: Any = 298.15):
+        self._T = temperature_in_K
+
+    def ln(self, x: Any) -> Any:
+        return x.log() if hasattr(x, "log") else math.log(x)
+
+    def exp(self, x: Any) -> Any:
+        return x.exp() if hasattr(x, "exp") else math.exp(x)
+
+    def pow(self, a: Any, b: Any) -> Any:
+        return a ** b
+
+    def subexpression(self, expr: Any) -> Any:
+        return expr
+
+    def get_temperature_in_kelvin(self) -> Any:
+        return self._T
+
+    def get_molefrac_var(self, name: str) -> Any:
+        raise RuntimeError("mole fractions are supplied explicitly to this generator")
+
+
 def _c(value: Any) -> str:
     """One value as C source. Floats go through repr so that the C constant is the same double."""
     if isinstance(value, CExpr):
@@ -353,7 +388,12 @@ class CExpr:
     def __init__(self, code: str):
         self.code = code
 
-    def _bin(self, other: Any, op: str, flip: bool = False) -> "CExpr":
+    def _bin(self, other: Any, op: str, flip: bool = False) -> Any:
+        # A CDual knows how to combine itself with a plain CExpr and this class does not, so hand
+        # the operation back to Python, which then tries CDual's reflected operator. Without this
+        # the mixed product raises inside _c() instead.
+        if other.__class__.__name__ == "CDual":
+            return NotImplemented
         a, b = (_c(other), self.code) if flip else (self.code, _c(other))
         return CExpr("(" + a + op + b + ")")
 
@@ -403,6 +443,188 @@ class CCodeExpressionGenerator:
         return CExpr(name)
 
     def get_temperature_in_kelvin(self) -> CExpr:
+        return self._T
+
+    def get_molefrac_var(self, name: str) -> Any:
+        raise RuntimeError("mole fractions are supplied explicitly to this generator")
+
+
+class CDual:
+    """A piece of C arithmetic carrying its exact derivatives with respect to the arguments.
+
+    The C counterpart of :py:class:`~pyoomph.expressions.cb.HyperDual`: same forward-mode chain
+    rule, but each component is a :py:class:`CExpr` instead of a float, so running the model
+    through it emits C source for the value AND for every entry of the Jacobian.
+
+    Gradient components that are exactly zero are kept as the Python float ``0.0`` rather than as
+    C text, so the chain rule prunes them at generation time instead of emitting ``(0.0*...)``
+    everywhere. That pruning is what keeps the emitted code proportional to the number of arguments
+    a quantity actually depends on rather than to the total.
+    """
+
+    __slots__ = ("value", "grad")
+
+    def __init__(self, value: Any, grad: "list[Any]"):
+        self.value = value
+        self.grad = grad
+
+    @staticmethod
+    def _is_zero(v: Any) -> bool:
+        return not isinstance(v, CExpr) and float(v) == 0.0
+
+    @classmethod
+    def _scale(cls, factor: Any, v: Any) -> Any:
+        """factor*v, collapsed when either side is a literal zero or one."""
+        if cls._is_zero(factor) or cls._is_zero(v):
+            return 0.0
+        if not isinstance(factor, CExpr) and float(factor) == 1.0:
+            return v
+        if not isinstance(v, CExpr) and float(v) == 1.0:
+            return factor
+        return CExpr("(" + _c(factor) + "*" + _c(v) + ")")
+
+    @classmethod
+    def _add(cls, a: Any, b: Any) -> Any:
+        if cls._is_zero(a):
+            return b
+        if cls._is_zero(b):
+            return a
+        return CExpr("(" + _c(a) + "+" + _c(b) + ")")
+
+    @staticmethod
+    def _split(o: Any) -> "tuple[Any, list[Any] | None]":
+        if isinstance(o, CDual):
+            return o.value, o.grad
+        return o, None
+
+    def _binary(self, o: Any, value: Any, d_self: Any, d_other: Any) -> "CDual":
+        _, og = self._split(o)
+        grad = [self._scale(d_self, g) for g in self.grad]
+        if og is not None:
+            grad = [self._add(g, self._scale(d_other, h)) for g, h in zip(grad, og)]
+        return CDual(value, grad)
+
+    def _unary(self, value: Any, d1: Any) -> "CDual":
+        return CDual(value, [self._scale(d1, g) for g in self.grad])
+
+    @classmethod
+    def _value_op(cls, a: Any, op: str, b: Any) -> Any:
+        """a <op> b on the value components, either of which may be a plain number."""
+        return CExpr("(" + _c(a) + op + _c(b) + ")")
+
+    def __add__(self, o: Any) -> "CDual":
+        ov, _ = self._split(o)
+        return self._binary(o, self._value_op(self.value, "+", ov), 1.0, 1.0)
+    __radd__ = __add__
+
+    def __neg__(self) -> "CDual":
+        return CDual(CExpr("(-" + _c(self.value) + ")"), [self._scale(-1.0, g) for g in self.grad])
+
+    def __sub__(self, o: Any) -> "CDual":
+        ov, _ = self._split(o)
+        return self._binary(o, self._value_op(self.value, "-", ov), 1.0, -1.0)
+
+    def __rsub__(self, o: Any) -> "CDual":
+        return (-self) + o
+
+    def __mul__(self, o: Any) -> "CDual":
+        ov, _ = self._split(o)
+        return self._binary(o, self._value_op(self.value, "*", ov), ov, self.value)
+    __rmul__ = __mul__
+
+    def __truediv__(self, o: Any) -> "CDual":
+        ov, og = self._split(o)
+        value = self._value_op(self.value, "/", ov)
+        if og is None:
+            return self._binary(o, value, CExpr("(1.0/" + _c(ov) + ")"), 0.0)
+        # d(a/b) = da/b - a db/b^2, written as (da - value*db)/b so the division appears once.
+        inv = CExpr("(1.0/" + _c(ov) + ")")
+        grad = [self._scale(inv, self._add(g, self._scale(-1.0, self._scale(value, h))))
+                for g, h in zip(self.grad, og)]
+        return CDual(value, grad)
+
+    def __rtruediv__(self, o: Any) -> "CDual":
+        value = self._value_op(o, "/", self.value)
+        return self._unary(value, CExpr("(-" + _c(value) + "/" + _c(self.value) + ")"))
+
+    def __pow__(self, o: Any) -> "CDual":
+        if isinstance(o, CDual):
+            raise NotImplementedError("a**b with a differentiated exponent is not used by this model")
+        p = float(o)
+        if p == 0.5:
+            value = CExpr("sqrt(" + _c(self.value) + ")")
+            return self._unary(value, CExpr("(0.5/" + _c(value) + ")"))
+        value = CExpr("pow(" + _c(self.value) + "," + repr(p) + ")")
+        dv = CExpr("pow(" + _c(self.value) + "," + repr(p - 1.0) + ")")
+        return self._unary(value, CExpr("(" + repr(p) + "*" + _c(dv) + ")"))
+
+    def __repr__(self) -> str:
+        return "CDual(" + _c(self.value) + ")"
+
+
+class CDualExpressionGenerator:
+    """An expression generator that emits C for the values AND their exact Jacobian.
+
+    The analytic alternative to ending the generated function with
+    ``FILL_MULTI_RET_JACOBIAN_BY_FD``, which costs one full model evaluation per argument and is
+    accurate to about sqrt(epsilon).
+
+    ``subexpression`` is what makes the emitted code stay a sensible size: it names the value and
+    every nonzero gradient component as its own ``const double``, so a quantity shared by the model
+    is computed once and so is each of its derivatives, instead of the whole tree being pasted out
+    again at every use.
+    """
+    def __init__(self, nargs: int, temperature: Any, prefix: str = "aiomd"):
+        self.lines: list[str] = []
+        self.prefix = prefix
+        self.nargs = nargs
+        self._count = 0
+        self._T = temperature
+
+    def _seed(self, index: int, code: str) -> CDual:
+        grad = [0.0] * self.nargs
+        grad[index] = 1.0
+        return CDual(CExpr(code), grad)
+
+    def ln(self, x: Any) -> Any:
+        if not isinstance(x, CDual):
+            return CExpr("log(" + _c(x) + ")")
+        value = CExpr("log(" + _c(x.value) + ")")
+        return x._unary(value, CExpr("(1.0/" + _c(x.value) + ")"))
+
+    def exp(self, x: Any) -> Any:
+        if not isinstance(x, CDual):
+            return CExpr("exp(" + _c(x) + ")")
+        value = CExpr("exp(" + _c(x.value) + ")")
+        return x._unary(value, value)
+
+    def pow(self, a: Any, b: Any) -> Any:
+        if not isinstance(a, CDual):
+            if b == 0.5:
+                return CExpr("sqrt(" + _c(a) + ")")
+            return CExpr("pow(" + _c(a) + "," + _c(b) + ")")
+        return a ** b
+
+    def subexpression(self, expr: Any) -> Any:
+        if not isinstance(expr, CDual):
+            name = self.prefix + "_t" + str(self._count)
+            self._count += 1
+            self.lines.append("const double " + name + " = " + _c(expr) + ";")
+            return CExpr(name)
+        base = self.prefix + "_t" + str(self._count)
+        self._count += 1
+        self.lines.append("const double " + base + " = " + _c(expr.value) + ";")
+        grad: list[Any] = []
+        for j, g in enumerate(expr.grad):
+            if CDual._is_zero(g):
+                grad.append(0.0)
+                continue
+            name = base + "_d" + str(j)
+            self.lines.append("const double " + name + " = " + _c(g) + ";")
+            grad.append(CExpr(name))
+        return CDual(CExpr(base), grad)
+
+    def get_temperature_in_kelvin(self) -> Any:
         return self._T
 
     def get_molefrac_var(self, name: str) -> Any:
@@ -563,6 +785,11 @@ class AIOMFACElectrolyteMultiReturnExpression(CustomMultiReturnExpression):
         #: The order of the results, which is the same species order.
         self.result_order = list(mixture.molecules) + list(mixture.ions)
         self.FD_epsilon = 1e-9
+        #: Emit the exact Jacobian into the generated C instead of ending it with
+        #: FILL_MULTI_RET_JACOBIAN_BY_FD. Exact rather than accurate to about sqrt(epsilon), and one
+        #: pass instead of one full model evaluation per argument - at the price of a longer C file
+        #: and a longer compile. See dev_docs/multi_return_second_derivatives.md for the numbers.
+        self.analytic_c_jacobian: bool = True
 
     def get_num_returned_scalars(self, nargs: int) -> int:
         expected = len(self.argument_order) + (0 if self._T_const is not None else 1)
@@ -582,6 +809,8 @@ class AIOMFACElectrolyteMultiReturnExpression(CustomMultiReturnExpression):
         return x, molal, T
 
     def generate_c_code(self) -> str:
+        if self.analytic_c_jacobian:
+            return self._generate_c_code_analytic()
         gen = CCodeExpressionGenerator(temperature="T_in_K")
         args = [CExpr("arg_list[" + str(i) + "]") for i in range(len(self.argument_order))]
         if self._T_const is None:
@@ -596,26 +825,92 @@ class AIOMFACElectrolyteMultiReturnExpression(CustomMultiReturnExpression):
         lines.append("FILL_MULTI_RET_JACOBIAN_BY_FD(" + repr(self.FD_epsilon) + ")")
         return "\n            ".join(lines)
 
-    def eval(self, flag: int, arg_list: Any, result_list: Any, derivative_matrix: Any) -> None:
-        x, molal, T = self._split([float(v) for v in arg_list])
-        gen = FloatExpressionGenerator(T)
+    def _generate_c_code_analytic(self) -> str:
+        """The same model, emitted together with its exact Jacobian.
+
+        The finite-difference alternative above re-evaluates the entire model once per argument;
+        this propagates the derivatives alongside the value in a single pass, so it is both cheaper
+        and exact. See CDualExpressionGenerator for how the code is kept to a sensible size.
+        """
+        nargs = len(self.argument_order) + (0 if self._T_const is not None else 1)
+        gen = CDualExpressionGenerator(nargs, None)
+        args: list[Any] = [gen._seed(i, "arg_list[" + str(i) + "]") for i in range(len(self.argument_order))]
+        if self._T_const is None:
+            T_dual = gen._seed(len(self.argument_order), "arg_list[" + str(len(self.argument_order)) + "]")
+            args.append(T_dual)
+            gen._T = T_dual
+        else:
+            gen._T = self._T_const
+        x, molal, T = self._split(args)
         res = self.mixture.activity_coefficients(cast(Any, gen), x, molal, T)
+        lines = list(gen.lines)
         for i, name in enumerate(self.result_order):
-            result_list[i] = res[name]
-        if flag:
-            # Finite differences, as the short-range multi-return does: the expressions here are
-            # long and their exact derivatives would be longer still, while the Newton solver only
-            # needs the Jacobian well enough to converge.
-            nargs = len(arg_list)
-            base = [result_list[i] for i in range(len(self.result_order))]
+            r = res[name]
+            if not isinstance(r, CDual):
+                lines.append("result_list[" + str(i) + "] = " + _c(r) + ";")
+                continue
+            lines.append("result_list[" + str(i) + "] = " + _c(r.value) + ";")
+        lines.append("if (flag)")
+        lines.append("{")
+        for i, name in enumerate(self.result_order):
+            r = res[name]
             for j in range(nargs):
-                shifted = [float(v) for v in arg_list]
-                h = self.FD_epsilon * max(1.0, abs(shifted[j]))
-                shifted[j] += h
-                xs, ms, Ts = self._split(shifted)
-                rs = self.mixture.activity_coefficients(cast(Any, FloatExpressionGenerator(Ts)), xs, ms, Ts)
-                for i, name in enumerate(self.result_order):
-                    derivative_matrix[i * nargs + j] = (rs[name] - base[i]) / h
+                g = r.grad[j] if isinstance(r, CDual) else 0.0
+                lines.append("  derivative_matrix[" + str(i * nargs + j) + "] = " + _c(g) + ";")
+        lines.append("}")
+        return "\n            ".join(lines)
+
+    def _evaluate(self, values: "list[Any]") -> "list[Any]":
+        """The model at one composition, with whatever kind of number it is handed.
+
+        Floats give the values; HyperDuals give the values together with their exact derivatives.
+        The model code itself (activity_coefficients) is identical either way - that is the whole
+        point of the expression-generator interface it is written against.
+        """
+        x, molal, T = self._split(values)
+        gen = DualExpressionGenerator(T) if any(isinstance(v, HyperDual) for v in values) \
+            else FloatExpressionGenerator(T)
+        res = self.mixture.activity_coefficients(cast(Any, gen), x, molal, T)
+        return [res[name] for name in self.result_order]
+
+    def eval(self, flag: int, arg_list: Any, result_list: Any, derivative_matrix: Any) -> None:
+        if not flag:
+            for i, v in enumerate(self._evaluate([float(v) for v in arg_list])):
+                result_list[i] = v
+            return
+        # Exact derivatives by forward-mode AD through the very same model code: one pass, rather
+        # than the one full model evaluation per argument that the finite differences this used to
+        # do cost, and exact rather than accurate to about sqrt(epsilon). See
+        # pyoomph.expressions.cb.HyperDual.
+        nargs = len(arg_list)
+        # First order only: carrying the second derivatives through as well costs an
+        # (nargs x nargs) array per elementary operation and made this an order of magnitude slower
+        # than the finite differences it replaces.
+        duals = HyperDual.independent_variables([float(v) for v in arg_list], second_order=False)
+        results = self._evaluate(cast("list[Any]", duals))
+        flat = getattr(derivative_matrix, "ndim", 2) == 1
+        for i, r in enumerate(results):
+            if isinstance(r, HyperDual):
+                result_list[i] = r.value
+                for j in range(nargs):
+                    if flat:
+                        derivative_matrix[i * nargs + j] = r.grad[j]
+                    else:
+                        derivative_matrix[i, j] = r.grad[j]
+            else:
+                result_list[i] = float(r)
+
+    def eval_second_derivatives(self, arg_list: Any, result_list: Any, derivative_matrix: Any, second_derivative_tensor: Any) -> None:
+        """Exact second derivatives, from the same AD pass. Needed for an analytic Hessian."""
+        nargs = len(arg_list)
+        duals = HyperDual.independent_variables([float(v) for v in arg_list])
+        for i, r in enumerate(self._evaluate(cast("list[Any]", duals))):
+            if not isinstance(r, HyperDual):
+                result_list[i] = float(r)
+                continue
+            result_list[i] = r.value
+            derivative_matrix[i, :] = r.grad
+            second_derivative_tensor[i, :, :] = r.hess
 
     def process_args_to_scalar_list(self, *args: "ExpressionOrNum") -> "list[ExpressionOrNum]":
         from ..expressions.units import kelvin

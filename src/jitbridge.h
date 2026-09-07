@@ -94,6 +94,24 @@ float __mzerosf=-0.0;
 #define PYOOMPH_NULL NULL
 #endif
 
+/* The `flag` a multi-return callback (CustomMultiReturnExpression) is invoked with. A callback body
+   only ever has to test bits: historically it just asked `if (flag)`, i.e. "is a derivative wanted",
+   which is why DERIVATIVES is bit 0 and every other bit is set alongside it rather than instead of
+   it. The generated Residual/Jacobian code passes its own flag variable straight through (0 for the
+   residual, nonzero when a Jacobian or mass matrix is being assembled); the Hessian routine passes a
+   literal, since ITS flag is a Hessian mode (0..5), not a derivative request. */
+#define PYOOMPH_MULTIRET_FLAG_DERIVATIVES 1        /* fill derivative_matrix */
+#define PYOOMPH_MULTIRET_FLAG_DEBUG_PYTHON_VS_C 128 /* cross-check the C result against Python's eval() */
+#define PYOOMPH_MULTIRET_FLAG_SECOND_DERIVATIVES 256 /* also fill second_derivative_tensor */
+
+/* A generated static function that only some of the emitted routines call - the second-derivative
+   multi-return wrappers, which exist whenever a callback does but are reached only from a Hessian. */
+#if defined(__GNUC__) || defined(__clang__)
+#define PYOOMPH_MAYBE_UNUSED __attribute__((unused))
+#else
+#define PYOOMPH_MAYBE_UNUSED
+#endif
+
 // Deliberately empty, and measured: defining it as __restrict changes nothing. Rebuilding the heated-
 // cylinder Navier-Stokes element with `#define PYOOMPH_RESTRICT __restrict` produced a BYTE-IDENTICAL
 // object file - 8841 instructions either way, and still 168 loads of shapeinfo->jacobian_size inside
@@ -620,6 +638,10 @@ typedef struct JITFuncSpec_Table_FiniteElement
   // Python callbacks. First arg is the functable ptr, func id, then list of doubles, finally num of args
   double (*invoke_callback)(void *, int, double *, int);
   void (*invoke_multi_ret)(void *, int,int, double *,double *,double *, int, int);   //Index, flag,args,returns,derivative matrix, nargs,nret
+  // Same, but additionally filling the second-derivative tensor. Deliberately a SEPARATE entry point
+  // rather than a widened invoke_multi_ret: only the Hessian routine ever wants second derivatives,
+  // and keeping the original signature is what lets the residual/Jacobian code stay byte-identical.
+  void (*invoke_multi_ret_hessian)(void *, int,int, double *,double *,double *,double *, int, int); //Index, flag,args,returns,derivative matrix,second derivative tensor, nargs,nret
 
   JITFuncSpec_EvalIntegralExpr_FiniteElement EvalIntegralExpression;
   JITFuncSpec_RequiredShapes_FiniteElement_t shapes_required_IntegralExprs; // TODO: Split this into the individual contribs?
@@ -1287,5 +1309,55 @@ if (flag)\
     }\
     arg_list[i]=oldarg;\
   }\
+}\
+
+/* The same service for the SECOND derivatives, to be placed in the body of a multi-return callback's
+   second-derivative C code (multi_ret_ccode_d2_*, which the code generator writes around it). Unlike
+   the Jacobian macro above it is NOT wrapped in `if (flag)`: that function is only ever called when
+   the second derivatives are actually wanted.
+
+   It CENTRAL-differences the DERIVATIVE MATRIX rather than the results, so a callback with an
+   analytic Jacobian gets second derivatives accurate to about 1e-10 relative - measured on
+   AIOMFAC. Central rather than forward differences because the extra evaluation buys five orders
+   of magnitude here, and because the result has to be symmetric enough to be worth symmetrising.
+
+   Where the Jacobian is ITSELF filled by FILL_MULTI_RET_JACOBIAN_BY_FD this degenerates into a
+   difference of a difference, and that is not merely inaccurate but useless: measured on AIOMFAC
+   it came out with a RELATIVE error of 2.8, i.e. no correct digits at all. A callback that is
+   going to appear in an analytic Hessian therefore needs a real Jacobian - analytic C, or
+   use_symbolic_derivative - not an FD one.
+
+   The final sweep symmetrises: d2f/da_j da_k is symmetric, and the generated code relies on it -
+   MultiRetCallback canonicalises the index pair so that only the j<=k slot is ever read. A forward
+   difference of a Jacobian is symmetric only to O(epsilon), so without this the two halves would
+   disagree and which one got used would depend on the index order. */
+#define FILL_MULTI_RET_HESSIAN_BY_FD(epsilon_fd) \
+{\
+  PYOOMPH_AQUIRE_ARRAY(double, _res_p, nret);\
+  PYOOMPH_AQUIRE_ARRAY(double, _deriv_p, nret*nargs);\
+  PYOOMPH_AQUIRE_ARRAY(double, _deriv_m, nret*nargs);\
+  unsigned int _r,_j,_k;\
+  CURRENT_MULTIRET_FUNCTION(PYOOMPH_MULTIRET_FLAG_DERIVATIVES, arg_list, result_list, derivative_matrix,nargs,nret);\
+  for (_j=0;_j<nargs*nargs*nret;_j++) second_derivative_tensor[_j]=0.0;\
+  for (_k=0;_k<nargs;_k++)\
+  {\
+    const double _oldarg=arg_list[_k];\
+    arg_list[_k]=_oldarg+(epsilon_fd);\
+    CURRENT_MULTIRET_FUNCTION(PYOOMPH_MULTIRET_FLAG_DERIVATIVES, arg_list, _res_p, _deriv_p,nargs,nret);\
+    arg_list[_k]=_oldarg-(epsilon_fd);\
+    CURRENT_MULTIRET_FUNCTION(PYOOMPH_MULTIRET_FLAG_DERIVATIVES, arg_list, _res_p, _deriv_m,nargs,nret);\
+    arg_list[_k]=_oldarg;\
+    for (_r=0;_r<nret;_r++)\
+      for (_j=0;_j<nargs;_j++)\
+        second_derivative_tensor[(_r*nargs+_j)*nargs+_k]=(_deriv_p[_r*nargs+_j]-_deriv_m[_r*nargs+_j])/(2.0*(epsilon_fd));\
+  }\
+  for (_r=0;_r<nret;_r++)\
+    for (_j=0;_j<nargs;_j++)\
+      for (_k=_j+1;_k<nargs;_k++)\
+      {\
+        const double _sym=0.5*(second_derivative_tensor[(_r*nargs+_j)*nargs+_k]+second_derivative_tensor[(_r*nargs+_k)*nargs+_j]);\
+        second_derivative_tensor[(_r*nargs+_j)*nargs+_k]=_sym;\
+        second_derivative_tensor[(_r*nargs+_k)*nargs+_j]=_sym;\
+      }\
 }\
 
