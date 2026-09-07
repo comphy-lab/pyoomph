@@ -616,12 +616,17 @@ namespace pyoomph
 					units *= common_unit;
 					units=GiNaC::expand(units);
 					factor *= dominant_factor;
-					GiNaC::ex normalized_rest = 0;
+					// Collected into a vector and summed once. Accumulating with "+=" builds a new
+					// expairseq of length i at step i, i.e. it is quadratic in the number of terms -
+					// which is what a 14806-term marker argument in an azimuthally expanded
+					// mass-transfer residual spends minutes on.
+					GiNaC::exvector normalized_terms;
+					normalized_terms.reserve(cl.nops());
 					for (unsigned int i = 0; i < cl.nops(); i++)
 					{
-						normalized_rest += (factors[i] / dominant_factor) * terms[i];
+						normalized_terms.push_back((factors[i] / dominant_factor) * terms[i]);
 					}
-					rest *= normalized_rest;
+					rest *= GiNaC::add(normalized_terms);
 				}
 				else if (is_ex_the_function(cl, subexpression))
 				{
