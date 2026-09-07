@@ -907,7 +907,28 @@ namespace pyoomph
 			GiNaC::ex out = expressions::subexpression(rest);
 			// allow() must see exactly the ex that is returned: an enclosing marker meets this very
 			// node again (ex::map hands the shared node back), and that is what makes it maskable.
-			masker.allow(out);
+			//
+			// Except when the marker hides a multi-return callback. GiNaCMultiRetCallback is the one
+			// pyginacstruct with a subs() that descends into what it wraps (codegen.cpp), while
+			// nothing else does - not ex::map, not const_preorder_iterator. So a base unit inside a
+			// callback's invocation is invisible to collect_base_units()'s "rest is dimensionless"
+			// tail check and to this masker, but is still reached by the bu -> 1 substitution at the
+			// end of add_residual. Masking such a marker would hide it from that substitution, and
+			// the unit symbol would be emitted into the generated C (gcc: 'mol' undeclared - which is
+			// how this was found, on test_diffusivity_estimates' finite-difference thermodynamic
+			// factor). The rule is inductive: a nested marker that hides a callback is not allowed
+			// either, so it is still a visible function node in the scan below.
+			bool hides_multiret = false;
+			for (GiNaC::const_preorder_iterator i = marg.preorder_begin(); i != marg.preorder_end(); ++i)
+			{
+				if (GiNaC::is_a<GiNaC::GiNaCMultiRetCallback>(*i))
+				{
+					hides_multiret = true;
+					break;
+				}
+			}
+			if (!hides_multiret)
+				masker.allow(out);
 			if (pyoomph_verbose)
 				std::cout << "RET: " << (factor * unit * out) << std::endl;
 			return factor * unit * out;
