@@ -554,10 +554,55 @@ namespace pyoomph
 	protected:
 		FiniteElementCode *code;
 
+		// Two hash-bucket tables, both the same idiom as ReplaceFieldsToNonDimFields (key by
+		// gethash(), confirm the bucket with is_equal):
+		//  - `memo` makes this mapper a DAG walk instead of a tree walk. The side effects it skips on a
+		//    hit are all idempotent registrations of exactly the input it is skipping (the multi-return
+		//    call is already resolved, the subexpression is already in the list), so a hit reproduces
+		//    the first visit exactly.
+		//  - `known` replaces the linear is_equal scan over `subexpressions` that decided whether a
+		//    marker had been seen. That was O(N^2) in the number of distinct markers, and a droplet with
+		//    UNIFAC activity coefficients has of the order of 440 of them. First-encounter numbering is
+		//    kept, so the subexpr_N names do not move.
+		struct MemoEntry
+		{
+			GiNaC::ex key, value;
+		};
+		std::unordered_map<unsigned, std::vector<MemoEntry>> memo;
+		std::unordered_map<unsigned, std::vector<GiNaC::ex>> known;
+
+		bool already_known(const GiNaC::ex &e)
+		{
+			auto &bucket = known[e.gethash()];
+			for (auto &k : bucket)
+				if (k.is_equal(e))
+					return true;
+			bucket.push_back(e);
+			return false;
+		}
+
 	public:
 		std::vector<FiniteElementCodeSubExpression> subexpressions;
 		SubExpressionsToStructs(FiniteElementCode *code_) : code(code_) {}
 		GiNaC::ex operator()(const GiNaC::ex &inp) override
+		{
+			// Numbers are not cached, for the reason given on ReplaceFieldsToNonDimFields::operator():
+			// GiNaC keys them by value, so an exact and an inexact -1 would share an entry.
+			if (GiNaC::is_a<GiNaC::numeric>(inp))
+				return inp;
+			const unsigned h = inp.gethash();
+			auto it = memo.find(h);
+			if (it != memo.end())
+				for (auto &e : it->second)
+					if (e.key.is_equal(inp))
+						return e.value;
+			GiNaC::ex out = do_map(inp);
+			memo[h].push_back(MemoEntry{inp, out});
+			return out;
+		}
+
+	protected:
+		GiNaC::ex do_map(const GiNaC::ex &inp)
 		{
 			if (is_ex_the_function(inp, expressions::subexpression))
 			{
@@ -576,14 +621,7 @@ namespace pyoomph
 
 				GiNaC::ex res = GiNaC::GiNaCSubExpression(SubExpression(code, mapped_ex));
 				auto &st = GiNaC::ex_to<GiNaC::GiNaCSubExpression>(res).get_struct();
-				bool found = false;
-				for (unsigned int j = 0; j < subexpressions.size(); j++)
-					if (st.expr.is_equal(subexpressions[j].get_expression()))
-					{
-						found = true;
-						break;
-					}
-				if (!found)
+				if (!already_known(st.expr))
 				{
 					std::set<ShapeExpansion> sub_shapeexps = code->get_all_shape_expansions_in(st.expr);
 					std::set<TestFunction> sub_testfuncs = code->get_all_test_functions_in(st.expr);
@@ -664,7 +702,12 @@ namespace pyoomph
 							}
 						}
 					}
-					subexpressions.push_back(FiniteElementCodeSubExpression(st.expr.map(*this), GiNaC::potential_real_symbol("subexpr_" + std::to_string(subexpressions.size())), sub_shapeexps));
+					// st.expr is mapped_ex, i.e. already mapped once above. Mapping it again here doubled
+					// the work per nesting level and could not change anything: the markers inside are
+					// GiNaCSubExpression structs by now, which ex::map does not descend into. It also had
+					// to be a no-op for the code to work at all, since the returned wrapper carries the
+					// once-mapped st.expr and resolve_subexpression() matches the two against each other.
+					subexpressions.push_back(FiniteElementCodeSubExpression(st.expr, GiNaC::potential_real_symbol("subexpr_" + std::to_string(subexpressions.size())), sub_shapeexps));
 				}
 
 				return res;
@@ -6697,12 +6740,18 @@ namespace pyoomph
 
 		// Everything printed below (residual entries, Jacobian/mass derivatives, CSE bodies) derives
 		// from resi, so screening resi covers the whole function
+		// gp_scope must live until the END of this function: it is what makes
+		// GiNaCGlobalParameterWrapper::print reference the hoisted pyoomph_gparam_<i> local instead of
+		// falling back to the double indirection. Only the scans are timed.
 		GlobalParameterFunctionScope gp_scope(this, {resi});
-		gp_scope.write_declarations(os, "  ");
-
-		std::set<ShapeExpansion> all_shapeexps = get_all_shape_expansions_in(resi, true);
-
-		std::set<TestFunction> all_testfuncs = get_all_test_functions_in(resi);
+		std::set<ShapeExpansion> all_shapeexps;
+		std::set<TestFunction> all_testfuncs;
+		{
+			__wc_phase_timer __t("    RJM:param_scan+shape_scan");
+			gp_scope.write_declarations(os, "  ");
+			all_shapeexps = get_all_shape_expansions_in(resi, true);
+			all_testfuncs = get_all_test_functions_in(resi);
+		}
 		std::set<FiniteElementField *,FiniteElementFieldPtrLess> indices_required;
 		for (auto &sp : all_shapeexps)
 		{
@@ -6725,7 +6774,10 @@ namespace pyoomph
 		}
 
 		// Mark other requirements
-		mark_further_required_fields(resi, "ResJac[" + std::to_string(residual_index) + "]");
+		{
+			__wc_phase_timer __t("    RJM:mark_further_required_fields");
+			mark_further_required_fields(resi, "ResJac[" + std::to_string(residual_index) + "]");
+		}
 
 
 		if (this->coordinates_as_dofs)
@@ -6793,14 +6845,18 @@ namespace pyoomph
 			}
 		}
 
-		GiNaC::ex spatial_integral_portion_Eulerian = extract_spatial_integral_part(resi, true, false);	  // resi.coeff(get_dx(false), 1) * get_dx(false);
-		if (pyoomph::pyoomph_verbose)
+		GiNaC::ex spatial_integral_portion_Eulerian, spatial_integral_portion_Lagrangian, spatial_integral_portion_NodalDelta;
 		{
-			std::cout << "Full residual: " << resi << std::endl;
-			std::cout << "Eulerian part of the residual: " << spatial_integral_portion_Eulerian << std::endl;
+			__wc_phase_timer __t("    RJM:extract_spatial_integral_part");
+			spatial_integral_portion_Eulerian = extract_spatial_integral_part(resi, true, false);	  // resi.coeff(get_dx(false), 1) * get_dx(false);
+			if (pyoomph::pyoomph_verbose)
+			{
+				std::cout << "Full residual: " << resi << std::endl;
+				std::cout << "Eulerian part of the residual: " << spatial_integral_portion_Eulerian << std::endl;
+			}
+			spatial_integral_portion_Lagrangian = extract_spatial_integral_part(resi, false, true); // resi.coeff(get_dx(true), 1) * get_dx(true);
+			spatial_integral_portion_NodalDelta = resi.coeff(get_nodal_delta(), 1);
 		}
-		GiNaC::ex spatial_integral_portion_Lagrangian = extract_spatial_integral_part(resi, false, true); // resi.coeff(get_dx(true), 1) * get_dx(true);
-		GiNaC::ex spatial_integral_portion_NodalDelta = resi.coeff(get_nodal_delta(), 1);
 
 		if (!spatial_integral_portion_Lagrangian.is_zero())
 			this->mark_shapes_required("ResJac[" + std::to_string(residual_index) + "]", spaces[0], "psi");
@@ -6848,8 +6904,12 @@ namespace pyoomph
 
 			ipt_body << "    // SUBEXPRESSIONS" << std::endl
 			   << std::endl;
-			spatial_integral_portion = this->write_code_subexpressions(ipt_body, "     ", spatial_integral_portion, spatial_shape_exps, false);
+			{
+				__wc_phase_timer __t("    RJM:write_code_subexpressions");
+				spatial_integral_portion = this->write_code_subexpressions(ipt_body, "     ", spatial_integral_portion, spatial_shape_exps, false);
+			}
 
+			__wc_phase_timer __t_contrib("    RJM:contributions+loop assembly");
 			ipt_body << "    //START: Contribution of the spaces" << std::endl;
 			ipt_body << "    double _res_contrib,_J_contrib;" << std::endl;
 			for (auto *sp : allspaces)
