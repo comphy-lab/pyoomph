@@ -2239,6 +2239,62 @@ namespace pyoomph
 				return subexpression(wrapped).hold();
 		}
 
+		// Whether the expression a subexpression() wraps is provably real, memoised.
+		//
+		// This is what stops the azimuthal real/imaginary split from multiplying products out. The split
+		// (SubExpressionsToRealAndImag below) rewrites each complex marker into
+		// subexpression(real_part(m)) + I*subexpression(imag_part(m)), so its markers are real BY
+		// CONSTRUCTION - but GiNaC could not see that, because a function without a real_part_func falls
+		// back to basic::real_part, i.e. real_part_function(marker).hold(). mul::find_real_imag then
+		// treats every already-split factor as fully complex and finishes with rp.expand()/ip.expand(),
+		// which turns a product of n split factors into 2*4^(n-1) terms inside the next marker's
+		// argument. Measured: n=7 -> 8192 terms, n=8 -> 32768, and the evaporating droplet's
+		// mass-transfer residual reached 14806, on which the unit analysis did not return within
+		// sixteen minutes.
+		//
+		// Answering "is it real" makes that product 2^(n-1) terms instead: each factor's real and
+		// imaginary parts become single markers rather than held real_part()/imag_part() pairs. GiNaC's
+		// own real_part_function already reports imag_part == 0, so the property propagates up the
+		// nesting by induction and every level of the split stays short.
+		//
+		// The memo is not optional: the question is answered per marker, the answer is computed by
+		// asking the same question of every nested marker, and the argument is a DAG - so without it the
+		// query is exponential in the nesting depth, which is the defect this is fixing.
+		// PYOOMPH_DISABLE_REIM_FOLD=1 restores the old, unknowing behaviour and is the A/B lever.
+		static const bool __reim_fold_on = getenv("PYOOMPH_DISABLE_REIM_FOLD") == NULL;
+
+		static bool subexpression_wrapped_is_real(const ex &wrapped)
+		{
+			static thread_local std::unordered_map<unsigned, std::vector<std::pair<GiNaC::ex, bool>>> memo;
+			const unsigned h = wrapped.gethash();
+			{
+				auto it = memo.find(h);
+				if (it != memo.end())
+					for (auto &e : it->second)
+						if (e.first.is_equal(wrapped))
+							return e.second;
+			}
+			// May recurse into this function for nested markers; the table is looked up again afterwards
+			// because that recursion can have rehashed it.
+			const bool res = wrapped.imag_part().is_zero();
+			memo[h].push_back(std::make_pair(wrapped, res));
+			return res;
+		}
+
+		static ex subexpression_real_part(const ex &wrapped)
+		{
+			if (__reim_fold_on && subexpression_wrapped_is_real(wrapped))
+				return subexpression(wrapped);
+			return GiNaC::real_part_function(subexpression(wrapped)).hold();
+		}
+
+		static ex subexpression_imag_part(const ex &wrapped)
+		{
+			if (__reim_fold_on && subexpression_wrapped_is_real(wrapped))
+				return 0;
+			return GiNaC::imag_part_function(subexpression(wrapped)).hold();
+		}
+
 		// GiNaC's generic (implicit) derivative_func is disabled -- differentiating a subexpression() must always go through
 		// expl_derivative_func below (which recurses via wrapped.diff() and re-wraps the result), never via GiNaC's default chain-rule machinery
 		static ex subexpression_deriv(const ex &, unsigned)
@@ -2281,7 +2337,7 @@ namespace pyoomph
 		// every nested marker) to rediscover it on each query - and subexpression_eval itself asks exactly
 		// that question of its argument. The dynamic answer is already commutative, so the canonical
 		// ordering of products is unchanged.
-		REGISTER_FUNCTION(subexpression, eval_func(subexpression_eval).evalf_func(subexpression_evalf).derivative_func(subexpression_deriv).expl_derivative_func(subexpression_expl_deriv).set_return_type(GiNaC::return_types::commutative))
+		REGISTER_FUNCTION(subexpression, eval_func(subexpression_eval).evalf_func(subexpression_evalf).derivative_func(subexpression_deriv).expl_derivative_func(subexpression_expl_deriv).real_part_func(subexpression_real_part).imag_part_func(subexpression_imag_part).set_return_type(GiNaC::return_types::commutative))
 
 		SubexpressionDerivativeCacheScope::SubexpressionDerivativeCacheScope() : prev(__subexpr_deriv_cache)
 		{
