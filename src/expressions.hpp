@@ -538,6 +538,8 @@ namespace pyoomph
       GiNaC::ex mask(const GiNaC::ex &inp) { return masker(inp); }
       GiNaC::ex unmask(const GiNaC::ex &inp) { return unmasker(inp); }
       unsigned long n_masked() const { return (unsigned long)from_mask.size(); }
+      // placeholder -> marker, for passes that want to visit every marker interior exactly once
+      const GiNaC::exmap &get_masked_markers() const { return from_mask; }
     };
 
     // Substitutes field()/nondimfield() placeholders and global parameters occurring in arg by concrete expressions (used e.g. to numerically evaluate an expression by "calling" it with concrete field values)

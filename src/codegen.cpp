@@ -866,9 +866,25 @@ namespace pyoomph
 			// Hiding those behind placeholder symbols is what keeps the unit analysis linear in the
 			// DAG instead of exponential in the nesting depth - see SubexpressionMasker.
 			GiNaC::ex marg = (__unit_mask_on ? masker.mask(arg) : arg);
+			std::chrono::steady_clock::time_point __t_cbu0;
 			if (__time_add_residual())
+			{
 				n_cbu_calls++;
-			if (!expressions::collect_base_units(marg, factor, unit, rest))
+				__t_cbu0 = std::chrono::steady_clock::now();
+			}
+			bool __cbu_ok = expressions::collect_base_units(marg, factor, unit, rest);
+			if (__time_add_residual())
+			{
+				// A single slow unit split is the signature this pass keeps producing, and it is
+				// invisible in the phase total. Report the argument's top-level shape with it: what
+				// costs minutes here is one add with tens of thousands of terms, not many small ones.
+				double __dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - __t_cbu0).count();
+				if (__dt > 0.5)
+					std::cerr << "[add_residual]   ph:units slow split #" << n_cbu_calls << " " << __dt
+							  << " s " << GiNaC::ex_to<GiNaC::basic>(marg).class_name()
+							  << " nops " << marg.nops() << " masked_total " << masker.n_masked() << std::endl;
+			}
+			if (!__cbu_ok)
 			{
 				std::ostringstream oss;
 				oss << std::endl
@@ -4965,8 +4981,20 @@ namespace pyoomph
 		if (expanded.is_zero())
 			return 0;
 		DrawUnitsOutOfSubexpressions units_out_of_subexpressions(this);
-		GiNaC::ex repl = units_out_of_subexpressions(expanded);
-		GiNaC::ex expa = repl.expand().evalm().normal();
+		GiNaC::ex repl;
+		{
+			__phase_timer __t("  ph:eaen_DrawUnits");
+			repl = units_out_of_subexpressions(expanded);
+		}
+		GiNaC::ex expa;
+		{
+			// Same hazard class as add_residual's expand().normal(), and not masked: this entry point
+			// is used for scales and single components rather than for whole residuals, and no case
+			// has yet been measured where it is the wall. If one turns up, mask `repl` here the way
+			// add_residual does - and unmask on every return path.
+			__phase_timer __t("  ph:eaen_expand_normal");
+			expa = repl.expand().evalm().normal();
+		}
 		GiNaC::lst sublist;
 		if (collected_units_and_factor)
 		{
@@ -5219,9 +5247,9 @@ namespace pyoomph
 		*/
 
 		GiNaC::ex repl;
+		DrawUnitsOutOfSubexpressions units_out_of_subexpressions(this);
 		{
 			__phase_timer __t("DrawUnitsOutOfSubexpressions");
-			DrawUnitsOutOfSubexpressions units_out_of_subexpressions(this);
 			repl = units_out_of_subexpressions(expanded);
 			if (__time_add_residual())
 				std::cerr << "[add_residual]   ph:units calls " << units_out_of_subexpressions.get_n_calls()
@@ -5230,6 +5258,16 @@ namespace pyoomph
 						  << " cbu_calls " << units_out_of_subexpressions.get_n_cbu_calls()
 						  << " masked " << units_out_of_subexpressions.get_n_masked() << std::endl;
 		}
+		// Everything below - the prescan, expand().normal(), the surviving-unit scan and the
+		// bu -> 1 substitution - walks the whole contribution again, and every one of those is a tree
+		// operation over what is a DAG. The markers the pass above emitted are base-unit-free by
+		// collect_base_units()'s tail check, so masking them keeps all of it linear in the DAG: a
+		// masked marker can neither hide a surviving unit nor swallow a needed bu -> 1 substitution.
+		// Markers that were not emitted here are not maskable and stay fully visible.
+		// (Synthetic depth-6 nested-marker residual: base_unit_prescan 5.3 s and repl.subs(sublist)
+		// 25.4 s, both growing ~x10 per nesting level, before this.)
+		expressions::SubexpressionMasker &masker = units_out_of_subexpressions.get_masker();
+		GiNaC::ex repl_masked = (__unit_mask_on ? masker.mask(repl) : repl);
 		// `expa` is read only by the base-unit check below; the residual actually stored is
 		// repl.subs(sublist). Normalising a residual with rational nonlinearities puts all the
 		// denominators over a common one and costs seconds per contribution, all discarded. Since
@@ -5244,7 +5282,7 @@ namespace pyoomph
 		bool may_be_dimensional = prescan_disabled;
 		{
 			__phase_timer __t("base_unit_prescan");
-			for (GiNaC::const_preorder_iterator i = repl.preorder_begin(); i != repl.preorder_end() && !may_be_dimensional; ++i)
+			for (GiNaC::const_preorder_iterator i = repl_masked.preorder_begin(); i != repl_masked.preorder_end() && !may_be_dimensional; ++i)
 			{
 				if (!GiNaC::is_a<GiNaC::symbol>(*i))
 					continue;
@@ -5274,19 +5312,19 @@ namespace pyoomph
 		{
 			__phase_timer __t("collect_base_units_fastcheck");
 			GiNaC::ex f_, u_, r_;
-			if (expressions::collect_base_units(repl, f_, u_, r_) && u_.is_equal(1))
+			if (expressions::collect_base_units(repl_masked, f_, u_, r_) && u_.is_equal(1))
 				units_proven_to_cancel = true;
 		}
 		GiNaC::ex expa;
 		if (may_be_dimensional && !units_proven_to_cancel)
 		{
 			__phase_timer __t("expand().normal()");
-			expa = repl.expand().normal();
+			expa = repl_masked.expand().normal();
 		}
 		else if (units_proven_to_cancel && getenv("PYOOMPH_PARANOID_UNIT_PRESCAN"))
 		{
 			// Cross-check of the fast path: run the authoritative computation and insist it would
-			// have accepted too.
+			// have accepted too. On the unmasked contribution, for the same reason as below.
 			GiNaC::ex check = repl.expand().normal();
 			for (auto &bu : base_units)
 			{
@@ -5309,7 +5347,9 @@ namespace pyoomph
 		{
 			// Opt-in cross-check of the invariant above: do the work the prescan just skipped and
 			// insist it agrees. Only for validating this optimisation against real (dimensional)
-			// models; it is strictly slower than not having the prescan at all.
+			// models; it is strictly slower than not having the prescan at all. Deliberately on the
+			// *unmasked* contribution, so that it also catches a base unit hiding inside a masked
+			// marker - which would be the one way masking could make the prescan lie.
 			GiNaC::ex check = repl.expand().normal();
 			for (auto &bu : base_units)
 			{
@@ -5355,28 +5395,54 @@ namespace pyoomph
 					sublist.append(bu.second == 1);
 					continue;
 				}
-				throw_runtime_error(this->format_dimensional_error(add, expa, "The added residual contribution"));
+				throw_runtime_error(this->format_dimensional_error(add, masker.unmask(expa), "The added residual contribution"));
 			}
 			sublist.append(bu.second == 1);
 		}
 		delete __t_bu;
 
 		__phase_timer __t_subs("repl.subs(sublist)");
-		GiNaC::ex final_contrib = repl.subs(sublist);
+		GiNaC::ex final_contrib_masked = repl_masked.subs(sublist);
+		GiNaC::ex final_contrib = final_contrib_masked;
+		if (__unit_mask_on)
+		{
+			__phase_timer __t_unmask("unmask(final_contrib)");
+			final_contrib = masker.unmask(final_contrib_masked);
+		}
 		//		 GiNaC::ex final_contrib=expa.subs(sublist);
 		//		  GiNaC::ex final_contrib=expanded;
 		if (pyoomph_verbose)
 			std::cout << "Adding residual " << final_contrib << std::endl;
 
-		for (GiNaC::const_preorder_iterator i = final_contrib.preorder_begin(); i != final_contrib.preorder_end(); ++i)
 		{
-			if (GiNaC::is_a<GiNaC::matrix>(*i))
+			// Every node of the DAG has to be looked at once, not once per path to it: a preorder walk
+			// of the unmasked residual is the same tree-over-a-DAG traversal as everywhere else in this
+			// file, and after the phases above it was all that was left of add_residual (5.2 s of 5.3 s
+			// on the synthetic depth-6 case). So scan the masked form, and then each masked marker's
+			// interior once - itself masked, so the nested markers stay leaves. Coverage is identical:
+			// the union of those is every node of the residual.
+			__phase_timer __t_mat("matrix_scan");
+			auto scan_for_matrix = [this](const GiNaC::ex &e)
 			{
-				std::ostringstream oss;
-				oss << std::endl
-					<< *i << std::endl;
-				throw_runtime_error("Apparently, the added residual contains vectors or matrices. Please contract everything to scalar via dot or double_dot. Problematic term:" + oss.str());
+				for (GiNaC::const_preorder_iterator i = e.preorder_begin(); i != e.preorder_end(); ++i)
+				{
+					if (GiNaC::is_a<GiNaC::matrix>(*i))
+					{
+						std::ostringstream oss;
+						oss << std::endl
+							<< *i << std::endl;
+						throw_runtime_error("Apparently, the added residual contains vectors or matrices. Please contract everything to scalar via dot or double_dot. Problematic term:" + oss.str());
+					}
+				}
+			};
+			if (__unit_mask_on)
+			{
+				scan_for_matrix(final_contrib_masked);
+				for (const auto &m : masker.get_masked_markers())
+					scan_for_matrix(masker.mask(m.second.op(0)));
 			}
+			else
+				scan_for_matrix(final_contrib);
 		}
 
 		if (warn_on_large_numerical_factor)
