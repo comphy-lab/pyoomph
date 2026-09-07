@@ -300,10 +300,13 @@ if(PYOOMPH_DOWNLOAD_GINAC)
     PREFIX "${CMAKE_BINARY_DIR}/ginac_build"
     DEPENDS ${_ginac_depends}
     BUILD_IN_SOURCE 1
-    # Makes GiNaC's internal term/hash ordering deterministic across separate
-    # process runs (upstream otherwise seeds it from an ASLR-dependent RTTI
-    # pointer, in two different spots) - see citools/patches/*.patch and
-    # branch deterministic_codegen for the full rationale.
+    # Applies pyoomph's GiNaC fixes: two that make GiNaC's internal term/hash
+    # ordering deterministic across separate process runs (upstream otherwise
+    # seeds it from an ASLR-dependent RTTI pointer, in two different spots),
+    # and one that stops power::to_polynomial() recursing forever on a
+    # negative integer power of a power with a symbolic exponent - see
+    # citools/patches/*.patch, branch deterministic_codegen and
+    # dev_docs/code_generation.md 2.3 for the full rationale.
     PATCH_COMMAND bash "${CMAKE_SOURCE_DIR}/citools/patches/apply_ginac_patch.sh"
     CONFIGURE_COMMAND ${CMAKE_COMMAND} -E env
                        "PKG_CONFIG_PATH=${_cln_pkgconfig_dir}"

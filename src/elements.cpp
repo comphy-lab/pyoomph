@@ -52,7 +52,17 @@ extern "C"
 		JITFuncSpec_Table_FiniteElement_t *ft = (JITFuncSpec_Table_FiniteElement_t *)functab;
 		pyoomph::CustomMultiReturnExpressionBase *expr = (pyoomph::CustomMultiReturnExpressionBase *)ft->multi_ret_infos[jitindex].cb_obj; // TODO: This may not be multiple inherited!!		
 		expr->_call(flag,arg_list, numargs,result_list,numret,derivative_matrix);
-	}	
+	}
+
+	// Same, for the Hessian: additionally fills the numret x numargs x numargs second-derivative
+	// tensor. A separate entry point rather than a widened invoke_multi_ret, so that nothing on the
+	// residual/Jacobian path has to change - see jitbridge.h.
+	void _pyoomph_invoke_multi_ret_hessian(void * functab, int jitindex,int flag,double * arg_list,double * result_list, double * derivative_matrix, double * second_derivative_tensor, int numargs, int numret)
+	{
+		JITFuncSpec_Table_FiniteElement_t *ft = (JITFuncSpec_Table_FiniteElement_t *)functab;
+		pyoomph::CustomMultiReturnExpressionBase *expr = (pyoomph::CustomMultiReturnExpressionBase *)ft->multi_ret_infos[jitindex].cb_obj;
+		expr->_call_second_derivatives(flag,arg_list, numargs,result_list,numret,derivative_matrix,second_derivative_tensor);
+	}
 
 	// Called from generated code inside the integration-point loop. The element comes back out of
 	// the eleminfo the generated function was handed; it used to come from a process-wide

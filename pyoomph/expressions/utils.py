@@ -164,7 +164,6 @@ class MultiSafeDivide(CustomMultiReturnExpression):
         eps=arg_list[nret+1]
         Clist=arg_list[nret+2:]
         assert len(Alist)==len(Clist)
-        print(Alist,B)
         if abs(B)<eps:            
             result_list[:]=Clist[:]
             #print("Case small: "+str(B)+"<"+str(eps))
@@ -182,6 +181,23 @@ class MultiSafeDivide(CustomMultiReturnExpression):
     
         #if flag:
         #    self.debug_python_derivatives_with_FD(arg_list,result_list,derivative_matrix,fd_epsilion=1e-9,error_threshold=1e-1,stop_on_error=True)
+
+    # A/B is the only nonlinearity, so its second derivatives are three lines. Needed for an
+    # analytic Hessian; without them the code generator would finite-difference the Jacobian.
+    def eval_second_derivatives(self,arg_list:NPFloatArray,result_list:NPFloatArray,derivative_matrix:NPFloatArray,second_derivative_tensor:NPFloatArray):
+        self.eval(1,arg_list,result_list,derivative_matrix)
+        second_derivative_tensor.fill(0.0)
+        nret=len(result_list)
+        B=arg_list[nret]
+        eps=arg_list[nret+1]
+        if abs(B)<eps:
+            return  # the result is C, which enters linearly
+        Alist=arg_list[0:nret]
+        for i in range(nret):
+            # d2(A_i/B) / dA_i dB, both ways round since the tensor has to be symmetric
+            second_derivative_tensor[i,i,nret]=-1.0/B**2
+            second_derivative_tensor[i,nret,i]=-1.0/B**2
+            second_derivative_tensor[i,nret,nret]=2.0*Alist[i]/B**3
 
 
     def generate_c_code(self) -> str:
@@ -230,6 +246,30 @@ class MultiSafeDivide(CustomMultiReturnExpression):
           }
         }
         
+        """
+
+    def generate_c_code_second_derivatives(self) -> str:
+        # The mirror of eval_second_derivatives above. Cheap enough to write out that there is no
+        # reason to let the code generator finite-difference the Jacobian instead.
+        return """
+        // Second derivatives of MultiSafeDivide
+        CURRENT_MULTIRET_FUNCTION(PYOOMPH_MULTIRET_FLAG_DERIVATIVES, arg_list, result_list, derivative_matrix, nargs, nret);
+        {
+          const double B=arg_list[nret];
+          const double eps=arg_list[nret+1];
+          unsigned int i;
+          for (i=0;i<nret*nargs*nargs;i++) second_derivative_tensor[i]=0.0;
+          // In the cutoff branch the result is C, which enters linearly: everything stays zero.
+          if (fabs(B)>=eps)
+          {
+            for (i=0;i<nret;i++)
+            {
+              second_derivative_tensor[(i*nargs+i)*nargs+nret]=-1.0/(B*B);
+              second_derivative_tensor[(i*nargs+nret)*nargs+i]=-1.0/(B*B);
+              second_derivative_tensor[(i*nargs+nret)*nargs+nret]=2.0*arg_list[i]/(B*B*B);
+            }
+          }
+        }
         """
 
 

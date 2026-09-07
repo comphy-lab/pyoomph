@@ -1,0 +1,44 @@
+Stop GiNaC::power::to_polynomial() from recursing forever on (x^a)^(-n), i.e. a negative integer
+power of a power whose own exponent is symbolic.
+
+The negint branch rebuilds pow(basis_pref, exponent) and recurses into it, justified by the comment
+"(A*B)^n will be automagically transformed to A^n*B^n". That holds for a `mul` basis, and for a
+`power` basis whose inner exponent is numeric ((x^3)^(-2) evaluates to x^(-6)). It does NOT hold for
+a `power` basis with a SYMBOLIC inner exponent: power::eval only contracts (x^a)^b into x^(a*b) when
+that is provably valid, since for symbolic a the two sides differ across the branch cut. So
+pow((x^a), -2) evaluates back to the very expression to_polynomial was called on, and the recursion
+is a self-call with an unchanged argument -- roughly 47000 frames deep here before the stack runs
+out, with no diagnostic of any kind.
+
+Recursing only when the rebuilt expression actually differs leaves every terminating case
+bit-identical (there t differs from *this by construction) and turns the non-terminating one into
+the same opaque-symbol replacement that to_polynomial already applies to any other non-polynomial
+subexpression -- including, without this patch, the closely related (x^a)^(1/2).
+
+pyoomph reaches it through unit extraction: collect_base_units() calls collect_common_factors(),
+which calls to_polynomial(). A Vignes-interpolated Maxwell-Stefan diffusivity written as
+D0_ij^e_ij * D0_ji^e_ji has composition FIELDS in its exponents, and when the mixture viscosity
+inside D0 is a sum the unit symbols do not cancel automatically, leaving factors of the form
+kilogram^(<field expression>) for collect_common_factors to choke on. See
+dev_docs/examples/ginac_to_polynomial_symbolic_exponent.cpp, which reproduces it in five lines with
+no pyoomph involved and is what to send upstream.
+
+--- a/ginac/normal.cpp
++++ b/ginac/normal.cpp
+@@ -2720,10 +2720,13 @@
+ 		if (is_exactly_a<mul>(basis_pref) || is_exactly_a<power>(basis_pref)) {
+ 			// (A*B)^n will be automagically transformed to A^n*B^n
+ 			ex t = pow(basis_pref, exponent);
+-			return t.to_polynomial(repl);
++			// ... but a power with a SYMBOLIC exponent is not, and rebuilding it unchanged
++			// would make this an infinite self-recursion. Fall through to the replacement
++			// below instead, which is what any other non-polynomial basis gets.
++			if (!t.is_equal(*this))
++				return t.to_polynomial(repl);
+ 		}
+-		else
+-			return pow(replace_with_symbol(pow(basis, _ex_1), repl), -exponent);
++		return pow(replace_with_symbol(pow(basis, _ex_1), repl), -exponent);
+ 	} 
+ 	else
+ 		return replace_with_symbol(*this, repl);

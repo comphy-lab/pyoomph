@@ -43,6 +43,7 @@ extern "C"
 {
   double _pyoomph_invoke_callback(void *, int, double *, int);
   void _pyoomph_invoke_multi_ret(void *, int, int, double *, double *, double *, int, int); // Index, flag,args,returns,derivative matrix, nargs,nret
+  void _pyoomph_invoke_multi_ret_hessian(void *, int, int, double *, double *, double *, double *, int, int); // Same, plus the second-derivative tensor (Hessian assembly only)
   void _pyoomph_fill_shape_buffer_for_point(const JITElementInfo_t *, unsigned, JITFuncSpec_RequiredShapes_FiniteElement_t *, int);
 }
 

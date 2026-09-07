@@ -116,6 +116,53 @@ Still, "verified equivalent on what I ran" is not a reason to reassociate every 
 in the framework by default, for a win that only materialises on heavy rational nonlinearity. Turn it
 on if that describes your model.
 
+### 2.3 A unit under a symbolic exponent kills the process — GiNaC bug, patched
+
+`collect_base_units()` opens with `collect_common_factors(expand(arg))`, and GiNaC's
+`power::to_polynomial()` (`ginac/normal.cpp`) recurses forever on `(x^a)^(-n)` when `a` is symbolic:
+
+```cpp
+    else if (exponent.info(info_flags::negint)) {
+        ex basis_pref = collect_common_factors(basis);
+        if (is_exactly_a<mul>(basis_pref) || is_exactly_a<power>(basis_pref)) {
+            // (A*B)^n will be automagically transformed to A^n*B^n
+            ex t = pow(basis_pref, exponent);
+            return t.to_polynomial(repl);      // <- self-call with an UNCHANGED argument
+        }
+```
+
+The comment is what justifies the recursion, and it is right for a `mul` basis and for a `power`
+basis with a numeric inner exponent (`(x^3)^(-2)` evaluates to `x^(-6)`). It is wrong for a symbolic
+inner exponent: `power::eval` will not contract `(x^a)^b` into `x^(a*b)` there, because the two sides
+differ across the branch cut. So `t` *is* `*this`, and the process dies about 47000 frames deep with
+no diagnostic — a raw SIGSEGV, which looks nothing like a symbolic-algebra problem. Raising the stack
+limit to 1 GB does not help, and should not be mistaken for evidence that it is not a stack overflow;
+counting the frames (`gdb -ex run -ex "bt -100000" | grep -c to_polynomial`) is what settles it.
+
+[examples/ginac_to_polynomial_symbolic_exponent.cpp](examples/ginac_to_polynomial_symbolic_exponent.cpp)
+reproduces it in five expressions with no pyoomph involved, exits nonzero while the bug is present,
+and is what to send upstream. `citools/patches/ginac-to-polynomial-symbolic-exponent.patch` recurses
+only when the rebuilt expression actually differs and otherwise falls through to the
+`replace_with_symbol` branch that every other non-polynomial basis already takes — including, without
+the patch, the closely related `(x^a)^(1/2)`. Every terminating case is bit-identical, and GiNaC's own
+`exam_collect_common_factors`, `exam_normalization`, `exam_polygcd`, `exam_paranoia`, `exam_misc`,
+`exam_powerlaws`, `exam_numeric`, `exam_differentiation`, `exam_matrices`, `exam_factor`,
+`exam_pseries` and `exam_lsolve` all pass against a patched `normal.cpp` linked ahead of the stock
+library.
+
+**What produces such an expression, and why it is worth avoiding anyway.** A *dimensional* quantity
+raised to a field-dependent exponent. The Vignes interpolation of a Maxwell-Stefan diffusivity,
+`D0_ij^e_ij * D0_ji^e_ji` with the exponents depending on composition, is the case that found this:
+the bases are divided by `meter**2/second` first, so they *ought* to be dimensionless, but when the
+mixture viscosity inside `D0` is a **sum** (a weighted average over the components) GiNaC does not
+distribute the division over it, and factors of `kilogram^(<field expression>)` survive into
+`collect_base_units`. A single-term viscosity cancels and nothing happens, which is why the same
+model crashes for a ternary and not for a binary. `pyoomph/materials/diffusivity_estimates.py`
+therefore builds the interpolation as `exp(e*log(D0))`, which is the same number, has no `power` node
+with a symbolic exponent, and does not depend on the patch being present in whatever GiNaC the wheel
+was built against. This is the general rule from CLAUDE.md — no float exponents on dimensional
+quantities — extended to its field-valued case, where the penalty is a crash rather than a wrong unit.
+
 ## 3. Cause 2: the placeholder expander walked a DAG as a tree
 
 On the actual tutorial scripts, cause 1 is small. There the ingestion cost is `expand_placeholders()`
@@ -718,6 +765,21 @@ index takes the escape hatch and inlines. And the *original* subexpression's `d_
 often dead in the Hessian, since the outer index goes through the nested copy; that is §8.2's ratio
 again (once per integration point against `nnode²` entries), except that an unreferenced `exp()` is not
 free to the compiler without `-fno-math-errno`. Neither was measurable against the numbers above.
+
+### 9.3.1 Multi-return callbacks in the Hessian
+
+A `CustomMultiReturnExpression` is opaque to the symbolic machinery: it supplies its value and, at
+runtime, its Jacobian with respect to its arguments, and the generator builds the chain rule around
+them. It now differentiates twice, so such a callback can appear in an analytic Hessian. The node
+carries a second argument index, the pair is canonicalised because the tensor is symmetric, and the
+second derivatives arrive through a *separate* generated function and function-table entry so that
+nothing on the residual/Jacobian path changes. There is an ordering subtlety in this very file —
+the subexpression derivative fill is what creates the twice-derived node, and it runs after the
+multi-return call has been emitted — which is why the Hessian pass computes those differentiations
+before the emission loop and only prints them later.
+
+Full account, including the two live bugs this uncovered and the measured cost:
+[multi_return_second_derivatives.md](multi_return_second_derivatives.md).
 
 ## 9.4 The moving-mesh shape sensitivities are closed forms, and the entries are exactly linear
 

@@ -78,6 +78,16 @@ short-range part already used. Three back-ends supply the values:
 | `UNIFACPyoomphExpressionGenerator` | GiNaC expressions | the symbolic path, exact derivatives |
 | `FloatExpressionGenerator` | Python floats | `eval` of the multi-return expression |
 | `CCodeExpressionGenerator` | `CExpr` strings | the generated C |
+| `DualExpressionGenerator` | `HyperDual` numbers | exact derivatives of `eval`, in Python |
+| `CDualExpressionGenerator` | `CDual` (C expressions plus their derivatives) | the generated C **and its exact Jacobian** |
+
+The last two were added when the multi-return callback had to become differentiable twice, for an
+analytic Hessian. They replaced the finite differences the Jacobian used to be filled with, which is
+worth more than accuracy alone: differencing an already-differenced Jacobian to get second
+derivatives gave a *relative error of 2.2*, i.e. no correct digits. The analytic Jacobian is also
+3.3x faster than the FD one, at 10x the generated C and 4x the compile time. Numbers, and the rest
+of the second-derivative machinery, in
+[multi_return_second_derivatives.md](multi_return_second_derivatives.md).
 
 The short-range part had historically been written three times over — once symbolically, once as C
 strings, once in numpy — and adding the electrolyte parts the same way would have been three chances
