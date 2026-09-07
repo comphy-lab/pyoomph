@@ -155,7 +155,7 @@ def main() -> int:
                 "tests/test_taylor_culick_restart.py",
             ]
             tests = _run(
-                [str(python), "-I", "-m", "pytest", "-q", "-ra", "--durations=10", *selections],
+                [str(python), "-I", "-m", "pytest", "-q", "-ra", "-s", "--durations=10", *selections],
                 cwd=work,
                 timeout=600,
             )

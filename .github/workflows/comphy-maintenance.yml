@@ -93,6 +93,7 @@ jobs:
           mkdir -p receipts
           build-env/bin/python -m pip freeze > receipts/build-packages.txt
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        id: compiled-cache
         with:
           path: .ccache
           key: comphy-ubuntu24-py313-${{ needs.sync.outputs.candidate_sha }}
@@ -105,6 +106,12 @@ jobs:
             --config-settings=cmake.define.CMAKE_CXX_COMPILER_LAUNCHER=ccache \
             --config-settings=cmake.define.PYOOMPH_USE_MPI=ON \
             --config-settings=cmake.define.PYOOMPH_COPY_STUBS_TO_SOURCE_TREE=OFF
+      - name: Preserve compilation cache before regressions
+        if: steps.compiled-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .ccache
+          key: comphy-ubuntu24-py313-${{ needs.sync.outputs.candidate_sha }}
       - name: Exercise installed wheel
         env:
           CANDIDATE_SHA: ${{ needs.sync.outputs.candidate_sha }}

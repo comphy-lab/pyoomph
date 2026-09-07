@@ -26,7 +26,7 @@ from pyoomph.equations.navier_stokes import (  # noqa: E402
     NavierStokesFreeSurface,
 )
 from pyoomph.expressions import partial_t, var, vector  # noqa: E402
-from pyoomph.meshes.bcs import EnforcedDirichlet  # noqa: E402
+from pyoomph.equations.generic import EnforcedDirichlet  # noqa: E402
 from pyoomph.meshes.zeta import (  # noqa: E402
     AssignZetaCoordinatesByArclength,
     AssignZetaCoordinatesByEulerianCoordinate,
