@@ -180,7 +180,39 @@ against 0.66 / 6.7 / 76.7 / 887.6 s and 2.3 GB at depths 3 to 6 in round 1, i.e.
 11 per level. Most of what is left is the C compiler. The Jacobian agrees with a central difference
 to 2.4e-9 at depth 7.
 
-### 5.4 Smaller, known, not done
+### 5.4 The split's own memo was mixing exact and inexact numbers
+
+`SubExpressionsToRealAndImag` memoises in a `GiNaC::exmap`, and it was the one mapper of this
+pipeline that did not exempt numbers from its cache. That is not a minor omission here: GiNaC hashes
+and compares numbers **by value, not by representation** (`numeric::calchash` says so in its own
+comment - *"3 and 3.0 share the same hashvalue"*), so an exact `-2` and an inexact `-2.0` were one
+key; and `ex::compare()` *unifies* two expressions it finds equal by rebinding one's pointer to the
+other (`ex::share`, `ginac/ex.h`), so the mere lookup rewrote the exponent of the power the `-2`
+belonged to **in place**.
+
+The consequence is not cosmetic. `power::real_part()` uses its integer-binomial branch only for
+`exponent.info(integer)`, which an inexact `-2.0` fails, so it falls through to the polar form and
+buries a *dimensional* basis inside an `atan2`, where `collect_base_units()` cannot separate the
+units - and `add_residual` throws "The added residual contribution is not dimensionless". Five
+parameter sets of the evaporating-droplet stability campaign died exactly there; see
+`droplet_azimuthal_experiment_series.md` §3 for the trace and the numbers.
+
+All three of these memos were added at once by `e7408619` ("Stop the residual mappers from treating
+an expression DAG as a tree"), which is where the defect entered; the later commits of 5.1 only made
+it deterministic, by fixing which of two equal numbers gets met first.
+
+The mapper now returns a `GiNaC::numeric` unchanged before touching its cache, which is the rule
+`ReplaceFieldsToNonDimFields`, `SubexpressionMasker` and `MemoisedSubs` already followed and which
+their comments already gave the reason for - what those comments did not say, and now do, is that the
+*lookup* is the dangerous half, not the answer. `DrawUnitsOutOfSubexpressions` and
+`MeshToCoordinateShapes`, the two other `exmap`-memoised mappers here, had the same hole and got the
+same guard. Generated C is byte-identical over the reference set (23 files), and the depth sweep of
+5.3 is unchanged.
+
+**Any new mapper added to this pipeline must exempt numbers from its cache, not only memoise.** That
+is now two independent requirements on every one of them, alongside 2's "must memoise at all".
+
+### 5.5 Smaller, known, not done
 
 - `expand_all_and_ensure_nondimensional` (`src/codegen.cpp`) runs `repl.expand().evalm().normal()` on
   the **unmasked** result of its own `DrawUnitsOutOfSubexpressions`. It is the same hazard class. It
@@ -189,7 +221,10 @@ to 2.4e-9 at depth 7.
   components, not for whole residuals.
 - `warn_on_large_numerical_factor`'s `expand()` at the end of `add_residual` is unmasked too, and is
   off by default.
-- The GiNaC patch is local to the vendored build and has not been sent upstream.
+- The two GiNaC patches from this work - `ginac-binomial-real-imag-pow00.patch` and
+  `ginac-inexact-whole-number-exponent.patch`, the latter letting `real_part()`/`imag_part()` use the
+  binomial branch for an inexact whole-number exponent as well - are local to the vendored build and
+  have not been sent upstream. The second is a backstop for the class of 5.4, not what fixed it.
 
 ## 6. Reproducing, and the two traps
 
