@@ -425,6 +425,28 @@ namespace pyoomph
 	// pyoomph::expressions::SubexpressionMasker. PYOOMPH_DISABLE_UNIT_MASK=1 restores the old path.
 	static const bool __unit_mask_on = getenv("PYOOMPH_DISABLE_UNIT_MASK") == NULL;
 	static inline bool __time_add_residual() { return __time_add_residual_on; }
+	// PYOOMPH_TIME_WRITE_CODE=1 does the same for the emission half, FiniteElementCode::write_code:
+	// which residual set, which routine (RJM / steady / Hessian / dResidual-dParameter) and which
+	// of the trailing code writers the time goes into. Deliberately a sibling switch rather than a
+	// reuse of PYOOMPH_TIME_ADD_RESIDUAL: the two phases are usually investigated separately and the
+	// ingestion breakdown is per contribution, i.e. very chatty, on exactly the models whose
+	// emission is slow. See dev_docs/code_generation.md.
+	static const bool __time_write_code_on = getenv("PYOOMPH_TIME_WRITE_CODE") != NULL;
+	struct __wc_phase_timer
+	{
+		std::chrono::steady_clock::time_point t0;
+		std::string name;
+		double *accum;
+		__wc_phase_timer(const std::string &n, double *acc = NULL) : t0(std::chrono::steady_clock::now()), name(n), accum(acc) {}
+		~__wc_phase_timer()
+		{
+			double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+			if (accum)
+				*accum += dt;
+			else if (__time_write_code_on && dt > 1e-3)
+				std::cerr << "[write_code] " << name << " " << dt << " s" << std::endl;
+		}
+	};
 	struct __phase_timer
 	{
 		std::chrono::steady_clock::time_point t0;
@@ -7804,6 +7826,7 @@ namespace pyoomph
 	// advanced to 2 (fully finalized) once done.
 	void FiniteElementCode::write_code(std::ostream &os)
 	{
+		__wc_phase_timer __t_total("TOTAL");
 		__current_code = this;
 		this->hoist_coeff_counter = 0; // names are per code, not per process - see codegen.hpp
 		this->emitted_nohang_entry_points.clear(); // Refilled by write_generic_RJM; a rewrite must not inherit the last one's decisions
@@ -7873,11 +7896,18 @@ namespace pyoomph
 				// specialising the branch away. MakeResidualSteady is a pure GiNaC map, so hoisting it
 				// above the write changes nothing else.
 				MakeResidualSteady make_steady(this);
-				GiNaC::ex steady_residual = make_steady(residual[resind]);
+				GiNaC::ex steady_residual;
+				{
+					__wc_phase_timer __t("res[" + std::to_string(resind) + "] MakeResidualSteady");
+					steady_residual = make_steady(residual[resind]);
+				}
 				extra_steady_routine[resind] = make_steady.require_extra_steady_routine();
 
 				record_jacobian_blocks_for_flags = (get_derive_jacobian_by_expansion_mode() == NULL);
-				write_generic_RJM(os, "ResidualAndJacobian" + std::to_string(resind), residual[resind], true, !extra_steady_routine[resind], true); // Hanging unsteady routine
+				{
+					__wc_phase_timer __t("res[" + std::to_string(resind) + "] RJM");
+					write_generic_RJM(os, "ResidualAndJacobian" + std::to_string(resind), residual[resind], true, !extra_steady_routine[resind], true); // Hanging unsteady routine
+				}
 				record_jacobian_blocks_for_flags = false;
 				os << std::endl;
 
@@ -7886,24 +7916,34 @@ namespace pyoomph
 					os << std::endl;
 					// The steady twin gets the hang split too: a stationary solve is the common case, and
 					// elements_assembly.cpp picks the Steady slot without ever looking at the unsteady one.
-					write_generic_RJM(os, "ResidualAndJacobianSteady" + std::to_string(resind), steady_residual, true, true, true); // Hanging steady routine
+					{
+						__wc_phase_timer __t("res[" + std::to_string(resind) + "] RJM steady");
+						write_generic_RJM(os, "ResidualAndJacobianSteady" + std::to_string(resind), steady_residual, true, true, true); // Hanging steady routine
+					}
 					os << std::endl;
 				}
 
 				if (generate_hessian)
 				{
 					has_constant_mass_matrix_for_sure[resind]=true; // Might change during writing the Hessian
+					__wc_phase_timer __t("res[" + std::to_string(resind) + "] Hessian");
 					has_hessian_contribution[resind] = write_generic_Hessian(os, "HessianVectorProduct" + std::to_string(resind), residual[resind], true);
 					os << std::endl;
 				}
 
 				GiNaC::potential_real_symbol gp_dummy("_global_param_");
+				double __t_dp_diff = 0.0, __t_dp_write = 0.0;
 				for (unsigned int i = 0; i < local_parameter_symbols.size(); i++) // Only parameters in Residuals releveant (e.g. not in integral expressions)
 				{
 					GiNaC::ex p = local_parameter_symbols[i];
-					GiNaC::ex dres_dp = steady_residual.subs(p == gp_dummy).diff(gp_dummy); // Take the steady residual only here
+					GiNaC::ex dres_dp;
+					{
+						__wc_phase_timer __t("", &__t_dp_diff);
+						dres_dp = steady_residual.subs(p == gp_dummy).diff(gp_dummy); // Take the steady residual only here
+					}
 					if (!dres_dp.is_zero())													// Need to write the dresidual_dparameter function
 					{
+						__wc_phase_timer __t("", &__t_dp_write);
 						dres_dp = dres_dp.subs(gp_dummy == p);
 						os << std::endl;
 						os << "//Derivative wrt. global parameter " << p << std::endl;
@@ -7915,6 +7955,9 @@ namespace pyoomph
 					else
 						local_parameter_has_deriv[resind].push_back(false);
 				}
+				if (__time_write_code_on && (__t_dp_diff > 1e-3 || __t_dp_write > 1e-3))
+					std::cerr << "[write_code] res[" << resind << "] dRes/dParam over " << local_parameter_symbols.size()
+							  << " params: diff " << __t_dp_diff << " s, write " << __t_dp_write << " s" << std::endl;
 			}
 			else
 			{
@@ -7924,6 +7967,7 @@ namespace pyoomph
 
 		residual_index = 0;
 
+		__wc_phase_timer __t_rest("trailing writers (ICs, Dirichlet, geom.Jac, Z2, expressions, info)");
 		for (unsigned int i = 0; i < IC_names.size(); i++)
 		{
 			write_code_initial_condition(os, i, IC_names[i]);
