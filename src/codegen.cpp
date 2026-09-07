@@ -781,9 +781,51 @@ namespace pyoomph
 		FiniteElementCode *code;
 		bool extra_steady_routine;
 
+		// Memo, same idiom as ReplaceFieldsToNonDimFields (hash bucket, confirmed by is_equal, mutable
+		// state replayed on a hit). ex::map walks the residual DAG as a tree, so without it a shared
+		// subexpression() body is rebuilt once per path and the rebuild is not free: the marker is
+		// still a plain subexpression() function here, so re-emitting it re-fires subexpression_eval.
+		// On the deeply nested synthetic azimuthal case this pass was 4.4 s per residual set at depth 5
+		// and, per the RSS trace, the whole peak of the run - materialised copies of shared subtrees.
+		// The only mutable state is the monotone extra_steady_routine flag, recorded per entry and
+		// OR'ed back in on a hit, so a cached branch still reports the rewrite it performed.
+		struct MemoEntry
+		{
+			GiNaC::ex key, value;
+			bool needs_steady;
+		};
+		std::unordered_map<unsigned, std::vector<MemoEntry>> memo;
+
 	public:
 		MakeResidualSteady(FiniteElementCode *_code) : code(_code), extra_steady_routine(false) {}
 		GiNaC::ex operator()(const GiNaC::ex &inp) override
+		{
+			// Numbers are never cached: GiNaC hashes and compares them by value, so an exact -1 and an
+			// inexact -1.0 share a key and the memo would hand back whichever was met first, which the
+			// generated C is not indifferent to (see ReplaceFieldsToNonDimFields::operator()). A leaf
+			// costs nothing here anyway.
+			if (GiNaC::is_a<GiNaC::numeric>(inp))
+				return inp;
+			const unsigned h = inp.gethash();
+			auto it = memo.find(h);
+			if (it != memo.end())
+				for (auto &e : it->second)
+					if (e.key.is_equal(inp))
+					{
+						extra_steady_routine = extra_steady_routine || e.needs_steady;
+						return e.value;
+					}
+			const bool steady_before = extra_steady_routine;
+			extra_steady_routine = false;
+			GiNaC::ex res = do_map(inp);
+			const bool needs_steady = extra_steady_routine;
+			extra_steady_routine = steady_before || needs_steady;
+			memo[h].push_back(MemoEntry{inp, res, needs_steady});
+			return res;
+		}
+
+	protected:
+		GiNaC::ex do_map(const GiNaC::ex &inp)
 		{
 			if (GiNaC::is_a<GiNaC::GiNaCShapeExpansion>(inp))
 			{
@@ -844,6 +886,7 @@ namespace pyoomph
 				return inp.map(*this);
 		}
 
+	public:
 		bool require_extra_steady_routine() const { return extra_steady_routine; }
 	};
 
