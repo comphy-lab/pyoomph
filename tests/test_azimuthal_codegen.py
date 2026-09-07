@@ -347,3 +347,14 @@ def test_azimuthal_split_keeps_exact_and_inexact_numbers_apart():
     got = str(_split((-2.0 * x) * (x + y) ** (-2)))
     assert "**(-2.0)" not in got and "^(-2.0)" not in got, got
     assert "(2.0)" in got, got
+
+
+def test_real_part_of_an_inexact_whole_number_power_stays_polynomial():
+    """power::real_part() must not fall through to atan2 just because the exponent reads 2.0."""
+    x, y = _symbol("x"), _symbol("y")
+    I = imaginary_i()
+
+    exact = str(_split(subexpression(x ** (-2) + I * y)))
+    inexact = str(_split(subexpression(x ** (-2.0) + I * y)))
+    assert "atan2" not in inexact, "an inexact exponent produced a polar real part: " + inexact
+    assert inexact == exact, "%s\n!=\n%s" % (inexact, exact)
