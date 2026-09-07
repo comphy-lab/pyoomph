@@ -7952,8 +7952,31 @@ namespace pyoomph
 
 				GiNaC::potential_real_symbol gp_dummy("_global_param_");
 				double __t_dp_diff = 0.0, __t_dp_write = 0.0;
+				// Which of the parameters this residual set actually mentions. local_parameter_symbols
+				// is process-wide over all residual sets and all the other expression families, so on a
+				// model with several parameters most entries of the loop below differentiate a residual
+				// that does not contain the parameter at all, only to find the result is zero. That is
+				// not a cheap way to find out: substituting and differentiating rebuilds the whole
+				// residual DAG as a tree (GiNaC::diff is not memoised, and subexpression_expl_deriv
+				// re-enters the evaluating subexpression() on the way out), and on the deeply nested
+				// azimuthal synthetic case it was 65% of the entire code-emission time - for two
+				// residual sets whose derivative was identically zero.
+				//
+				// The scan is the same one write_generic_RJM already runs through
+				// GlobalParameterFunctionScope, and it is now linear in the DAG. A parameter absent from
+				// the residual has an identically zero derivative, so this takes exactly the same `else`
+				// branch as before and the emitted PYOOMPH_NULL entry is unchanged. The converse is not
+				// assumed: a parameter that IS present still gets differentiated and still gets to be
+				// found zero.
+				std::set<unsigned> params_in_residual;
+				register_global_parameters_in(steady_residual, params_in_residual);
 				for (unsigned int i = 0; i < local_parameter_symbols.size(); i++) // Only parameters in Residuals releveant (e.g. not in integral expressions)
 				{
+					if (!params_in_residual.count(i))
+					{
+						local_parameter_has_deriv[resind].push_back(false);
+						continue;
+					}
 					GiNaC::ex p = local_parameter_symbols[i];
 					GiNaC::ex dres_dp;
 					{
