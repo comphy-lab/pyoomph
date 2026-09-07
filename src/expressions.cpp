@@ -513,6 +513,16 @@ namespace pyoomph
 			return res;
 		}
 
+		// Set while collect_base_units is inside an expression whose size tripped the
+		// collect_common_factors gate below; see the comment there.
+		static thread_local bool __cbu_skip_ccf = false;
+		struct CollectCommonFactorsSkipScope
+		{
+			bool prev;
+			CollectCommonFactorsSkipScope(bool v) : prev(__cbu_skip_ccf) { __cbu_skip_ccf = __cbu_skip_ccf || v; }
+			~CollectCommonFactorsSkipScope() { __cbu_skip_ccf = prev; }
+		};
+
 		bool collect_base_units(GiNaC::ex arg, GiNaC::ex &factor, GiNaC::ex &units, GiNaC::ex &rest)
 		{
 			if (pyoomph_verbose)
@@ -522,7 +532,35 @@ namespace pyoomph
 			rest = 1;
 			factor = 1;
 			units = 1;
-			GiNaC::ex cl = GiNaC::collect_common_factors(GiNaC::expand(arg));
+			// collect_common_factors() is not needed for the analysis - the add branch below handles a
+			// sum term by term and insists that the terms agree on their unit, and the common-factor
+			// collection only changes WHICH factor gets hoisted; arg == factor*unit*rest holds either
+			// way. It is, however, superlinear in the number of terms (find_common_factor ->
+			// to_polynomial -> replace_with_symbol scans its repl vector linearly, and
+			// power::to_polynomial re-enters collect_common_factors for every negative-power basis).
+			// Measured on marker-atom sums: about M^1.4 for M terms in isolation, and the evaporating
+			// droplet's azimuthal mass-transfer residual reaches a 14806-term sum on which it did not
+			// return within sixteen minutes. So it is skipped above a term count;
+			// PYOOMPH_UNIT_CCF_MAX_TERMS moves the threshold. Below it nothing changes, which is what
+			// keeps the generated code of everything that used to work byte-identical - see
+			// dev_docs/subexpression_unit_analysis_stall.md.
+			static const unsigned ccf_max_terms = (getenv("PYOOMPH_UNIT_CCF_MAX_TERMS") ? (unsigned)atoi(getenv("PYOOMPH_UNIT_CCF_MAX_TERMS")) : 2000);
+			GiNaC::ex ex_arg = GiNaC::expand(arg);
+			// Once tripped, the decision holds for the WHOLE subtree, not just for this node. The add
+			// branch below recurses per term, and it is those per-term calls - one collect_common_factors
+			// on each of 14806 products of 10-14 atoms, each of which reaches gcd/find_common_factor -
+			// that the droplet actually spends its minutes in (gdb, frames
+			// collect_base_units:546 <- collect_base_units:616). Gating only the sum itself changes
+			// nothing measurable.
+			const bool skip_ccf = __cbu_skip_ccf || (GiNaC::is_exactly_a<GiNaC::add>(ex_arg) && ex_arg.nops() > ccf_max_terms);
+			// Under PYOOMPH_TIME_ADD_RESIDUAL the outermost skip is announced, so that a sweep with the
+			// threshold lowered reports how close the models one cares about get to it.
+			static const bool report_skips = getenv("PYOOMPH_TIME_ADD_RESIDUAL") != NULL;
+			if (skip_ccf && !__cbu_skip_ccf && report_skips)
+				std::cerr << "[add_residual]   ph:units ccf skipped, add with " << ex_arg.nops()
+						  << " terms (limit " << ccf_max_terms << ")" << std::endl;
+			CollectCommonFactorsSkipScope __ccf_scope(skip_ccf);
+			GiNaC::ex cl = (skip_ccf ? ex_arg : GiNaC::collect_common_factors(ex_arg));
 			// GiNaC::ex cl=GiNaC::expand(arg);
 			//  std::cout << "CL "  << cl <<  std::endl;
 			//  std::cout << "NOPS "  << cl.nops() <<  std::endl;
