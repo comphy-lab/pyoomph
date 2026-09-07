@@ -67,6 +67,36 @@ class PiecewiseNSCHPotential(CustomMultiReturnExpression):
                 derivative_matrix[1]=3*phi**2 - 1
             #self.debug_python_derivatives_with_FD(arg_list,result_list,derivative_matrix)
 
+    # The two results are the first and second derivative of the double-well potential, so their
+    # own derivatives are its third and fourth: a parabola and a line.
+    def eval_second_derivatives(self, arg_list: NPFloatArray, result_list: NPFloatArray, derivative_matrix: NPFloatArray, second_derivative_tensor: NPFloatArray) -> None:
+        self.eval(1, arg_list, result_list, derivative_matrix)
+        phi = arg_list[0]
+        if abs(phi) > 1:
+            second_derivative_tensor[0, 0, 0] = 2.0
+            second_derivative_tensor[1, 0, 0] = 0.0
+        else:
+            second_derivative_tensor[0, 0, 0] = 3 * phi ** 2 - 1
+            second_derivative_tensor[1, 0, 0] = 6 * phi
+
+    def generate_c_code_second_derivatives(self) -> str:
+        return """
+        CURRENT_MULTIRET_FUNCTION(PYOOMPH_MULTIRET_FLAG_DERIVATIVES, arg_list, result_list, derivative_matrix, nargs, nret);
+        {
+          const double phi=arg_list[0];
+          if (phi<-1 || phi>1)
+          {
+            second_derivative_tensor[0]=2.0;
+            second_derivative_tensor[1]=0.0;
+          }
+          else
+          {
+            second_derivative_tensor[0]=3.0*phi*phi - 1.0;
+            second_derivative_tensor[1]=6.0*phi;
+          }
+        }
+        """
+
     def generate_c_code(self) -> str:
         return """
         const double phi=arg_list[0];

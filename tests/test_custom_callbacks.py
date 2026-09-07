@@ -140,3 +140,28 @@ def test_python_callback_derivatives_reach_the_jacobian(tmp_path, with_c_code):
         problem.initialise()
         problem.solve()
         assert abs(float(problem.get_ode("ode").get_value("u")) - 2.0) < 1e-8
+
+
+def test_differentiating_a_multi_return_expression_raises_where_it_is_written():
+    """
+    A multi-return callback has no symbolic derivative outside code generation.
+
+    Its Jacobian is supplied only while the element code is generated, from the expanded node --
+    either the callback's own symbolic derivative or the numerical one it fills in at runtime. A
+    diff() taken in Python differentiates the UNEXPANDED invocation instead, which used to build a
+    node no printer can render: the failure then surfaced hours later as a C file the compiler
+    rejects with the callback's address in it, pointing nowhere near the diff() that caused it.
+
+    Differentiating with respect to something the callback never sees is not an error, and must stay
+    zero -- a residual may perfectly well be differentiated with respect to an unrelated variable.
+    """
+    import pyoomph._pyoomph_core as _pyoomph
+    E = _pyoomph.Expression
+    cb = _PythonOnly()
+    invocation = cb(var("a"))[1]
+
+    # float(), not "== 0": pyoomph's __eq__ compares symbolically and returns an expression
+    assert float(_pyoomph.GiNaC_diff(E(invocation), E(var("unrelated")))) == 0.0
+
+    with pytest.raises(RuntimeError, match="cannot be differentiated symbolically"):
+        _pyoomph.GiNaC_diff(E(invocation), E(var("a")))

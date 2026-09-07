@@ -18,6 +18,7 @@ Submodules
    pyoomph.materials.activity
    pyoomph.materials.activity_electrolyte
    pyoomph.materials.default_materials
+   pyoomph.materials.diffusivity_estimates
    pyoomph.materials.generic
    pyoomph.materials.ions
    pyoomph.materials.mass_transfer

@@ -42,6 +42,10 @@ class PureLiquidWater(PureLiquidProperties):
         # https://en.wikipedia.org/wiki/Water
         self.molar_mass = 18.01528 * gram / mol
 
+        # Molar volume at the normal boiling point, the value Wilke & Chang themselves use for
+        # water (Le Bas increments would give 18.7).
+        self.molar_volume_for_Wilke_Chang_eq = 18.9 * (centi * meter) ** 3 / mol
+
         TKelvin = var("temperature") / kelvin
 
         # https://www.engineersedge.com/physics/water__density_viscosity_specific_weight_13146.htm
@@ -112,6 +116,10 @@ class PureLiquidGlycerol(PureLiquidProperties):
         # https://en.wikipedia.org/wiki/Glycerol
         self.molar_mass = 92.094 * gram / mol
 
+        # Molar volume at the normal boiling point by the additive Le Bas increments
+        # (C 14.8, H 3.7, alcoholic O 7.4 cm^3/mol), for the Wilke-Chang correlation.
+        self.molar_volume_for_Wilke_Chang_eq = 96.2 * (centi * meter) ** 3 / mol
+
         # Malmberg & Maryott, J. Res. Natl. Bur. Stand. 56 (1956) 1: 42.5 at 25 C. Not set as a
         # correlation because the temperature dependence is not needed here; a mixture does not
         # average this automatically, see get_absolute_permittivity.
@@ -149,6 +157,10 @@ class PureLiquidEthanol(PureLiquidProperties):
         super().__init__()
         # https://en.wikipedia.org/wiki/Ethanol
         self.molar_mass = 46.07 * gram / mol
+
+        # Molar volume at the normal boiling point by the additive Le Bas increments
+        # (C 14.8, H 3.7, alcoholic O 7.4 cm^3/mol), for the Wilke-Chang correlation.
+        self.molar_volume_for_Wilke_Chang_eq = 59.2 * (centi * meter) ** 3 / mol
 
         # https://en.wikipedia.org/wiki/Ethanol
         self.dynamic_viscosity = 1.2 * milli * pascal * second
@@ -194,6 +206,10 @@ class PureLiquid12Hexanediol(PureLiquidProperties):
         super().__init__()
         # https://www.sigmaaldrich.com/DE/de/product/aldrich/213691
         self.molar_mass = 118.17 * gram / mol
+
+        # Molar volume at the normal boiling point by the additive Le Bas increments
+        # (C 14.8, H 3.7, alcoholic O 7.4 cm^3/mol), for the Wilke-Chang correlation.
+        self.molar_volume_for_Wilke_Chang_eq = 155.4 * (centi * meter) ** 3 / mol
         self.mass_density = 951 * kilogram / (meter**3)
 
         # https://dx.doi.org/10.1515/zna-2004-0905

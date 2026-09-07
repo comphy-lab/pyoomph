@@ -1123,8 +1123,11 @@ class Problem(_pyoomph.Problem):
         # tracers' rolling position history, which the trail plots are drawn from. 0.1.4 adds the
         # interface/skeleton element data. 0.1.5 adds the endtime of the run statement that wrote the
         # file, so a --runmode continue can tell a state written in the middle of a run statement from
-        # one written by an earlier statement that has since finished. Older files still load.
-        self._dump_version = "0.1.5"
+        # one written by an earlier statement that has since finished. 0.1.6 adds the tracer
+        # collections that live on an interface: only bulk meshes write theirs from inside their own
+        # _define_state_file, so before it a continued run lost every particle a
+        # TracerTransferToInterface had trapped on a free surface. Older files still load.
+        self._dump_version = "0.1.6"
         self._last_bc_setting="init"
 
         self._output_step:int=0
@@ -3504,6 +3507,7 @@ class Problem(_pyoomph.Problem):
         linear_solver_group.add_argument('--umfpack', help="use UMFPACK solver", action='store_true')
         linear_solver_group.add_argument('--pardiso', help="use Pardiso solver", action='store_true')
         linear_solver_group.add_argument('--petsc_mumps',help="use PETSc as linear solver with MUMPS as backend",action="store_true")
+        linear_solver_group.add_argument('--mumps',help="use MUMPS directly as linear solver (needs the pyoomph_mumps package; unlike --petsc_mumps it does not go through PETSc)",action="store_true")
         linear_solver_group.add_argument('--accelerate',help="use Apple Accelerate sparse solver (macOS only)",action='store_true')
         # Mutually exclusive for the same reason as linear_solver_group above.
         eigen_solver_group = self.cmdlineparser.add_mutually_exclusive_group()
@@ -3511,6 +3515,9 @@ class Problem(_pyoomph.Problem):
         eigen_solver_group.add_argument('--slepc_mumps',help="use SLEPc as eigensolver with MUMPS as backend",action="store_true")
         eigen_solver_group.add_argument('--spectra',help="use the built-in Spectra eigensolver (needs no PETSc, but is serial)",action="store_true")
         eigen_solver_group.add_argument('--arpack',help="use scipy's ARPACK-based eigensolver (serial, cannot target an eigenvalue)",action="store_true")
+        # Spelled differently from the linear --mumps because argparse has one flat namespace: the two
+        # registries may both call the backend "mumps", the command line cannot.
+        eigen_solver_group.add_argument('--mumps_eigen',help="use the Spectra eigensolver with MUMPS factorising the shifted matrix (needs the pyoomph_mumps package)",action="store_true")
         # Mutually exclusive for the same reason as linear_solver_group above.
         ccompiler_group = self.cmdlineparser.add_mutually_exclusive_group()
         ccompiler_group.add_argument('--tcc', help="use internal TCC compiler", action='store_true')
@@ -3563,6 +3570,8 @@ class Problem(_pyoomph.Problem):
             self.set_linear_solver("pardiso")
         elif self.cmdlineargs.petsc_mumps:
             self.set_linear_solver("petsc_mumps")
+        elif self.cmdlineargs.mumps:
+            self.set_linear_solver("mumps")
         elif self.cmdlineargs.accelerate:
             self.set_linear_solver("accelerate")
 
@@ -3590,6 +3599,8 @@ class Problem(_pyoomph.Problem):
             self.set_eigensolver("slepc")
         elif self.cmdlineargs.spectra:
             self.set_eigensolver("spectra")
+        elif self.cmdlineargs.mumps_eigen:
+            self.set_eigensolver("mumps")
 
 
 
@@ -4219,14 +4230,14 @@ class Problem(_pyoomph.Problem):
 
             
             
+        # force_remesh carries the arclength vectors across the new mesh and renormalises them itself,
+        # inside its interpolation pass where the slots are actually populated. This used to re-read
+        # history slots 5 and 6 HERE, once more, and push that back as the tangent -- and by this
+        # point they hold nothing useful: with no remesher force_remesh bails out before it ever
+        # stashes, and after a real remesh they have been consumed. Measured on a two-phase
+        # moving-mesh continuation: |d(dof)/ds| was 157.2 before the remesh and 33.9 once
+        # force_remesh had carried it over, and this block then set it to exactly 0.
         self.force_remesh(num_adapt=num_adapt)
-        
-        # Reobtain the arclength vectors
-        if self._last_arclength_parameter is not None:
-            dof_deriv=self.get_history_dofs(5)
-            dof_current=self.get_history_dofs(6)
-            self._update_dof_vectors_for_continuation(dof_deriv,dof_current)
-            self._renormalise_continuation_tangent(dof_deriv,dof_current)
         
         if biftrack != "":
             if resolve_before_eigen:
@@ -4239,6 +4250,11 @@ class Problem(_pyoomph.Problem):
                 self.solve(max_newton_iterations=resolve_max_newton_steps,globally_convergent_newton=resolve_globally_convergent_newton)
         elif resolve:
             self.solve(max_newton_iterations=resolve_max_newton_steps,globally_convergent_newton=resolve_globally_convergent_newton)
+        # This used to fall off the end returning None, i.e. False, contradicting the docstring and
+        # every caller that asks whether a remesh happened -- the GUI's adapt policy never reset its
+        # step counter and never ran its post-remesh work, because the one remesh it did was reported
+        # as "nothing to do".
+        return True
 
     def _domain_name_pattern_candidates(self,node:"EquationTree",depth:int)->tuple[set[str],str]:
         """The names a glob child of `node` may expand to, together with a phrase naming them for the
@@ -9982,7 +9998,7 @@ Patrick E. Farrell, Ásgeir Birkisson & Simon W. Funke, https://arxiv.org/pdf/14
                     remeshers.append(t.remesher)
 
         if len(remeshers)==0:
-            return
+            return False
         # Both deliberately after the "is there anything to remesh at all" test, so that a
         # remesh_if_necessary() which finds nothing to do still returns quietly when distributed,
         # and both before the first mesh is touched - see _check_distributed_remeshing_scope.
@@ -10078,18 +10094,24 @@ Patrick E. Farrell, Ásgeir Birkisson & Simon W. Funke, https://arxiv.org/pdf/14
         def perform_interpolation():
             for _, interp in interpolators.items(): 
                 interp.interpolate() 
+            # Immediately, and after EVERY interpolation pass, not once at the end. History slots 5
+            # and 6 are the two continuation vectors, and interpolate() has just written them onto the
+            # new mesh; the live Dof_derivative is still the OLD mesh's and is meaningless here. The
+            # _adapt() that follows in the num_adapt loop stashes whatever is live back into those
+            # very slots before it refines, so leaving the stale vector in place made _adapt() undo
+            # the transfer -- the tangent came back bit-identical to the pre-remesh one, i.e. the old
+            # mesh's entries reinterpreted on the new numbering (measured: |ddof| and max|dX/ds| both
+            # unchanged to 6 digits while d(int c^2)/ds was 42 % off).
+            if has_continuation_data:
+                dof_deriv=numpy.asarray(self.get_history_dofs(5),dtype=float)
+                if dof_deriv.any():
+                    self._update_dof_vectors_for_continuation(dof_deriv,self.get_history_dofs(6))
             if self._debug_remeshing:
                 # And the state on the NEW mesh, so the two outputs bracket the transfer exactly.
                 if not self.is_quiet():
                     print("Writing an output AFTER remeshing (_debug_remeshing)")
                 self.output()
 
-
-        if has_continuation_data:
-            print("RESTORING CONTINUATION DATA")
-            dof_deriv=self.get_history_dofs(5)
-            dof_current=self.get_history_dofs(6)
-            self._update_dof_vectors_for_continuation(dof_deriv,dof_current)
 
         num_adapt = self._remesh_adaption_steps(num_adapt)
 
@@ -10148,10 +10170,18 @@ Patrick E. Farrell, Ásgeir Birkisson & Simon W. Funke, https://arxiv.org/pdf/14
         # teardown - and why its _templatemesh, in contrast, must be.
         for name, oldmesh in old_meshes.items():
             _destroy_superseded_mesh(oldmesh)
-        
-        
 
+        # The carried tangent has the right direction but not the right length: |dU/ds|^2 is a sum over
+        # degrees of freedom, and the new mesh has a different number of them. Read back from the LIVE
+        # vectors rather than from history slots 5 and 6, which the mesh rebuild above has since
+        # reassigned. See _renormalise_continuation_tangent for what depends on the length.
+        if has_continuation_data:
+            dof_deriv=self.get_arclength_dof_derivative_vector()
+            if len(dof_deriv)>0:
+                self._renormalise_continuation_tangent(dof_deriv,
+                                                       self.get_arclength_dof_current_vector())
 
+        return True
 
     def _define_state_header(self,state:DumpFile)->str:
         """Read or write the header of a state file: what it is, which format version, and how it is sharded.
@@ -10350,6 +10380,46 @@ Patrick E. Farrell, Ásgeir Birkisson & Simon W. Funke, https://arxiv.org/pdf/14
                 for _ in range(int(n_if)):
                     _name = state.string_data(lambda: "", lambda s: s)
                     self._pending_interface_states[_name] = read_interface_state(state)
+        # Tracer collections that live ON an interface. A bulk mesh writes its own inside
+        # _define_state_file; an interface mesh has no such hook - the mesh loop above walks only the
+        # bulk meshes, as its assert says - so without this block a continued run comes back with its
+        # interface collections empty. That is exactly the collection a TracerTransferToInterface has
+        # been filling, i.e. the particles trapped on a free surface, which are the ones that cannot
+        # be regenerated by re-seeding.
+        #
+        # Parked on loading for the same reason as the interface element data above: the interface
+        # meshes are rebuilt from the loaded bulk mesh afterwards, so the collections cannot be filled
+        # here. _apply_interface_states() pushes them once the meshes exist again.
+        if state.version_at_least(0,1,6):
+            # 0.1.6 implies 0.1.3, so the rolling history is always part of these records.
+            imeshes_tr = sorted(self._interfacemeshes, key=lambda m: m.get_full_name())
+            n_itr = len(imeshes_tr)
+            n_itr = state.int_data(lambda: n_itr, lambda n: n) #type:ignore
+            if state.save:
+                for _m in imeshes_tr:
+                    state.string_data(lambda _m=_m: _m.get_full_name(), lambda s: s) #type:ignore[misc]
+                    _tnames = sorted(_m._tracers.keys())
+                    state.int_data(lambda _tnames=_tnames: len(_tnames), lambda n: n) #type:ignore[misc]
+                    for _tn in _tnames:
+                        state.string_data(lambda _tn=_tn: _tn, lambda s: s) #type:ignore[misc]
+                        _col = _m.get_tracers(_tn)
+                        assert _col is not None
+                        _pdata, _tdata = _col._save_state(True) #type:ignore
+                        state.numpy_data(lambda _pdata=_pdata: _pdata, lambda v: v) #type:ignore[misc]
+                        state.numpy_data(lambda _tdata=_tdata: _tdata, lambda v: v) #type:ignore[misc]
+            else:
+                self._pending_interface_tracers = {}
+                for _ in range(int(n_itr)):
+                    _mname = state.string_data(lambda: "", lambda s: s)
+                    _ncols = int(state.int_data(lambda: 0, lambda n: n)) #type:ignore
+                    _per: dict[str,Any] = {}
+                    for _ in range(_ncols):
+                        _tn = state.string_data(lambda: "", lambda s: s)
+                        _pdata = state.numpy_data(lambda: 0, lambda v: v) #type:ignore
+                        _tdata = state.numpy_data(lambda: 0, lambda v: v) #type:ignore
+                        _per[_tn] = (_pdata, _tdata)
+                    self._pending_interface_tracers[_mname] = _per
+
         # Global params
         gpars = list(sorted(self.get_global_parameter_names()))
         numgpars = len(gpars)
@@ -10597,16 +10667,31 @@ Patrick E. Farrell, Ásgeir Birkisson & Simon W. Funke, https://arxiv.org/pdf/14
         alone: that is a mesh which has changed since the file was written, and the rebuild's own
         transfer is a better answer there than nothing."""
         pending = getattr(self, "_pending_interface_states", None)
-        if not pending:
-            return
-        from ..meshes.meshstate import apply_interface_state
-        try:
-            for m in self._interfacemeshes:
-                rec = pending.get(m.get_full_name())
-                if rec is not None:
-                    apply_interface_state(m, *rec)
-        finally:
-            self._pending_interface_states = None
+        if pending:
+            from ..meshes.meshstate import apply_interface_state
+            try:
+                for m in self._interfacemeshes:
+                    rec = pending.get(m.get_full_name())
+                    if rec is not None:
+                        apply_interface_state(m, *rec)
+            finally:
+                self._pending_interface_states = None
+        # The interface tracer collections, parked by the same reasoning. A collection named in the
+        # file but absent now is skipped: the equations changed since it was written, and an empty
+        # collection is a better answer than raising on a file that is otherwise fine.
+        pending_tr = getattr(self, "_pending_interface_tracers", None)
+        if pending_tr:
+            try:
+                for m in self._interfacemeshes:
+                    per = pending_tr.get(m.get_full_name())
+                    if not per:
+                        continue
+                    for tname, (pdata, tdata) in per.items():
+                        col = m.get_tracers(tname, error_on_missing=False)
+                        if col is not None:
+                            col._load_state(pdata, tdata, True) #type:ignore
+            finally:
+                self._pending_interface_tracers = None
 
     def _load_state(self, fname:str | IO[bytes],ignore_outstep:bool=False,relative_to_output:bool=False,ignore_eigendata:bool=False,ignore_continuation_data:bool=False,additional_info:dict[Any,Any]={},quiet:bool=False):
         if not self.is_initialised():

@@ -147,7 +147,16 @@ namespace pyoomph
     virtual std::string get_id_name() { return "unknown multi-ret cb"; }
     virtual std::string _get_c_code() { return ""; } // Optionally return literal C code implementing this function directly (inlined at code generation instead of calling back into Python); empty means no C code present
     virtual void _call(int , double *, unsigned int , double *, unsigned int , double *) { throw_runtime_error("Should not end up here"); } // Numerically evaluate; if flag is set, also fill the nres x nargs derivative matrix
+    // Same, but additionally filling the nres x nargs x nargs second-derivative tensor
+    // (second_derivs[(i_res*nargs + j_arg)*nargs + k_arg], symmetric in j_arg/k_arg). Only reached from the
+    // Hessian routine, through the separate invoke_multi_ret_hessian entry point - see jitbridge.h.
+    virtual void _call_second_derivatives(int , double *, unsigned int , double *, unsigned int , double *, double *) { throw_runtime_error("Should not end up here"); }
+    virtual std::string _get_c_code_second_derivatives() { return ""; } // Optionally literal C code filling second_derivative_tensor; empty means fall back to finite differences of the derivative matrix
+    virtual double get_second_derivative_fd_epsilon() { return 1e-6; }  // Step of that fallback. Larger than a Jacobian FD step on purpose: this differences an already-differenced quantity
     virtual std::pair<bool, GiNaC::ex> _get_symbolic_derivative(const std::vector<GiNaC::ex> &, const int &, const int &) { return std::make_pair(false, 0); } // Optionally provide an analytic symbolic derivative of result i_res w.r.t. argument j_arg (first=false means "not available", fall back to numerical differentiation)
+    // Same for the second derivative of result i_res w.r.t. arguments j_arg and k_arg. Only ever asked with
+    // j_arg <= k_arg, since the tensor is symmetric and MultiRetCallback canonicalises the index pair.
+    virtual std::pair<bool, GiNaC::ex> _get_symbolic_second_derivative(const std::vector<GiNaC::ex> &, const int &, const int &, const int &) { return std::make_pair(false, 0); }
 
     // See CustomMathExpressionBase::acquire_leaf_reference()/release_leaf_reference() - same purpose, for CustomMultiReturnExpressionWrapper below.
     virtual void acquire_leaf_reference() {}
@@ -472,6 +481,52 @@ namespace pyoomph
     double eval_to_double(const GiNaC::ex &inp);                // Forces full numeric evaluation of an expression to a real double (throws if not possible)
     std::complex<double> eval_to_complex(const GiNaC::ex &inp); // Forces full numeric evaluation of an expression to a complex double
 
+    // Determines the sign of a (possibly dimensional) expression without evaluating it numerically as a whole.
+    // Base units are positive symbols by construction, so the sign is carried entirely by the numeric prefactor
+    // times the dimensionless remainder of the unit split. Returns false if the sign cannot be decided, e.g.
+    // because the expression still contains fields or symbols. Sets sign to -1, 0 or +1 otherwise.
+    bool decidable_condition_sign(const GiNaC::ex &cond, int &sign);
+
+    // A held condition, i.e. what Python's <, <=, > and >= on an Expression return, optionally combined with ~, &, | and ^.
+    // It is deliberately neither a GiNaC::relational (which no pyoomph pass understands) nor an Expression (binding
+    // __bool__ on Expression would change the truthiness of every expression in the framework).
+    //
+    // conditional(cond, a, b) turns it into a piecewise_geq0/piecewise_gt0 call. A combination of conditions is lowered
+    // by evaluating each comparison to a 0/1 indicator and combining those arithmetically (not p = 1-p, p and q = p*q,
+    // p or q = p+q-p*q, p xor q = p+q-2*p*q), so that the whole condition remains a single sign test. Only the cheap
+    // comparisons are combined this way, the branch values themselves stay a proper ternary and are never both evaluated.
+    struct SymbolicCondition
+    {
+        enum Kind
+        {
+            rel_lt = 0,
+            rel_le = 1,
+            rel_gt = 2,
+            rel_ge = 3,
+            log_not = 4,
+            log_and = 5,
+            log_or = 6,
+            log_xor = 7
+        };
+        Kind kind;
+        GiNaC::ex lhs, rhs;                      // only used by the comparisons, i.e. by rel_*
+        std::vector<SymbolicCondition> children; // only used by the logical combinations
+        SymbolicCondition(const GiNaC::ex &lhs_, const GiNaC::ex &rhs_, Kind kind_) : kind(kind_), lhs(lhs_), rhs(rhs_) {}
+        SymbolicCondition(Kind kind_, const std::vector<SymbolicCondition> &children_) : kind(kind_), lhs(0), rhs(0), children(children_) {}
+        bool is_comparison() const { return kind <= rel_ge; }
+        bool is_strict() const { return kind == rel_lt || kind == rel_gt; }
+        std::string opstring() const;  // the comparison operator, or the logical one for a combination
+        std::string to_string() const; // the whole condition, e.g. "(a < b) & (c >= d)"
+        // lhs-rhs of a comparison, oriented so that a positive sign means that it holds
+        GiNaC::ex oriented_condition() const;
+        // 1 if the condition holds, 0 otherwise, as an expression that keeps everything held that is not decidable yet
+        GiNaC::ex indicator() const;
+        // Evaluates the condition to a boolean, throwing if it cannot be decided (e.g. because it still depends on fields)
+        bool to_bool() const;
+        // piecewise_geq0/piecewise_gt0 expression selecting iftrue when the condition holds, iffalse otherwise
+        GiNaC::ex as_conditional(const GiNaC::ex &iftrue, const GiNaC::ex &iffalse) const;
+    };
+
     // The following DECLARE_FUNCTION_NP macros (from GiNaC) each declare a symbolic GiNaC function of N arguments that acts
     // as a placeholder/operator node in the expression tree. They are not evaluated immediately; their _eval/print/derivative
     // behavior is registered via REGISTER_FUNCTION in expressions.cpp, where they are expanded/lowered during code generation.
@@ -509,6 +564,7 @@ namespace pyoomph
     DECLARE_FUNCTION_2P(minimum)   // min(a,b)
     DECLARE_FUNCTION_2P(maximum)   // max(a,b)
     DECLARE_FUNCTION_3P(piecewise_geq0) // Returns a if the condition (1st arg) is >=0, otherwise b
+    DECLARE_FUNCTION_3P(piecewise_gt0)  // Returns a if the condition (1st arg) is >0, otherwise b (strict twin of piecewise_geq0)
     DECLARE_FUNCTION_1P(erf)       // Error function; GiNaC has no erf of its own, but C99 (and hence the generated code) does
     DECLARE_FUNCTION_1P(erfc)      // Complementary error function, i.e. 1-erf, kept separate to retain its accuracy for large arguments
 

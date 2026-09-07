@@ -29,6 +29,7 @@ from __future__ import annotations
  
 from .. import _pyoomph_core as _pyoomph
 from abc import abstractmethod
+import math
 import numpy
 from ..typings import *
 from .generic import ExpressionOrNum, Expression
@@ -269,12 +270,178 @@ class FiniteDifferenceDerivative2ndIJ(CustomMathExpression):
         return (upp-ump-upm+umm)/(4*self.epsilon1*self.epsilon2)
 
 
+# =================================================================================================
+# Exact derivatives of an eval() that was only ever written to compute values
+# =================================================================================================
+
+class HyperDual:
+    """A number carrying its first and second derivatives with respect to the callback arguments.
+
+    Forward-mode automatic differentiation, second order. Arithmetic on these propagates
+    ``(value, gradient, hessian)`` by the chain rule, so pushing HyperDual arguments through an
+    ordinary ``eval()`` implementation yields its EXACT Jacobian and second derivatives without any
+    of them being written out by hand, and without the round-off of differencing.
+
+    ``numpy.log``/``numpy.exp``/``numpy.sqrt`` on a Python object dispatch to the object's own
+    ``log()``/``exp()``/``sqrt()``, which is why an eval() written with ``numpy.log(x)`` needs no
+    change to be differentiated this way. What such an eval() must NOT do is cast its arguments to
+    ``float`` or write into a float array - see fill_python_derivatives_by_AD.
+
+    Cost is O(nargs^2) per elementary operation, i.e. one pass instead of the nargs*nargs callback
+    evaluations a difference-of-differences needs, and exact rather than accurate to sqrt(epsilon).
+    """
+
+    __slots__ = ("value", "grad", "hess")
+
+    def __init__(self, value: float, grad: NPFloatArray, hess: NPFloatArray | None):
+        self.value = value
+        self.grad = grad
+        #: None means first order only. Second derivatives cost an (nargs x nargs) array and two
+        #: outer products per elementary operation, so carrying them when only the Jacobian is
+        #: wanted made an analytic Jacobian an order of magnitude slower than the finite differences
+        #: it replaced - measured, not assumed.
+        self.hess = hess
+
+    @staticmethod
+    def independent_variables(values: Sequence[float], second_order: bool = True) -> list["HyperDual"]:
+        """The seed: argument i with dx_i/dx_j = delta_ij and zero second derivatives."""
+        n = len(values)
+        res: list[HyperDual] = []
+        for i in range(n):
+            g = numpy.zeros(n)
+            g[i] = 1.0
+            res.append(HyperDual(float(values[i]), g, numpy.zeros((n, n)) if second_order else None))
+        return res
+
+    @staticmethod
+    def _split(o: Any) -> tuple[float, Any, Any]:
+        if isinstance(o, HyperDual):
+            return o.value, o.grad, o.hess
+        return float(o), None, None
+
+    def _combine(self, o: Any, dvalue: float, d_self: float, d_other: float,
+                 d2_self: float, d2_other: float, d2_cross: float) -> "HyperDual":
+        """One chain-rule step for a binary operation, given its partial derivatives."""
+        ov, og, oh = self._split(o)
+        if self.hess is None:
+            grad = d_self * self.grad
+            if og is not None:
+                grad = grad + d_other * og
+            return HyperDual(dvalue, grad, None)
+        grad = d_self * self.grad
+        hess = d_self * self.hess + d2_self * numpy.outer(self.grad, self.grad)
+        if og is not None:
+            grad = grad + d_other * og
+            hess = (hess + d_other * oh + d2_other * numpy.outer(og, og)
+                    + d2_cross * (numpy.outer(self.grad, og) + numpy.outer(og, self.grad)))
+        return HyperDual(dvalue, grad, hess)
+
+    def __add__(self, o: Any) -> "HyperDual":
+        ov, _, _ = self._split(o)
+        return self._combine(o, self.value + ov, 1.0, 1.0, 0.0, 0.0, 0.0)
+    __radd__ = __add__
+
+    def __neg__(self) -> "HyperDual":
+        return HyperDual(-self.value, -self.grad, None if self.hess is None else -self.hess)
+
+    def __sub__(self, o: Any) -> "HyperDual":
+        ov, _, _ = self._split(o)
+        return self._combine(o, self.value - ov, 1.0, -1.0, 0.0, 0.0, 0.0)
+
+    def __rsub__(self, o: Any) -> "HyperDual":
+        return (-self) + o
+
+    def __mul__(self, o: Any) -> "HyperDual":
+        ov, _, _ = self._split(o)
+        return self._combine(o, self.value * ov, ov, self.value, 0.0, 0.0, 1.0)
+    __rmul__ = __mul__
+
+    def __truediv__(self, o: Any) -> "HyperDual":
+        ov, og, _ = self._split(o)
+        if og is None:
+            return self._combine(o, self.value / ov, 1.0 / ov, 0.0, 0.0, 0.0, 0.0)
+        return self._combine(o, self.value / ov, 1.0 / ov, -self.value / (ov * ov),
+                             0.0, 2.0 * self.value / (ov ** 3), -1.0 / (ov * ov))
+
+    def __rtruediv__(self, o: Any) -> "HyperDual":
+        ov = float(o)
+        return self._unary(ov / self.value, -ov / self.value ** 2, 2.0 * ov / self.value ** 3)
+
+    def _unary(self, value: float, d1: float, d2: float) -> "HyperDual":
+        if self.hess is None:
+            return HyperDual(value, d1 * self.grad, None)
+        return HyperDual(value, d1 * self.grad,
+                         d1 * self.hess + d2 * numpy.outer(self.grad, self.grad))
+
+    def __pow__(self, o: Any) -> "HyperDual":
+        if isinstance(o, HyperDual):
+            # a**b == exp(b ln a); no shipped callback needs it, and getting it silently wrong
+            # would be worse than saying so.
+            return (self.log() * o).exp()
+        p = float(o)
+        return self._unary(self.value ** p, p * self.value ** (p - 1.0),
+                           p * (p - 1.0) * self.value ** (p - 2.0))
+
+    def __rpow__(self, o: Any) -> "HyperDual":
+        lb = math.log(float(o))
+        v = float(o) ** self.value
+        return self._unary(v, v * lb, v * lb * lb)
+
+    def log(self) -> "HyperDual":
+        return self._unary(math.log(self.value), 1.0 / self.value, -1.0 / (self.value * self.value))
+
+    def exp(self) -> "HyperDual":
+        v = math.exp(self.value)
+        return self._unary(v, v, v)
+
+    def sqrt(self) -> "HyperDual":
+        v = math.sqrt(self.value)
+        return self._unary(v, 0.5 / v, -0.25 / (v * self.value))
+
+    def cosh(self) -> "HyperDual":
+        return self._unary(math.cosh(self.value), math.sinh(self.value), math.cosh(self.value))
+
+    def sinh(self) -> "HyperDual":
+        return self._unary(math.sinh(self.value), math.cosh(self.value), math.sinh(self.value))
+
+    def tanh(self) -> "HyperDual":
+        v = math.tanh(self.value)
+        return self._unary(v, 1.0 - v * v, -2.0 * v * (1.0 - v * v))
+
+    # Comparisons act on the value, so an eval() that branches on its arguments still branches the
+    # same way. The derivative of the branch taken is what AD gives, which is the right answer
+    # everywhere except exactly on the switching surface - the same caveat as any piecewise model.
+    def __lt__(self, o: Any) -> bool: return self.value < self._split(o)[0]
+    def __le__(self, o: Any) -> bool: return self.value <= self._split(o)[0]
+    def __gt__(self, o: Any) -> bool: return self.value > self._split(o)[0]
+    def __ge__(self, o: Any) -> bool: return self.value >= self._split(o)[0]
+    # Deliberately NO __float__. With one defined, math.sqrt(x) and friends coerce silently and
+    # return a plain number, so an eval() written against the `math` module rather than numpy would
+    # come back with the right value and NO derivatives at all - a silently wrong Jacobian, which is
+    # exactly the failure this class exists to avoid. Without it those calls raise a TypeError
+    # naming the operation, and the class is simply reported as not differentiable this way.
+
+    def __abs__(self) -> "HyperDual":
+        # Smooth away from zero, which is where a callback that branches on abs() is using it.
+        return self if self.value >= 0.0 else -self
+    def __repr__(self) -> str: return "HyperDual(" + repr(self.value) + ")"
+
+
 class CustomMultiReturnExpression(_pyoomph.CustomMultiReturnExpression):
     def __init__(self) -> None:
         super().__init__()
         self.use_c_code: Literal["auto"] | bool = "auto"
         self.return_tuple_for_single_return:bool=False
         self.set_debug_python_vs_c_epsilon(-1.0) # No C vs Python debugging by default
+        # Step of the finite-difference fallback for the SECOND derivatives, in Python and in the
+        # generated C alike. Deliberately larger than a Jacobian FD step: this differences an already
+        # differenced quantity, so the usual 1e-8 would leave nothing but round-off.
+        self.second_derivative_fd_epsilon:float=1e-6
+        #: How eval_second_derivatives() gets its numbers when it is not overridden.
+        #: "fd" finite-differences the Jacobian; "ad" runs eval() itself on HyperDual numbers,
+        #: which is exact but requires eval() to be written in plain arithmetic and numpy calls
+        #: (no math.* and no float() on the arguments - see fill_python_derivatives_by_AD).
+        self.second_derivative_mode:Literal["fd","ad"]="fd"
         pass
 
     def get_id_name(self) -> str:
@@ -299,6 +466,18 @@ class CustomMultiReturnExpression(_pyoomph.CustomMultiReturnExpression):
     def eval(self, flag: int, arg_list: NPFloatArray, result_list: NPFloatArray, derivative_matrix: NPFloatArray) -> None:
         raise RuntimeError("This must be implemented")
 
+    # The same, plus the second derivatives. Only called while an analytic Hessian is assembled, i.e.
+    # after setup_for_stability_analysis(analytic_hessian=True), and never during a residual or
+    # Jacobian assembly - so implementing it costs nothing anywhere else.
+    # second_derivative_tensor[i, j, k] is d^2 result[i] / d arg[j] d arg[k]. It MUST come out
+    # symmetric in j and k: the generated code exploits that and only ever reads the j<=k half.
+    def eval_second_derivatives(self, arg_list: NPFloatArray, result_list: NPFloatArray, derivative_matrix: NPFloatArray, second_derivative_tensor: NPFloatArray) -> None:
+        if self.second_derivative_mode == "ad":
+            self.fill_python_derivatives_by_AD(arg_list, result_list, derivative_matrix, second_derivative_tensor)
+            return
+        self.eval(1, arg_list, result_list, derivative_matrix)
+        self.fill_python_second_derivatives_by_FD(arg_list, result_list, derivative_matrix, second_derivative_tensor)
+
     # Sometimes, we know that some derivative is e.g. a constant or even zero. In that case, we can return it here. It will be substituted in the derived expression
     # If it is e.g. 0, this simplifies the Jacobian term and requires less computation
     def use_symbolic_derivative(self,arg_list: Sequence[Expression],i_res:int,j_arg:int)->ExpressionOrNum | None:
@@ -306,6 +485,22 @@ class CustomMultiReturnExpression(_pyoomph.CustomMultiReturnExpression):
 
     def _get_symbolic_derivative(self,arg_list:Sequence[Expression],i_res:int,j_arg:int)->tuple[bool,Expression]:
         res=self.use_symbolic_derivative(arg_list,i_res,j_arg)
+        zero=Expression(0)
+        if res is None:
+            return (False,zero)
+        else:
+            if not isinstance(res,Expression):
+                res=Expression(res)
+            return (True,res)
+
+    # The same for a second derivative. Only ever asked with j_arg <= k_arg, since the tensor is
+    # symmetric. Note that a first derivative given symbolically here needs nothing further: it is an
+    # ordinary expression, which the code generator differentiates again by itself.
+    def use_symbolic_second_derivative(self,arg_list: Sequence[Expression],i_res:int,j_arg:int,k_arg:int)->ExpressionOrNum | None:
+        return None
+
+    def _get_symbolic_second_derivative(self,arg_list:Sequence[Expression],i_res:int,j_arg:int,k_arg:int)->tuple[bool,Expression]:
+        res=self.use_symbolic_second_derivative(arg_list,i_res,j_arg,k_arg)
         zero=Expression(0)
         if res is None:
             return (False,zero)
@@ -338,6 +533,42 @@ class CustomMultiReturnExpression(_pyoomph.CustomMultiReturnExpression):
             return res
         else:
             return ""
+
+    # C code filling the second derivatives, written into a function of its own that the code
+    # generator emits alongside the one generate_c_code() lands in. Available there, besides the
+    # usual arg_list/result_list/derivative_matrix/nargs/nret:
+    #   second_derivative_tensor[(i*nargs + j)*nargs + k] = d^2 result[i] / d arg[j] d arg[k]
+    # which has to be filled symmetrically in j and k.
+    #
+    # This body has to fill result_list and derivative_matrix as well, and they arrive UNSET: it is
+    # a separate function, not a continuation of generate_c_code(), so nothing has run that body
+    # yet. Unless the second derivatives are cheaper to get alongside the value, open with
+    #   CURRENT_MULTIRET_FUNCTION(PYOOMPH_MULTIRET_FLAG_DERIVATIVES, arg_list, result_list, derivative_matrix, nargs, nret);
+    # which calls this callback's own generate_c_code() function - the macro is defined around both
+    # functions for exactly this. Forgetting it does not fail to compile and does not warn: the
+    # Hessian is then built on an uninitialised value and Jacobian, and only a Hessian-vs-finite-
+    # difference check (Problem.debug_analytic_hessian_by_fd) tells you. The default
+    # FILL_MULTI_RET_HESSIAN_BY_FD body below starts with that same call.
+    #
+    # Only consulted for a callback that also has generate_c_code(): with no C implementation at
+    # all there is no generated function to put this in, and everything - values, Jacobian and
+    # second derivatives alike - goes back into Python through eval()/eval_second_derivatives().
+    #
+    # If this returns "", the generated function instead ends in
+    #   FILL_MULTI_RET_HESSIAN_BY_FD(second_derivative_fd_epsilon)
+    # which finite-differences the derivative matrix. That keeps every existing generate_c_code()
+    # implementation working under a Hessian without changes, at nargs extra evaluations per call -
+    # or nargs*nargs if the Jacobian is itself filled by FILL_MULTI_RET_JACOBIAN_BY_FD.
+    def generate_c_code_second_derivatives(self) -> str:
+        return ""
+
+    def _get_c_code_second_derivatives(self) -> str:
+        if self.use_c_code is False:
+            return ""
+        return self.generate_c_code_second_derivatives()
+
+    def get_second_derivative_fd_epsilon(self) -> float:
+        return self.second_derivative_fd_epsilon
 
     def __call__(self, *args: "ExpressionOrNum", **kwds: Any) -> Any:
         pargs = self.process_args_to_scalar_list(*args)
@@ -408,6 +639,90 @@ class CustomMultiReturnExpression(_pyoomph.CustomMultiReturnExpression):
             self.eval(0, arg_list_p, result_list_p, derivative_matrix_dummy)
             derivative_matrix[:, iarg] = (
                 result_list_p[:]-result_list[:])/fd_epsilion
+
+    # The second-derivative counterpart, and the default implementation of eval_second_derivatives.
+    # It differences the DERIVATIVE MATRIX rather than the results, so a callback with an analytic
+    # Jacobian gets second derivatives of the same quality; where the Jacobian is itself filled by
+    # fill_python_derivatives_by_FD this becomes a difference of a difference - correct, but only to
+    # about sqrt(epsilon), and at nargs*nargs evaluations of the callback.
+    # The closing symmetrisation is not cosmetic: a forward difference of a Jacobian is symmetric
+    # only to O(epsilon), and the generated code reads just one of the two halves of each pair.
+    def fill_python_second_derivatives_by_FD(self, arg_list: NPFloatArray, result_list: NPFloatArray, derivative_matrix: NPFloatArray, second_derivative_tensor: NPFloatArray, fd_epsilion: float | None = None):
+        if fd_epsilion is None:
+            fd_epsilion = self.second_derivative_fd_epsilon
+        nargs = len(arg_list)
+        arg_list_p = numpy.array(arg_list, dtype=numpy.float64)
+        result_list_p = numpy.array(result_list, dtype=numpy.float64)
+        derivative_matrix_p = numpy.array(derivative_matrix, dtype=numpy.float64)
+        for karg in range(nargs):
+            arg_list_p[:] = arg_list[:]
+            arg_list_p[karg] += fd_epsilion
+            derivative_matrix_p.fill(0.0)
+            self.eval(1, arg_list_p, result_list_p, derivative_matrix_p)
+            second_derivative_tensor[:, :, karg] = (
+                derivative_matrix_p[:, :]-derivative_matrix[:, :])/fd_epsilion
+        for jarg in range(nargs):
+            for karg in range(jarg+1, nargs):
+                sym = 0.5*(second_derivative_tensor[:, jarg, karg]+second_derivative_tensor[:, karg, jarg])
+                second_derivative_tensor[:, jarg, karg] = sym
+                second_derivative_tensor[:, karg, jarg] = sym
+
+    # Exact first and second derivatives, obtained by running this class's own eval() on HyperDual
+    # numbers instead of floats (forward-mode AD, second order - see HyperDual above). Nothing has to
+    # be differentiated by hand, and the result is exact rather than accurate to sqrt(epsilon).
+    #
+    # An eval() qualifies if it only does arithmetic and numpy.log/exp/sqrt/power on its arguments.
+    # It does NOT qualify if it casts them with float(), or writes results into an array that was
+    # allocated as float64 - hence the object-dtype scratch arrays below. A class whose eval() does
+    # either can usually be made to qualify by moving the cast behind a flag; see the AIOMFAC and
+    # UNIFAC callbacks, which do exactly that.
+    #
+    # Use it by pointing eval_second_derivatives at it:
+    #     def eval_second_derivatives(self, args, res, deriv, second):
+    #         self.fill_python_derivatives_by_AD(args, res, deriv, second)
+    def fill_python_derivatives_by_AD(self, arg_list: NPFloatArray, result_list: NPFloatArray, derivative_matrix: NPFloatArray, second_derivative_tensor: NPFloatArray | None = None) -> None:
+        nargs = len(arg_list)
+        nres = len(result_list)
+        duals = HyperDual.independent_variables([float(a) for a in arg_list],
+                                                second_order=second_derivative_tensor is not None)
+        arg_obj = numpy.empty(nargs, dtype=object)
+        for i, d in enumerate(duals):
+            arg_obj[i] = d
+        res_obj = numpy.zeros(nres, dtype=object)
+        deriv_dummy = numpy.zeros((nres, nargs), dtype=object)
+        self.eval(0, arg_obj, res_obj, deriv_dummy)
+        for i in range(nres):
+            r = res_obj[i]
+            if not isinstance(r, HyperDual):
+                # A result that came out a plain number does not depend on the arguments at all
+                # (a constant branch, say), so all of its derivatives are zero.
+                result_list[i] = float(r)
+                derivative_matrix[i, :] = 0.0
+                if second_derivative_tensor is not None:
+                    second_derivative_tensor[i, :, :] = 0.0
+                continue
+            result_list[i] = r.value
+            derivative_matrix[i, :] = r.grad
+            if second_derivative_tensor is not None:
+                second_derivative_tensor[i, :, :] = r.hess
+
+    # Add this at the end of an eval_second_derivatives implementation to check it against FD.
+    def debug_python_second_derivatives_with_FD(self, arg_list: NPFloatArray, result_list: NPFloatArray, derivative_matrix: NPFloatArray, second_derivative_tensor: NPFloatArray, fd_epsilion: float | None = None, error_threshold: float = 1e-5, stop_on_error: bool = False):
+        reference = numpy.zeros_like(numpy.array(second_derivative_tensor, dtype=numpy.float64))
+        self.fill_python_second_derivatives_by_FD(arg_list, result_list, derivative_matrix, reference, fd_epsilion)
+        for iret in range(reference.shape[0]):
+            for jarg in range(len(arg_list)):
+                for karg in range(jarg, len(arg_list)):
+                    diff = reference[iret, jarg, karg]-second_derivative_tensor[iret, jarg, karg]
+                    if abs(diff) > error_threshold:
+                        msg = ("DIFFERENCE IN "+str(self)+": d2 Result "+str(iret)+" derived by args "
+                               + str(jarg)+" and "+str(karg)+" should be "+str(reference[iret, jarg, karg])
+                               + ", but is "+str(second_derivative_tensor[iret, jarg, karg]))
+                        msg += " Args are: "+str(arg_list)+" Result is: "+str(result_list)
+                        if stop_on_error:
+                            raise RuntimeError(msg)
+                        else:
+                            print(msg)
 
 
     # Helper to generate the derivative code. It won't work out of the box, i.e. you might have to temporarily replace e.g. numpy.sqrt by sympy.sqrt etc in the eval function

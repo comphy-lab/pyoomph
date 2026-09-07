@@ -183,13 +183,19 @@ namespace pyoomph
 		std::vector<double> argbuffer;
 		std::vector<double> resbuffer;
 		std::vector<double> derivbuffer;
+		std::vector<double> secondderivbuffer;
 		size_t deriv_nres = 1, deriv_nargs = 1;
+		size_t second_deriv_nres = 0, second_deriv_nargs = 0;
 
 	public:
 		CustomMultiReturnExpression() : CustomMultiReturnExpressionBase(), argbuffer(1), resbuffer(1), derivbuffer(1)
 		{
 		}
 		virtual void eval(int flag, nb::ndarray<nb::numpy, double> &args, nb::ndarray<nb::numpy, double> &result, nb::ndarray<nb::numpy, double> &derivs) {}
+		// Called instead of eval() when the Hessian needs the second derivatives as well. It is handed
+		// the first derivatives too, since every implementation - the finite-difference default included -
+		// wants them, and since filling them here saves the extra eval() call the caller would need.
+		virtual void eval_second_derivatives(nb::ndarray<nb::numpy, double> &args, nb::ndarray<nb::numpy, double> &result, nb::ndarray<nb::numpy, double> &derivs, nb::ndarray<nb::numpy, double> &second_derivs) {}
 
 		virtual void _debug_c_code_call(int flag, double *args, unsigned int nargs, double *res, unsigned int nres, double *derivs)
 		{
@@ -279,6 +285,63 @@ namespace pyoomph
 			}
 		}
 
+		// The Hessian counterpart of _call(), reached through invoke_multi_ret_hessian. Same buffer
+		// marshalling, with a third view - three-dimensional (nres, nargs, nargs), so Python can index
+		// it as second_derivative_tensor[i, j, k] the way the derivative matrix is indexed [i, j].
+		void _call_second_derivatives(int flag, double *args, unsigned int nargs, double *res, unsigned int nres, double *derivs, double *second_derivs) override
+		{
+			nb::gil_scoped_acquire gil; // See _call() above for why this is taken here.
+			if (argbuffer.size() != nargs)
+				argbuffer.resize(nargs);
+			if (resbuffer.size() != nres)
+				resbuffer.resize(nres);
+			if (deriv_nres != nres || deriv_nargs != nargs)
+			{
+				derivbuffer.resize((size_t)nres * nargs);
+				deriv_nres = nres;
+				deriv_nargs = nargs;
+			}
+			if (second_deriv_nres != nres || second_deriv_nargs != nargs)
+			{
+				secondderivbuffer.resize((size_t)nres * nargs * nargs);
+				second_deriv_nres = nres;
+				second_deriv_nargs = nargs;
+			}
+			for (unsigned int i = 0; i < nargs; i++)
+				argbuffer[i] = args[i];
+			nb::ndarray<nb::numpy, double> argview = callback_buffer_view(argbuffer.data(), {argbuffer.size()});
+			nb::ndarray<nb::numpy, double> resview = callback_buffer_view(resbuffer.data(), {resbuffer.size()});
+			nb::ndarray<nb::numpy, double> derivview = callback_buffer_view(derivbuffer.data(), {deriv_nres, deriv_nargs});
+			nb::ndarray<nb::numpy, double> secondview = callback_buffer_view(secondderivbuffer.data(), {second_deriv_nres, second_deriv_nargs, second_deriv_nargs});
+			this->eval_second_derivatives(argview, resview, derivview, secondview);
+			if (flag & PYOOMPH_MULTIRET_FLAG_DEBUG_PYTHON_VS_C)
+			{
+				// The generated code already ran its own C implementation into these arrays; report where
+				// Python disagrees rather than overwriting it, exactly as _debug_c_code_call() does.
+				for (unsigned int i = 0; i < nres; i++)
+					for (unsigned int j = 0; j < nargs; j++)
+						for (unsigned int k = 0; k < nargs; k++)
+						{
+							const size_t idx = ((size_t)i * nargs + j) * nargs + k;
+							if (std::fabs(secondderivbuffer[idx] - second_derivs[idx]) > this->debug_c_code_epsilon)
+							{
+								std::cout << "MULTI-RET Python Vs C difference: d2Result " << i << "/dArg" << j << "/dArg" << k << " is " << secondderivbuffer[idx] << " (Python) and " << second_derivs[idx] << " (C) at arguments: ";
+								for (unsigned int ia = 0; ia < nargs; ia++)
+									std::cout << args[ia] << (ia + 1 < nargs ? "," : "");
+								std::cout << std::endl;
+							}
+						}
+				return;
+			}
+			for (unsigned int i = 0; i < nres; i++)
+				res[i] = resbuffer[i];
+			for (unsigned int i = 0; i < nres; i++)
+				for (unsigned int j = 0; j < nargs; j++)
+					derivs[i * nargs + j] = derivbuffer[i * nargs + j];
+			for (size_t i = 0; i < (size_t)nres * nargs * nargs; i++)
+				second_derivs[i] = secondderivbuffer[i];
+		}
+
 		// See CustomMathExpression::acquire_leaf_reference()/release_leaf_reference() above.
 		void acquire_leaf_reference() override
 		{
@@ -299,7 +362,7 @@ namespace pyoomph
 	class PyCustomMultiReturnExpression : public CustomMultiReturnExpression
 	{
 	public:
-		NB_TRAMPOLINE(CustomMultiReturnExpression, 4);
+		NB_TRAMPOLINE(CustomMultiReturnExpression, 8);
 		std::string get_id_name() override
 		{
 			NB_OVERRIDE(get_id_name);
@@ -308,13 +371,29 @@ namespace pyoomph
 		{
 			NB_OVERRIDE_PURE(eval, flag, arg_list, result_list, derivative_matrix);
 		}
+		void eval_second_derivatives(nb::ndarray<nb::numpy, double> &arg_list, nb::ndarray<nb::numpy, double> &result_list, nb::ndarray<nb::numpy, double> &derivative_matrix, nb::ndarray<nb::numpy, double> &second_derivative_tensor) override
+		{
+			NB_OVERRIDE(eval_second_derivatives, arg_list, result_list, derivative_matrix, second_derivative_tensor);
+		}
 		std::string _get_c_code() override
 		{
 			NB_OVERRIDE(_get_c_code);
 		}
+		std::string _get_c_code_second_derivatives() override
+		{
+			NB_OVERRIDE(_get_c_code_second_derivatives);
+		}
+		double get_second_derivative_fd_epsilon() override
+		{
+			NB_OVERRIDE(get_second_derivative_fd_epsilon);
+		}
 		std::pair<bool, GiNaC::ex> _get_symbolic_derivative(const std::vector<GiNaC::ex> &arg_list, const int &i_res, const int &j_arg) override
 		{
 			NB_OVERRIDE(_get_symbolic_derivative, arg_list, i_res, j_arg);
+		}
+		std::pair<bool, GiNaC::ex> _get_symbolic_second_derivative(const std::vector<GiNaC::ex> &arg_list, const int &i_res, const int &j_arg, const int &k_arg) override
+		{
+			NB_OVERRIDE(_get_symbolic_second_derivative, arg_list, i_res, j_arg, k_arg);
 		}
 	};
 
@@ -426,8 +505,8 @@ void PyReg_Expressions(nb::module_ &m)
 		m, "Expression",
 		"A symbolic (GiNaC) expression: pyoomph's core representation of weak-form residuals, fields, "
 		"parameters and any other symbolic quantity. Supports the usual arithmetic operators (also mixed "
-		"with plain int/float/complex and GiNaC_GlobalParam), comparison against a numeric value (evaluated "
-		"numerically first), and indexing into vector/matrix-valued expressions.")
+		"with plain int/float/complex and GiNaC_GlobalParam), comparisons with <, <=, > and >= (which yield a held "
+		"RelationalExpression, see conditional), and indexing into vector/matrix-valued expressions.")
 		.def(nb::init<const int &>())
 		.def(nb::init<const double &>())
 		.def(nb::init<const GiNaC::ex &>())
@@ -543,58 +622,42 @@ void PyReg_Expressions(nb::module_ &m)
 			 { return lh + rh; }, nb::is_operator())
 		.def("__isub__", [](const GiNaC::ex &lh, const GiNaC::GiNaCGlobalParameterWrapper &rh)
 			 { return lh - rh; }, nb::is_operator())
+		// Comparisons build a held RelationalExpression instead of a bool, so that a condition can stay symbolic until it is
+		// either substituted (expr(t=4*second)) or compiled into the generated code via conditional(cond,iftrue,iffalse).
+		// A relation that *is* numerically decidable still converts to a bool implicitly (RelationalExpression.__bool__),
+		// so "if expr < 3.0:" keeps working exactly as before.
+		.def("__lt__", [](const GiNaC::ex &lh, const GiNaC::ex &rh)
+			 { return pyoomph::expressions::SymbolicCondition(lh, rh, pyoomph::expressions::SymbolicCondition::rel_lt); }, nb::is_operator())
+		.def("__gt__", [](const GiNaC::ex &lh, const GiNaC::ex &rh)
+			 { return pyoomph::expressions::SymbolicCondition(lh, rh, pyoomph::expressions::SymbolicCondition::rel_gt); }, nb::is_operator())
+		.def("__le__", [](const GiNaC::ex &lh, const GiNaC::ex &rh)
+			 { return pyoomph::expressions::SymbolicCondition(lh, rh, pyoomph::expressions::SymbolicCondition::rel_le); }, nb::is_operator())
+		.def("__ge__", [](const GiNaC::ex &lh, const GiNaC::ex &rh)
+			 { return pyoomph::expressions::SymbolicCondition(lh, rh, pyoomph::expressions::SymbolicCondition::rel_ge); }, nb::is_operator())
+		.def("__lt__", [](const GiNaC::ex &lh, const GiNaC::GiNaCGlobalParameterWrapper &rh)
+			 { return pyoomph::expressions::SymbolicCondition(lh, 0 + rh, pyoomph::expressions::SymbolicCondition::rel_lt); }, nb::is_operator())
+		.def("__gt__", [](const GiNaC::ex &lh, const GiNaC::GiNaCGlobalParameterWrapper &rh)
+			 { return pyoomph::expressions::SymbolicCondition(lh, 0 + rh, pyoomph::expressions::SymbolicCondition::rel_gt); }, nb::is_operator())
+		.def("__le__", [](const GiNaC::ex &lh, const GiNaC::GiNaCGlobalParameterWrapper &rh)
+			 { return pyoomph::expressions::SymbolicCondition(lh, 0 + rh, pyoomph::expressions::SymbolicCondition::rel_le); }, nb::is_operator())
+		.def("__ge__", [](const GiNaC::ex &lh, const GiNaC::GiNaCGlobalParameterWrapper &rh)
+			 { return pyoomph::expressions::SymbolicCondition(lh, 0 + rh, pyoomph::expressions::SymbolicCondition::rel_ge); }, nb::is_operator())
+		.def("__lt__", [](const GiNaC::ex &lh, const int &rh)
+			 { return pyoomph::expressions::SymbolicCondition(lh, GiNaC::ex(rh), pyoomph::expressions::SymbolicCondition::rel_lt); }, nb::is_operator())
+		.def("__gt__", [](const GiNaC::ex &lh, const int &rh)
+			 { return pyoomph::expressions::SymbolicCondition(lh, GiNaC::ex(rh), pyoomph::expressions::SymbolicCondition::rel_gt); }, nb::is_operator())
+		.def("__le__", [](const GiNaC::ex &lh, const int &rh)
+			 { return pyoomph::expressions::SymbolicCondition(lh, GiNaC::ex(rh), pyoomph::expressions::SymbolicCondition::rel_le); }, nb::is_operator())
+		.def("__ge__", [](const GiNaC::ex &lh, const int &rh)
+			 { return pyoomph::expressions::SymbolicCondition(lh, GiNaC::ex(rh), pyoomph::expressions::SymbolicCondition::rel_ge); }, nb::is_operator())
 		.def("__lt__", [](const GiNaC::ex &lh, const double &rh)
-			{ 
-			   try 
-			   {
-			     double res=pyoomph::expressions::eval_to_double(lh);
-			     return res< rh;
-			   }
-			   catch (const std::exception &e) 
-			   {
-			     std::ostringstream oss; oss<<"Cannot convert " << lh << " to double for comparison with a numeric value";
-			     throw_runtime_error(oss.str());
-			   } 				
-			}, nb::is_operator())
-         .def("__gt__", [](const GiNaC::ex &lh, const double &rh)
-			{ 
-			   try 
-			   {
-			     double res=pyoomph::expressions::eval_to_double(lh);
-			     return res> rh;
-			   }
-			   catch (const std::exception &e) 
-			   {
-			     std::ostringstream oss; oss<<"Cannot convert " << lh << " to double for comparison with a numeric value";
-			     throw_runtime_error(oss.str());
-			   } 				
-			}, nb::is_operator())	
-            .def("__le__", [](const GiNaC::ex &lh, const double &rh)
-			{ 
-			   try 
-			   {
-			     double res=pyoomph::expressions::eval_to_double(lh);
-			     return res<= rh;
-			   }
-			   catch (const std::exception &e) 
-			   {
-			     std::ostringstream oss; oss<<"Cannot convert " << lh << " to double for comparison with a numeric value";
-			     throw_runtime_error(oss.str());
-			   } 				
-			}, nb::is_operator())
-         .def("__ge__", [](const GiNaC::ex &lh, const double &rh)
-			{ 
-			   try 
-			   {
-			     double res=pyoomph::expressions::eval_to_double(lh);
-			     return res>= rh;
-			   }
-			   catch (const std::exception &e) 
-			   {
-			     std::ostringstream oss; oss<<"Cannot convert " << lh << " to double for comparison with a numeric value";
-			     throw_runtime_error(oss.str());
-			   } 				
-			}, nb::is_operator())						
+			 { return pyoomph::expressions::SymbolicCondition(lh, GiNaC::ex(rh), pyoomph::expressions::SymbolicCondition::rel_lt); }, nb::is_operator())
+		.def("__gt__", [](const GiNaC::ex &lh, const double &rh)
+			 { return pyoomph::expressions::SymbolicCondition(lh, GiNaC::ex(rh), pyoomph::expressions::SymbolicCondition::rel_gt); }, nb::is_operator())
+		.def("__le__", [](const GiNaC::ex &lh, const double &rh)
+			 { return pyoomph::expressions::SymbolicCondition(lh, GiNaC::ex(rh), pyoomph::expressions::SymbolicCondition::rel_le); }, nb::is_operator())
+		.def("__ge__", [](const GiNaC::ex &lh, const double &rh)
+			 { return pyoomph::expressions::SymbolicCondition(lh, GiNaC::ex(rh), pyoomph::expressions::SymbolicCondition::rel_ge); }, nb::is_operator())
 		.def("__round__",[](const GiNaC::ex &self)
 		{
 		  try 
@@ -686,6 +749,11 @@ void PyReg_Expressions(nb::module_ &m)
 			   return 0+pyoomph::expressions::replace_global_params_by_current_values(self);
 			 }, nb::rv_policy::reference, "Return a copy of this expression with every GiNaC_GlobalParam symbol replaced by its current numerical value.")
 		.def("is_zero", &GiNaC::ex::is_zero, "Whether this expression is symbolically (structurally) zero.")
+		.def("is_equal", &GiNaC::ex::is_equal, nb::arg("other"),
+			 "Whether this expression and ``other`` are structurally identical. Since ``==`` is deliberately not overloaded "
+			 "on an Expression (it must keep returning a bool, so that expressions can be used in dicts, sets and ``in`` "
+			 "tests), this is the explicit equality test. It compares the expression trees as they are, without simplifying "
+			 "first, so use ``(a-b).is_zero()`` instead whenever a mathematical rather than a structural comparison is meant.")
 		.def("__float__", [](const GiNaC::ex &self)
 			 { try
 			   {
@@ -771,6 +839,43 @@ void PyReg_Expressions(nb::module_ &m)
   	 self.print(pypc);
 	 return oss.str(); }, "Return the LaTeX representation of this expression.");
 
+	nb::class_<pyoomph::expressions::SymbolicCondition>(
+		m, "RelationalExpression",
+		"A held condition, i.e. a comparison (``<``, ``<=``, ``>``, ``>=``) of two Expressions, optionally combined with "
+		"``~`` (not), ``&`` (and), ``|`` (or) and ``^`` (xor). It stays symbolic, i.e. both sides may still depend on "
+		"fields, time or global parameters. Pass it to ``conditional(cond, iftrue, iffalse)`` to build an expression that "
+		"branches on it, either upon substitution or in the generated code. Whenever the condition is numerically "
+		"decidable, it also converts to a plain bool, so that it can be used in an ``if`` statement directly. Note that "
+		"Python's ternary ``a if cond else b`` and the keywords ``not``, ``and`` and ``or`` cannot be used, since Python "
+		"always casts the condition to a bool - hence the bitwise operators. Mind that these bind tighter than the "
+		"comparisons, i.e. each operand needs its own parentheses.")
+		.def("__bool__", [](const pyoomph::expressions::SymbolicCondition &self)
+			 { return self.to_bool(); })
+		.def("__repr__", [](const pyoomph::expressions::SymbolicCondition &self)
+			 { return self.to_string(); }, "Return the Python-style string representation of this condition.")
+		.def("__invert__", [](const pyoomph::expressions::SymbolicCondition &self)
+			 { return pyoomph::expressions::SymbolicCondition(pyoomph::expressions::SymbolicCondition::log_not, {self}); }, nb::is_operator())
+		.def("__and__", [](const pyoomph::expressions::SymbolicCondition &self, const pyoomph::expressions::SymbolicCondition &other)
+			 { return pyoomph::expressions::SymbolicCondition(pyoomph::expressions::SymbolicCondition::log_and, {self, other}); }, nb::is_operator())
+		.def("__or__", [](const pyoomph::expressions::SymbolicCondition &self, const pyoomph::expressions::SymbolicCondition &other)
+			 { return pyoomph::expressions::SymbolicCondition(pyoomph::expressions::SymbolicCondition::log_or, {self, other}); }, nb::is_operator())
+		.def("__xor__", [](const pyoomph::expressions::SymbolicCondition &self, const pyoomph::expressions::SymbolicCondition &other)
+			 { return pyoomph::expressions::SymbolicCondition(pyoomph::expressions::SymbolicCondition::log_xor, {self, other}); }, nb::is_operator())
+		.def_ro("lhs", &pyoomph::expressions::SymbolicCondition::lhs, "The left hand side of the comparison (only meaningful for a plain comparison).")
+		.def_ro("rhs", &pyoomph::expressions::SymbolicCondition::rhs, "The right hand side of the comparison (only meaningful for a plain comparison).")
+		.def("is_comparison", [](const pyoomph::expressions::SymbolicCondition &self)
+			 { return self.is_comparison(); }, "Whether this is a plain comparison rather than a combination of conditions.")
+		.def("indicator", [](const pyoomph::expressions::SymbolicCondition &self)
+			 { return 0 + self.indicator(); }, "The condition as an Expression that is 1 where it holds and 0 elsewhere.")
+		.def("operator_string", [](const pyoomph::expressions::SymbolicCondition &self)
+			 { return self.opstring(); }, "The operator as a string, i.e. ``<``, ``<=``, ``>``, ``>=`` for a comparison and ``~``, ``&``, ``|``, ``^`` for a combination.");
+
+	m.def(
+		"GiNaC_conditional", [](const pyoomph::expressions::SymbolicCondition &cond, const GiNaC::ex &iftrue, const GiNaC::ex &iffalse)
+		{ return cond.as_conditional(iftrue, iffalse); },
+		nb::arg("cond"), nb::arg("iftrue"), nb::arg("iffalse"),
+		"Returns iftrue if the comparison cond holds, else iffalse. Mapped onto piecewise_geq0/piecewise_gt0 of the difference of both sides.");
+
 	nb::class_<pyoomph::CustomCoordinateSystem, pyoomph::PyCustomCoordinateSystem>(
 		m, "CustomCoordinateSystem",
 		"Base class, to be subclassed in Python, implementing a custom coordinate system (i.e. custom "
@@ -852,7 +957,15 @@ void PyReg_Expressions(nb::module_ &m)
 		.def("_get_symbolic_derivative", &pyoomph::CustomMultiReturnExpression::_get_symbolic_derivative, nb::arg("arg_list"), nb::arg("i_res"), nb::arg("j_arg"),
 			 "Hook, overridable in Python, providing an exact symbolic (rather than finite-difference) derivative d result[i_res] / d arg_list[j_arg]; returns (found, expression).")
 		.def("_get_c_code", &pyoomph::CustomMultiReturnExpression::_get_c_code,
-			 "Hook, overridable in Python, returning a hand-written C implementation of this function to be inlined into the generated code instead of calling back into Python at runtime.");
+			 "Hook, overridable in Python, returning a hand-written C implementation of this function to be inlined into the generated code instead of calling back into Python at runtime.")
+		.def("eval_second_derivatives", &pyoomph::CustomMultiReturnExpression::eval_second_derivatives, nb::arg("arg_list"), nb::arg("result_list"), nb::arg("derivative_matrix"), nb::arg("second_derivative_tensor"),
+			 "Evaluate this function at ``arg_list``, filling the results, the Jacobian and the second derivatives (d2 result[i] / d arg[j] d arg[k], symmetric in j and k) into the three output arrays. Only called while an analytic Hessian is being assembled; the default implementation finite-differences the Jacobian.")
+		.def("_get_symbolic_second_derivative", &pyoomph::CustomMultiReturnExpression::_get_symbolic_second_derivative, nb::arg("arg_list"), nb::arg("i_res"), nb::arg("j_arg"), nb::arg("k_arg"),
+			 "Hook, overridable in Python, providing an exact symbolic second derivative d2 result[i_res] / d arg_list[j_arg] d arg_list[k_arg]; returns (found, expression). Only ever asked with j_arg <= k_arg.")
+		.def("_get_c_code_second_derivatives", &pyoomph::CustomMultiReturnExpression::_get_c_code_second_derivatives,
+			 "Hook, overridable in Python, returning a hand-written C implementation filling ``second_derivative_tensor``. When empty, the generated code finite-differences the derivative matrix instead.")
+		.def("get_second_derivative_fd_epsilon", &pyoomph::CustomMultiReturnExpression::get_second_derivative_fd_epsilon,
+			 "Step size of that finite-difference fallback.");
 
 	m.def(
 		"GiNaC_rational_number", [](const int &num, const int &denom)
@@ -947,6 +1060,10 @@ void PyReg_Expressions(nb::module_ &m)
 		"GiNaC_piecewise_geq0", [](const GiNaC::ex &cond, const GiNaC::ex &a,const GiNaC::ex &b)
 		{ return 0 + pyoomph::expressions::piecewise_geq0(cond, a,b); },
 		nb::arg("cond"), nb::arg("a"), nb::arg("b"), "Returns a if cond>=0, else b"); // TODO Derivatives of step
+	m.def(
+		"GiNaC_piecewise_gt0", [](const GiNaC::ex &cond, const GiNaC::ex &a, const GiNaC::ex &b)
+		{ return 0 + pyoomph::expressions::piecewise_gt0(cond, a, b); },
+		nb::arg("cond"), nb::arg("a"), nb::arg("b"), "Returns a if cond>0, else b");
 	m.def(
 		"GiNaC_minimum", [](const GiNaC::ex &a, const GiNaC::ex &b)
 		{ return 0 + pyoomph::expressions::minimum(a, b); },

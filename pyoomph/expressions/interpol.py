@@ -210,12 +210,44 @@ class CSplineInterpolator(CustomMultiReturnExpression):
         self.tck=splrep(self.x,self.y,k=k)
         self.ppoly=PPoly.from_spline(self.tck)
         self.deriv_poly=self.ppoly.derivative()
+        self.second_deriv_poly=self.deriv_poly.derivative()
         
     def eval(self, flag: int, arg_list: NPFloatArray, result_list: NPFloatArray, derivative_matrix: NPFloatArray) -> None:
         result_list[0]=self.ppoly(arg_list[0])
         if flag:
             derivative_matrix[0]=self.deriv_poly(arg_list[0])
-            
+
+    # scipy differentiates the piecewise polynomial exactly, so the second derivative is as cheap
+    # and as accurate as the first. Note that for a cubic spline it is only piecewise linear, hence
+    # discontinuous in slope at the knots - which is a property of the interpolant, not of this
+    # code, and the same caveat that already applies to the first derivative one order down.
+    def eval_second_derivatives(self, arg_list: NPFloatArray, result_list: NPFloatArray, derivative_matrix: NPFloatArray, second_derivative_tensor: NPFloatArray) -> None:
+        self.eval(1, arg_list, result_list, derivative_matrix)
+        second_derivative_tensor[0,0,0]=self.second_deriv_poly(arg_list[0])
+
+    def generate_c_code_second_derivatives(self) -> str:
+        # Same binary search and Horner evaluation as generate_c_code(), one derivative further.
+        res = "CURRENT_MULTIRET_FUNCTION(PYOOMPH_MULTIRET_FLAG_DERIVATIVES, arg_list, result_list, derivative_matrix, nargs, nret);\n"
+        res += "{\n"
+        res += "const double x=arg_list[0];\n"
+        res += "const double knots[]={"+",".join(map(str,self.ppoly.x))+"};\n"
+        for m, coeff_row in enumerate(self.second_deriv_poly.c):
+            res += "const double d2coeffs_"+str(m)+"[]={"+",".join(map(str,coeff_row))+"};\n"
+        res += "unsigned L=0;\n"
+        res += "unsigned R="+str(len(self.x)-1)+";\n"
+        res += "unsigned m;\n"
+        res += "while (L<R)\n{\n"
+        res += "  m=((L+R)/2);\n"
+        res += "  if (x<knots[m]) R=m;\n"
+        res += "  else if (x>=knots[m+1]) L=m+1;\n"
+        res += "  else break;\n"
+        res += "}\n"
+        ndeg = len(self.second_deriv_poly.c)
+        terms = ["d2coeffs_"+str(i)+"[m]*pow(x-knots[m],"+str(ndeg-1-i)+")" for i in range(ndeg)]
+        res += "second_derivative_tensor[0]="+"+".join(terms)+";\n"
+        res += "}\n"
+        return res
+
     def generate_c_code(self) -> str:
         res="const double x=arg_list[0];\n"        
         res+="const double knots[]={"+",".join(map(str,self.ppoly.x))+"};\n"
