@@ -454,9 +454,9 @@ namespace pyoomph
       unsigned long n_hits = 0;
       unsigned long n_cbu_calls = 0;
       std::unordered_set<unsigned> distinct_nodes;
-      // Number of nested subexpression() markers replaced by a placeholder symbol before the unit
-      // analysis (see the masking pass below); stays 0 while masking is disabled.
-      unsigned long n_masked = 0;
+      // One masker per mapper, i.e. per residual contribution, so all markers of that contribution
+      // share the placeholder symbols.
+      pyoomph::expressions::SubexpressionMasker masker;
 
    public:
       DrawUnitsOutOfSubexpressions(FiniteElementCode *code_) : code(code_) {}
@@ -466,7 +466,8 @@ namespace pyoomph
       unsigned long get_n_hits() const { return n_hits; }
       unsigned long get_n_distinct() const { return distinct_nodes.size(); }
       unsigned long get_n_cbu_calls() const { return n_cbu_calls; }
-      unsigned long get_n_masked() const { return n_masked; }
+      unsigned long get_n_masked() const { return masker.n_masked(); }
+      pyoomph::expressions::SubexpressionMasker &get_masker() { return masker; }
    };
 
    // GiNaC::map_function that strips expressions::subexpression(...) markers back out again (replacing

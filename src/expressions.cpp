@@ -463,6 +463,56 @@ namespace pyoomph
 			return false;
 		}
 
+		// See the class comment in expressions.hpp. One placeholder per distinct marker, created only
+		// when the marker is actually met inside something being masked - a plain symbol, deliberately
+		// not a possymbol and never registered in base_units, so collect_base_units() files it under
+		// "rest" like any other unknown symbol.
+		GiNaC::ex SubexpressionMasker::get_placeholder(const GiNaC::ex &marker)
+		{
+			GiNaC::exmap::const_iterator found = to_mask.find(marker);
+			if (found != to_mask.end())
+				return found->second;
+			GiNaC::ex ph = GiNaC::symbol("__semask" + std::to_string(counter++));
+			to_mask[marker] = ph;
+			from_mask[ph] = marker;
+			return ph;
+		}
+
+		GiNaC::ex SubexpressionMasker::Masker::operator()(const GiNaC::ex &inp)
+		{
+			// Numbers are never cached: GiNaC compares and hashes them by value, so an exact -1 and an
+			// inexact -1.0 would share a key here (same reasoning as ReplaceFieldsToNonDimFields).
+			if (GiNaC::is_a<GiNaC::numeric>(inp))
+				return inp;
+			if (is_ex_the_function(inp, subexpression) && owner->is_allowed(inp))
+				return owner->get_placeholder(inp); // an atom from here on - never descend into it
+			GiNaC::exmap::const_iterator cached = cache.find(inp);
+			if (cached != cache.end())
+				return cached->second;
+			GiNaC::ex res = inp.map(*this);
+			cache[inp] = res;
+			return res;
+		}
+
+		GiNaC::ex SubexpressionMasker::Unmasker::operator()(const GiNaC::ex &inp)
+		{
+			if (GiNaC::is_a<GiNaC::numeric>(inp))
+				return inp;
+			if (GiNaC::is_a<GiNaC::symbol>(inp))
+			{
+				GiNaC::exmap::const_iterator found = owner->from_mask.find(inp);
+				if (found != owner->from_mask.end())
+					return found->second; // the original marker ex, spliced back in by pointer
+				return inp;
+			}
+			GiNaC::exmap::const_iterator cached = cache.find(inp);
+			if (cached != cache.end())
+				return cached->second;
+			GiNaC::ex res = inp.map(*this);
+			cache[inp] = res;
+			return res;
+		}
+
 		bool collect_base_units(GiNaC::ex arg, GiNaC::ex &factor, GiNaC::ex &units, GiNaC::ex &rest)
 		{
 			if (pyoomph_verbose)

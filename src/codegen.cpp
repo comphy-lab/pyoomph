@@ -421,6 +421,9 @@ namespace pyoomph
 	// and a function-local static would cost a guard-variable acquire load every time.
 	static const bool __time_add_residual_on = getenv("PYOOMPH_TIME_ADD_RESIDUAL") != NULL;
 	static const bool __expand_memo_on = getenv("PYOOMPH_DISABLE_EXPAND_MEMO") == NULL;
+	// Masking of already-analysed nested subexpression() markers during the unit split; see
+	// pyoomph::expressions::SubexpressionMasker. PYOOMPH_DISABLE_UNIT_MASK=1 restores the old path.
+	static const bool __unit_mask_on = getenv("PYOOMPH_DISABLE_UNIT_MASK") == NULL;
 	static inline bool __time_add_residual() { return __time_add_residual_on; }
 	struct __phase_timer
 	{
@@ -858,22 +861,40 @@ namespace pyoomph
 				std::cout << "PROCESSING " << inp << std::endl
 						  << "YIELDS " << arg << std::endl
 						  << std::endl;
+			// Every nested marker in "arg" has already been through this branch (the mapper works
+			// bottom-up), i.e. it is a subexpression() whose content is proven free of base units.
+			// Hiding those behind placeholder symbols is what keeps the unit analysis linear in the
+			// DAG instead of exponential in the nesting depth - see SubexpressionMasker.
+			GiNaC::ex marg = (__unit_mask_on ? masker.mask(arg) : arg);
 			if (__time_add_residual())
 				n_cbu_calls++;
-			if (!expressions::collect_base_units(arg, factor, unit, rest))
+			if (!expressions::collect_base_units(marg, factor, unit, rest))
 			{
 				std::ostringstream oss;
 				oss << std::endl
 					<< "INPUT: " << inp << std::endl
 					<< "PROCESSED ARG:" << arg << std::endl
-					<< "numerical part: " << factor << "unit part:" << unit << "rest part:" << rest << std::endl;
+					<< "numerical part: " << masker.unmask(factor) << "unit part:" << masker.unmask(unit) << "rest part:" << masker.unmask(rest) << std::endl;
 				throw_runtime_error("Cannot extract the unit from the subexpression:" + oss.str());
+			}
+			if (__unit_mask_on)
+			{
+				// All three, not just "rest": a placeholder can end up in an exponent of "unit" (the
+				// power branches of collect_base_units) or, when the split cannot decide its sign, in
+				// "factor".
+				factor = masker.unmask(factor);
+				unit = masker.unmask(unit);
+				rest = masker.unmask(rest);
 			}
 			if (pyoomph_verbose)
 				std::cout << "SEP: " << arg << "  n " << factor << " u " << unit << "  r  " << rest << std::endl;
+			GiNaC::ex out = expressions::subexpression(rest);
+			// allow() must see exactly the ex that is returned: an enclosing marker meets this very
+			// node again (ex::map hands the shared node back), and that is what makes it maskable.
+			masker.allow(out);
 			if (pyoomph_verbose)
-				std::cout << "RET: " << (factor * unit * expressions::subexpression(rest)) << std::endl;
-			return factor * unit * expressions::subexpression(rest);
+				std::cout << "RET: " << (factor * unit * out) << std::endl;
+			return factor * unit * out;
 		}
 		else if (is_ex_the_function(inp, expressions::Diff))
 		{
@@ -882,29 +903,42 @@ namespace pyoomph
 			// op(1) below would walk the whole (already processed) tree again
 			GiNaC::ex mapped = inp.map(*this);
 			GiNaC::ex arg = mapped.op(0); // Descent recursively through nested subexpressions
+			GiNaC::ex marg = (__unit_mask_on ? masker.mask(arg) : arg); // same masking as above
 			if (__time_add_residual())
 				n_cbu_calls++;
-			if (!expressions::collect_base_units(arg, factor, unit, rest))
+			if (!expressions::collect_base_units(marg, factor, unit, rest))
 			{
 				std::ostringstream oss;
 				oss << std::endl
 					<< "INPUT: " << inp << std::endl
 					<< "PROCESSED ARG:" << arg << std::endl
-					<< "numerical part: " << factor << "unit part:" << unit << "rest part:" << rest << std::endl;
+					<< "numerical part: " << masker.unmask(factor) << "unit part:" << masker.unmask(unit) << "rest part:" << masker.unmask(rest) << std::endl;
 				throw_runtime_error("Cannot extract the unit from the derivative numerator:" + oss.str());
 			}
 			GiNaC::ex factor2, unit2, rest2;
 			GiNaC::ex arg2 = mapped.op(1); // Descent recursively through nested subexpressions
+			GiNaC::ex marg2 = (__unit_mask_on ? masker.mask(arg2) : arg2);
 			if (__time_add_residual())
 				n_cbu_calls++;
-			if (!expressions::collect_base_units(arg2, factor2, unit2, rest2))
+			if (!expressions::collect_base_units(marg2, factor2, unit2, rest2))
 			{
 				std::ostringstream oss;
 				oss << std::endl
 					<< "INPUT: " << inp << std::endl
 					<< "PROCESSED ARG:" << arg2 << std::endl
-					<< "numerical part: " << factor2 << "unit part:" << unit2 << "rest part:" << rest2 << std::endl;
+					<< "numerical part: " << masker.unmask(factor2) << "unit part:" << masker.unmask(unit2) << "rest part:" << masker.unmask(rest2) << std::endl;
 				throw_runtime_error("Cannot extract the unit from the derivative denominator:" + oss.str());
+			}
+			if (__unit_mask_on)
+			{
+				// Diff() evaluates on construction, so it must never see a placeholder: unmask all six
+				// pieces before assembling the result.
+				factor = masker.unmask(factor);
+				unit = masker.unmask(unit);
+				rest = masker.unmask(rest);
+				factor2 = masker.unmask(factor2);
+				unit2 = masker.unmask(unit2);
+				rest2 = masker.unmask(rest2);
 			}
 			//		return (unit/unit2)*expressions::Diff(factor*rest,factor2*rest2);
 			return (factor / factor2) * (unit / unit2) * expressions::Diff(rest, factor2 * rest2);
@@ -7472,7 +7506,8 @@ namespace pyoomph
 		   << " sw_unit_fastcheck=" << (getenv("PYOOMPH_UNIT_FASTCHECK") != NULL)
 		   << " sw_no_unit_prescan=" << (getenv("PYOOMPH_DISABLE_UNIT_PRESCAN") != NULL)
 		   << " sw_no_rjm_split=" << (getenv("PYOOMPH_DISABLE_RJM_SPLIT") != NULL)
-		   << " sw_no_hang_split=" << (getenv("PYOOMPH_DISABLE_HANG_SPLIT") != NULL) << "\n";
+		   << " sw_no_hang_split=" << (getenv("PYOOMPH_DISABLE_HANG_SPLIT") != NULL)
+		   << " sw_no_unit_mask=" << !__unit_mask_on << "\n";
 		os << "dim=" << nodal_dim << " lagr_dim=" << lagr_dim << " max_dt_order=" << max_dt_order << " integration_order=" << integration_order << "\n";
 		os << "generate_hessian=" << generate_hessian << " assemble_hessian_by_symmetry=" << assemble_hessian_by_symmetry << "\n";
 		os << "analytical_jacobian=" << analytical_jacobian << " analytical_position_jacobian=" << analytical_position_jacobian << "\n";
