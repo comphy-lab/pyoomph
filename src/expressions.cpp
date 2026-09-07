@@ -2158,7 +2158,13 @@ namespace pyoomph
 			return subexpression(wrapped.diff(deriv_arg));
 		}
 
-		REGISTER_FUNCTION(subexpression, eval_func(subexpression_eval).evalf_func(subexpression_evalf).derivative_func(subexpression_deriv).expl_derivative_func(subexpression_expl_deriv))
+		// A held subexpression() is always scalar: subexpression_eval above pushes a matrix argument down
+		// into its entries and only ever holds the scalar branch. Declaring that statically stops
+		// GiNaC::function::return_type() from walking the first-operand chain (through every mul factor and
+		// every nested marker) to rediscover it on each query - and subexpression_eval itself asks exactly
+		// that question of its argument. The dynamic answer is already commutative, so the canonical
+		// ordering of products is unchanged.
+		REGISTER_FUNCTION(subexpression, eval_func(subexpression_eval).evalf_func(subexpression_evalf).derivative_func(subexpression_deriv).expl_derivative_func(subexpression_expl_deriv).set_return_type(GiNaC::return_types::commutative))
 
 		////////////////
 
