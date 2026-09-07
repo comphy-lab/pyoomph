@@ -4496,6 +4496,25 @@ namespace pyoomph
 			gather_shape_expansions_in(inp.op(i), res, visited);
 	}
 
+	// Every distinct node of the expression DAG rooted at `e`, in preorder, each exactly once.
+	//
+	// This is the drop-in replacement for a const_preorder_iterator loop over a residual. The iterator
+	// walks the DAG as a TREE - a node reachable by k paths is handed out k times - which is
+	// exponential in the nesting depth of the subexpression() markers, and the markers are transparent
+	// to it because they are still plain function applications at code-emission time. The scans that
+	// use this only test node types and perform idempotent registrations, so seeing each node once is
+	// all they need. Nodes below a pyginacstruct are NOT enumerated, exactly as the iterator does not
+	// enumerate them (nops()==0); the collectors that must look inside a marker struct recurse
+	// explicitly instead (gather_shape_expansions_in).
+	static void collect_dag_nodes(const GiNaC::ex &e, std::vector<GiNaC::ex> &out, DagVisitedSet &visited)
+	{
+		if (!visited.visit(e))
+			return;
+		out.push_back(e);
+		for (size_t i = 0; i < e.nops(); i++)
+			collect_dag_nodes(e.op(i), out, visited);
+	}
+
 	// Collects every distinct TestFunction structure appearing anywhere in expression `inp` (simple
 	// preorder scan; unlike get_all_shape_expansions_in, test functions are not expected inside
 	// subexpression(...) wrappers since subexpressions may not depend on test functions - see
@@ -4503,8 +4522,12 @@ namespace pyoomph
 	std::set<TestFunction> FiniteElementCode::get_all_test_functions_in(GiNaC::ex inp)
 	{
 		std::set<TestFunction> res;
-		for (GiNaC::const_preorder_iterator i = inp.preorder_begin(); i != inp.preorder_end(); ++i)
+		DagVisitedSet __visited;
+		std::vector<GiNaC::ex> __nodes;
+		collect_dag_nodes(inp, __nodes, __visited);
+		for (const GiNaC::ex &__node : __nodes)
 		{
+			const GiNaC::ex *i = &__node;
 			//			std::cout << *i << std::endl;
 			if (GiNaC::is_a<GiNaC::GiNaCTestFunction>(*i))
 			{
@@ -6122,8 +6145,12 @@ namespace pyoomph
 	void FiniteElementCode::mark_further_required_fields(GiNaC::ex expr, const std::string &for_what)
 	{
 		// Mark other requirements
-		for (GiNaC::const_preorder_iterator i = expr.preorder_begin(); i != expr.preorder_end(); ++i)
+		DagVisitedSet __visited;
+		std::vector<GiNaC::ex> __nodes;
+		collect_dag_nodes(expr, __nodes, __visited);
+		for (const GiNaC::ex &__node : __nodes)
 		{
+			const GiNaC::ex *i = &__node;
 			if (GiNaC::is_a<GiNaC::GiNaCNormalSymbol>(*i))
 			{
 				const pyoomph::NormalSymbol &sp = GiNaC::ex_to<GiNaC::GiNaCNormalSymbol>(*i).get_struct();
@@ -6275,9 +6302,15 @@ namespace pyoomph
 	{
 		//std::set<GiNaC::GiNaCSpatialIntegralSymbol> dx_symbs;
 		std::set<GiNaC::ex, GiNaC::ex_is_less> dx_symbs;
-		// First, gather all dx terms
-		for (GiNaC::const_preorder_iterator i = inp.preorder_begin(); i != inp.preorder_end(); ++i)
+		// First, gather all dx terms. Only this gather is a DAG walk; the coeff() calls below are
+		// shallow - basic::coeff does not descend into a function's arguments, so a subexpression()
+		// marker is a leaf to them.
+		DagVisitedSet __visited;
+		std::vector<GiNaC::ex> __nodes;
+		collect_dag_nodes(inp, __nodes, __visited);
+		for (const GiNaC::ex &__node : __nodes)
 		{
+			const GiNaC::ex *i = &__node;
 			if (GiNaC::is_a<GiNaC::GiNaCSpatialIntegralSymbol>(*i))
 			{
 				if (pyoomph_verbose)
