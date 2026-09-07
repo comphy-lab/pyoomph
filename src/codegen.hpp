@@ -1241,6 +1241,7 @@ namespace pyoomph
       std::vector<std::string> *hoisted_array_decls = nullptr;
       std::string write_buffer_alias_declarations(const std::string &indent, const std::string &body) const; // only the aliases `body` mentions
       void register_global_parameters_in(const GiNaC::ex &e, std::set<unsigned> &used_local_indices); // Print-free registration pre-pass over an expression (descends into subexpressions and multi-ret invocations); fills used_local_indices with the local slots occurring in e
+      void register_global_parameters_in(const GiNaC::ex &e, std::set<unsigned> &used_local_indices, std::set<const GiNaC::basic *> &visited); // As above; `visited` stops a subexpression body shared by several paths of the residual DAG from being descended into once per path
       std::vector<FiniteElementCodeSubExpression> subexpressions; // All CSE'd subexpressions registered for this code, in creation order (indices referenced by GiNaCSubExpression)
       std::vector<GiNaC::ex> multi_return_calls; // All distinct multi-return callback invocations registered for this code, in creation order
       // Those invocations whose SECOND-derivative tensor the pass currently being generated actually
@@ -1296,6 +1297,7 @@ namespace pyoomph
       // Collects, respectively, all distinct ShapeExpansions / TestFunctions occurring anywhere in expression inp
       // (used to determine which shape-function tables must be computed before evaluating inp).
       std::set<ShapeExpansion> get_all_shape_expansions_in(GiNaC::ex inp, bool merge_no_jacobian = true, bool merge_expansion_modes = true, bool merge_no_hessian = true);
+      void gather_shape_expansions_in(const GiNaC::ex &inp, std::set<ShapeExpansion> &res, std::set<const GiNaC::basic *> &visited); // Raw collection half of the above, without the flag merging; `visited` keeps the DAG from being walked as a tree
       std::set<TestFunction> get_all_test_functions_in(GiNaC::ex inp);
 
       void fill_callback_info(JITFuncSpec_Table_FiniteElement_t *ft); // Fills the JIT function table's callback-function-pointer entries (parameters, custom math functions, multi-return calls) for the compiled element

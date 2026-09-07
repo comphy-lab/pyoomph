@@ -241,6 +241,19 @@ namespace pyoomph
 	// wrappers and multi-ret invocation arguments, which a plain preorder walk would treat as opaque.
 	void FiniteElementCode::register_global_parameters_in(const GiNaC::ex &e, std::set<unsigned> &used_local_indices)
 	{
+		std::set<const GiNaC::basic *> visited;
+		register_global_parameters_in(e, used_local_indices, visited);
+	}
+
+	// A residual with nested subexpression() markers is a DAG, and the recursion below is the only
+	// part of this scan that leaves the (marker-opaque) preorder iterator, so without a visited set a
+	// marker reachable by k paths is descended into k times - exponential in the nesting depth, which
+	// is what made this one of the three hot frames of write_code on the deeply nested azimuthal case.
+	// The visited set is keyed on node identity: the DAG shares the actual GiNaC nodes, so a pointer
+	// compare is exact here, and skipping a body already descended into is provably lossless because
+	// the registration it performs happened on the first visit (in the same first-encounter order).
+	void FiniteElementCode::register_global_parameters_in(const GiNaC::ex &e, std::set<unsigned> &used_local_indices, std::set<const GiNaC::basic *> &visited)
+	{
 		for (GiNaC::const_preorder_iterator i = e.preorder_begin(); i != e.preorder_end(); ++i)
 		{
 			if (GiNaC::is_a<GiNaC::GiNaCGlobalParameterWrapper>(*i))
@@ -257,11 +270,15 @@ namespace pyoomph
 			}
 			else if (GiNaC::is_a<GiNaC::GiNaCSubExpression>(*i))
 			{
-				register_global_parameters_in(GiNaC::ex_to<GiNaC::GiNaCSubExpression>(*i).get_struct().expr, used_local_indices);
+				const GiNaC::ex &body = GiNaC::ex_to<GiNaC::GiNaCSubExpression>(*i).get_struct().expr;
+				if (visited.insert(&GiNaC::ex_to<GiNaC::basic>(body)).second)
+					register_global_parameters_in(body, used_local_indices, visited);
 			}
 			else if (GiNaC::is_a<GiNaC::GiNaCMultiRetCallback>(*i))
 			{
-				register_global_parameters_in(GiNaC::ex_to<GiNaC::GiNaCMultiRetCallback>(*i).get_struct().invok.op(1), used_local_indices);
+				GiNaC::ex body = GiNaC::ex_to<GiNaC::GiNaCMultiRetCallback>(*i).get_struct().invok.op(1);
+				if (visited.insert(&GiNaC::ex_to<GiNaC::basic>(body)).second)
+					register_global_parameters_in(body, used_local_indices, visited);
 			}
 		}
 	}
@@ -4330,39 +4347,8 @@ namespace pyoomph
 	std::set<ShapeExpansion> FiniteElementCode::get_all_shape_expansions_in(GiNaC::ex inp, bool merge_no_jacobian, bool merge_expansion_modes, bool merge_no_hessian)
 	{
 		std::set<ShapeExpansion> res;
-		for (GiNaC::const_preorder_iterator i = inp.preorder_begin(); i != inp.preorder_end(); ++i)
-		{
-			//			std::cout << *i << std::endl;
-			if (GiNaC::is_a<GiNaC::GiNaCShapeExpansion>(*i))
-			{
-				auto &shapeexp = (GiNaC::ex_to<GiNaC::GiNaCShapeExpansion>(*i)).get_struct();
-				//&		  	std::cout << "FOUND SHAPE EXPANSION  " << &shapeexp << std::endl;
-				res.insert(shapeexp);
-			}
-			else if (GiNaC::is_a<GiNaC::GiNaCSubExpression>(*i))
-			{
-				GiNaC::GiNaCSubExpression se = GiNaC::ex_to<GiNaC::GiNaCSubExpression>(*i);
-				std::set<ShapeExpansion> sub = get_all_shape_expansions_in(se.get_struct().expr, merge_no_jacobian, merge_expansion_modes, merge_no_hessian);
-				for (auto &se : sub)
-				{
-					res.insert(se);
-				}
-			}
-			else if (GiNaC::is_a<GiNaC::GiNaCMultiRetCallback>(*i))
-			{
-				//std::cout << "GOT MULTIRET CB "  << (*i) << std::endl;
-				
-				GiNaC::GiNaCMultiRetCallback se = GiNaC::ex_to<GiNaC::GiNaCMultiRetCallback>(*i);
-				//std::cout << "GOT MULTIRET CB " << "INVOK "  << (se.get_struct().invok) << std::endl;
-				//std::cout << "GOT MULTIRET CB " << "INVOK OP1 "  << (se.get_struct().invok.op(1)) << std::endl;
-				std::set<ShapeExpansion> sub = get_all_shape_expansions_in(se.get_struct().invok.op(1), merge_no_jacobian, merge_expansion_modes, merge_no_hessian);
-				for (auto &se : sub)
-				{
-					//std::cout << "GOT MULTIRET CB " << "INSERTING "  << GiNaC::GiNaCShapeExpansion(se) << std::endl;
-					res.insert(se);
-				}
-			}
-		}
+		std::set<const GiNaC::basic *> visited;
+		gather_shape_expansions_in(inp, res, visited);
 
 		if (merge_no_jacobian || merge_expansion_modes || merge_no_hessian)
 		{
@@ -4389,6 +4375,43 @@ namespace pyoomph
 			res = newres;
 		}
 		return res;
+	}
+
+	// The raw collection half, with the visited set that keeps a shared subexpression() body from
+	// being descended into once per path through the DAG (see register_global_parameters_in above for
+	// why pointer identity is the right key). The flag merging stays in the wrapper: it only ever
+	// clears flags, so doing it once on the union is the same set as doing it on every sub-result and
+	// again at the end, which is what the recursive version did.
+	void FiniteElementCode::gather_shape_expansions_in(const GiNaC::ex &inp, std::set<ShapeExpansion> &res, std::set<const GiNaC::basic *> &visited)
+	{
+		for (GiNaC::const_preorder_iterator i = inp.preorder_begin(); i != inp.preorder_end(); ++i)
+		{
+			//			std::cout << *i << std::endl;
+			if (GiNaC::is_a<GiNaC::GiNaCShapeExpansion>(*i))
+			{
+				auto &shapeexp = (GiNaC::ex_to<GiNaC::GiNaCShapeExpansion>(*i)).get_struct();
+				//&		  	std::cout << "FOUND SHAPE EXPANSION  " << &shapeexp << std::endl;
+				res.insert(shapeexp);
+			}
+			else if (GiNaC::is_a<GiNaC::GiNaCSubExpression>(*i))
+			{
+				GiNaC::GiNaCSubExpression se = GiNaC::ex_to<GiNaC::GiNaCSubExpression>(*i);
+				const GiNaC::ex &body = se.get_struct().expr;
+				if (visited.insert(&GiNaC::ex_to<GiNaC::basic>(body)).second)
+					gather_shape_expansions_in(body, res, visited);
+			}
+			else if (GiNaC::is_a<GiNaC::GiNaCMultiRetCallback>(*i))
+			{
+				//std::cout << "GOT MULTIRET CB "  << (*i) << std::endl;
+				
+				GiNaC::GiNaCMultiRetCallback se = GiNaC::ex_to<GiNaC::GiNaCMultiRetCallback>(*i);
+				//std::cout << "GOT MULTIRET CB " << "INVOK "  << (se.get_struct().invok) << std::endl;
+				//std::cout << "GOT MULTIRET CB " << "INVOK OP1 "  << (se.get_struct().invok.op(1)) << std::endl;
+				GiNaC::ex body = se.get_struct().invok.op(1);
+				if (visited.insert(&GiNaC::ex_to<GiNaC::basic>(body)).second)
+					gather_shape_expansions_in(body, res, visited);
+			}
+		}
 	}
 
 	// Collects every distinct TestFunction structure appearing anywhere in expression `inp` (simple
