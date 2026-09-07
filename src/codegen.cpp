@@ -933,6 +933,50 @@ namespace pyoomph
 		bool require_extra_steady_routine() const { return extra_steady_routine; }
 	};
 
+	// A memoising ex::subs of ONE expression for another.
+	//
+	// ex::subs is a tree operation, so on a residual with nested subexpression() markers - which are
+	// still plain function applications during code emission, i.e. transparent - it rebuilds a shared
+	// body once per path. It is what dominated write_code's parameter-derivative loop once the
+	// derivative itself was memoised (318a9a79): at depth 6 of the deeply nested synthetic azimuthal
+	// case, 6.59 s of substitution against 0.006 s of differentiation.
+	//
+	// Same hash-bucket memo as ReplaceFieldsToNonDimFields, and no mutable state to replay.
+	// GiNaCMultiRetCallback is the one node whose own subs() looks inside what it wraps while ex::map
+	// does not (see dev_docs/subexpression_unit_analysis_stall.md 4.1), so those are handed to the real
+	// subs rather than mapped - still once per distinct node, thanks to the memo.
+	class MemoisedSubs : public GiNaC::map_function
+	{
+	protected:
+		GiNaC::ex from, to;
+		GiNaC::exmap as_map;
+		struct MemoEntry
+		{
+			GiNaC::ex key, value;
+		};
+		std::unordered_map<unsigned, std::vector<MemoEntry>> memo;
+
+	public:
+		MemoisedSubs(const GiNaC::ex &from_, const GiNaC::ex &to_) : from(from_), to(to_) { as_map[from_] = to_; }
+		GiNaC::ex operator()(const GiNaC::ex &inp) override
+		{
+			if (inp.is_equal(from))
+				return to;
+			// Numbers are not cached, for the reason given on ReplaceFieldsToNonDimFields::operator().
+			if (GiNaC::is_a<GiNaC::numeric>(inp))
+				return inp;
+			const unsigned h = inp.gethash();
+			auto it = memo.find(h);
+			if (it != memo.end())
+				for (auto &e : it->second)
+					if (e.key.is_equal(inp))
+						return e.value;
+			GiNaC::ex res = (GiNaC::is_a<GiNaC::GiNaCMultiRetCallback>(inp) ? inp.subs(as_map) : inp.map(*this));
+			memo[h].push_back(MemoEntry{inp, res});
+			return res;
+		}
+	};
+
 	// GiNaC tree-mapper that replaces every global-parameter wrapper by its current numerical value,
 	// used where a fully numeric evaluation (rather than a symbolic parameter dependency) is required.
 	class GlobalParamsToValues : public GiNaC::map_function
@@ -8087,7 +8131,7 @@ namespace pyoomph
 				}
 
 				GiNaC::potential_real_symbol gp_dummy("_global_param_");
-				double __t_dp_diff = 0.0, __t_dp_write = 0.0;
+				double __t_dp_subs = 0.0, __t_dp_diff = 0.0, __t_dp_write = 0.0;
 				// Which of the parameters this residual set actually mentions. local_parameter_symbols
 				// is process-wide over all residual sets and all the other expression families, so on a
 				// model with several parameters most entries of the loop below differentiate a residual
@@ -8121,13 +8165,20 @@ namespace pyoomph
 					GiNaC::ex p = local_parameter_symbols[i];
 					GiNaC::ex dres_dp;
 					{
+						GiNaC::ex substituted;
+						{
+							__wc_phase_timer __t("", &__t_dp_subs);
+							MemoisedSubs to_dummy(p, gp_dummy);
+							substituted = to_dummy(steady_residual);
+						}
 						__wc_phase_timer __t("", &__t_dp_diff);
-						dres_dp = steady_residual.subs(p == gp_dummy).diff(gp_dummy); // Take the steady residual only here
+						dres_dp = substituted.diff(gp_dummy); // Take the steady residual only here
 					}
 					if (!dres_dp.is_zero())													// Need to write the dresidual_dparameter function
 					{
 						__wc_phase_timer __t("", &__t_dp_write);
-						dres_dp = dres_dp.subs(gp_dummy == p);
+						MemoisedSubs back_to_param(gp_dummy, p);
+						dres_dp = back_to_param(dres_dp);
 						os << std::endl;
 						os << "//Derivative wrt. global parameter " << p << std::endl;
 						std::ostringstream oss;
@@ -8138,9 +8189,10 @@ namespace pyoomph
 					else
 						local_parameter_has_deriv[resind].push_back(false);
 				}
-				if (__time_write_code_on && (__t_dp_diff > 1e-3 || __t_dp_write > 1e-3))
+				if (__time_write_code_on && (__t_dp_subs > 1e-3 || __t_dp_diff > 1e-3 || __t_dp_write > 1e-3))
 					std::cerr << "[write_code] res[" << resind << "] dRes/dParam over " << local_parameter_symbols.size()
-							  << " params: diff " << __t_dp_diff << " s, write " << __t_dp_write << " s" << std::endl;
+							  << " params: subs " << __t_dp_subs << " s, diff " << __t_dp_diff
+							  << " s, write " << __t_dp_write << " s" << std::endl;
 			}
 			else
 			{
