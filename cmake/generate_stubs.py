@@ -24,9 +24,27 @@ build stayed green. With `--required` (which CMake passes unless
 PYOOMPH_REQUIRE_STUBS=OFF) any failure to produce the stub is fatal, so the
 next such breakage stops the build that would have shipped it.
 
+`--expect-file` guards against generating the stub from the wrong binary.
+Stub generation imports `<module-name>`, and that import goes through the
+normal `sys.path` machinery, which tries every suffix in
+`importlib.machinery.EXTENSION_SUFFIXES` in order. A build directory still
+holding an older `<module-name>.cpython-3xx-<plat>.so` beside the freshly
+linked `<module-name>.abi3.so` therefore hands stubgen the stale one,
+because the versioned suffix is tried first.
+
+That is not hypothetical: a pre-nanobind pybind11 leftover shadowed the
+real module for weeks. pybind11 wraps class methods in
+`PyInstanceMethod_New`, a shape `nanobind.stubgen` does not recognise, so
+every method degraded to `name: instancemethod = ...` and the only symptom
+was `patch_stubs.py` raising on whichever of its patterns came first -
+which points at a binding that never changed. CMake knows the real path as
+`$<TARGET_FILE:_pyoomph_core>` and passes it here, so the mismatch is now
+reported as itself, naming the file that has to go.
+
 Usage (called from CMakeLists.txt):
     generate_stubs.py --module-dir DIR --module-name _core \
-        --stage-dir DIR [--extra-copy-dir DIR] [--patch-script PATH] [--python EXE]
+        --stage-dir DIR [--expect-file PATH] [--extra-copy-dir DIR] \
+        [--patch-script PATH] [--python EXE]
 
 On success, `<stage-dir>` ends up containing either:
   - `<module-name>.pyi`               (flat module, the common case), or
@@ -41,6 +59,7 @@ resolve `pyoomph._core` even without a full `pip install`, since they never
 see the build/install directory.
 """
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -53,6 +72,87 @@ def run(cmd, **kwargs):
     return subprocess.run(cmd, **kwargs)
 
 
+# Asked of the *target* interpreter rather than answered in this process: --python may be a
+# different interpreter than the one running this script, and both EXTENSION_SUFFIXES and the
+# sys.path it is resolved against belong to that one. find_spec() locates the module without
+# importing it, so this stays cheap and cannot fail for load-time reasons (missing DLLs on
+# Windows, say) that are not what is being asked about here.
+_RESOLVE_SRC = (
+    "import importlib.machinery as m, importlib.util as u, json, sys\n"
+    "try:\n"
+    "    spec = u.find_spec(sys.argv[1])\n"
+    "except BaseException as e:\n"
+    "    out = {'error': type(e).__name__ + ': ' + str(e)}\n"
+    "else:\n"
+    "    out = {'origin': None if spec is None else spec.origin}\n"
+    "out['suffixes'] = list(m.EXTENSION_SUFFIXES)\n"
+    "print(json.dumps(out))\n"
+)
+
+
+def same_file(a: str, b: str) -> bool:
+    """Compare two paths the way the loader effectively does."""
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        # One of them does not exist (or is unstattable); fall back to a textual comparison
+        # rather than reporting a spurious mismatch.
+        return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+
+
+def resolution_mismatch(python: str, module_name: str, expect_file: str,
+                        module_dir: str, env) -> "str | None":
+    """Return an error message if importing `module_name` would not load `expect_file`.
+
+    Returns None when the resolution is correct (or could not be determined, which is
+    reported by the caller as its own failure rather than silently accepted).
+    """
+    proc = subprocess.run([python, "-c", _RESOLVE_SRC, module_name],
+                          env=env, stdout=subprocess.PIPE, text=True)
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return (f"Could not determine which file {module_name!r} resolves to "
+                f"(exit {proc.returncode}) - refusing to generate a stub that may describe "
+                f"a different binary than {expect_file}")
+    try:
+        info = json.loads(proc.stdout.strip().splitlines()[-1])
+    except ValueError:
+        return (f"Unparseable resolution probe output for {module_name!r}: "
+                f"{proc.stdout.strip()!r}")
+
+    if "error" in info:
+        return (f"Could not resolve {module_name!r}: {info['error']}")
+
+    origin = info.get("origin")
+    if origin and same_file(origin, expect_file):
+        return None
+
+    # A mismatch is nearly always an older artifact sitting next to the new one under a
+    # suffix Python tries first, so name the actual files instead of only the two paths.
+    lines = []
+    if origin is None:
+        lines.append(f"{module_name!r} is not importable from {module_dir}")
+    else:
+        lines.append(f"{module_name!r} resolves to")
+        lines.append(f"    {origin}")
+        lines.append("but the module this build just linked is")
+        lines.append(f"    {expect_file}")
+        lines.append("Stub generation imports the module, so the stub would describe the "
+                     "wrong binary.")
+
+    present = [Path(module_dir) / f"{module_name}{suffix}"
+               for suffix in info.get("suffixes") or []]
+    present = [c for c in present if c.exists()]
+    if present:
+        lines.append(f"Files in {module_dir} matching {module_name!r}, in the order Python "
+                     f"tries them:")
+        for cand in present:
+            marker = "  <-- wins" if cand == present[0] else ""
+            lines.append(f"    {cand.name}{marker}")
+        lines.append("Delete the stale one(s) - they are build output, not sources - and "
+                     "rebuild.")
+    return "\n".join(lines)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--module-dir", required=True,
@@ -61,6 +161,11 @@ def main() -> int:
                          help="Import name of the extension module (default: _core)")
     parser.add_argument("--stage-dir", required=True,
                          help="Directory the final stub(s) are normalized into")
+    parser.add_argument("--expect-file", default=None,
+                         help="Path of the extension that --module-name MUST resolve to "
+                              "(CMake passes $<TARGET_FILE:...>). Guards against an older "
+                              "build artifact with a higher-priority extension suffix "
+                              "shadowing the freshly linked module.")
     parser.add_argument("--extra-copy-dir", action="append", default=[],
                          help="Additional directory (e.g. the source-tree pyoomph/ "
                               "package) to mirror the final stub(s) into, so editors "
@@ -98,6 +203,15 @@ def main() -> int:
 
     env = dict(os.environ)
     env["PYTHONPATH"] = args.module_dir + os.pathsep + env.get("PYTHONPATH", "")
+
+    # Checked before stubgen runs, not after: once the wrong module has been imported the
+    # only evidence left is a stub whose contents look merely unexpected, which is how this
+    # went unnoticed the first time (see --expect-file in the module docstring).
+    if args.expect_file:
+        mismatch = resolution_mismatch(args.python, args.module_name, args.expect_file,
+                                       args.module_dir, env)
+        if mismatch:
+            return give_up(mismatch)
 
     # nanobind.stubgen always writes a single flat "<module>.pyi" file (no
     # "<module>/__init__.pyi" package-directory form the way pybind11-stubgen
