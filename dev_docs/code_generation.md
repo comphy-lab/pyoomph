@@ -116,6 +116,41 @@ Still, "verified equivalent on what I ran" is not a reason to reassociate every 
 in the framework by default, for a win that only materialises on heavy rational nonlinearity. Turn it
 on if that describes your model.
 
+### 2.2b Nested subexpression markers are masked — `PYOOMPH_DISABLE_UNIT_MASK`
+
+Everything in `add_residual` after `expand_placeholders` — the unit split of
+`DrawUnitsOutOfSubexpressions`, the base-unit prescan, `expand().normal()`, the surviving-unit scan,
+the `bu -> 1` substitution and the matrix scan — is a **tree** operation, and a residual with nested
+`subexpression()` markers is a **DAG**. Doing any of them once per path instead of once per node is
+exponential in the nesting depth.
+
+The mapper works bottom-up, so when it reaches a marker every nested marker inside is already
+`factor*unit*subexpression(rest)` with `rest` proven free of base units.
+`pyoomph::expressions::SubexpressionMasker` (`src/expressions.hpp`) therefore replaces each of them
+by a plain placeholder symbol before the analysis and splices the marker `ex` objects back
+afterwards, by pointer — nothing is substituted, no interior is rebuilt. The same masked form is
+reused for every later phase, and only the stored residual is unmasked. On a synthetic fan-out-2
+chain of dimensional markers under `azimuthal_stability=True`, `add_residual` per contribution goes
+0.68 s -> 0.011 s at depth 4, 2.74 s -> 0.061 s at depth 5 and 30.7 s -> 0.088 s at depth 6, i.e.
+flat instead of an order of magnitude per level.
+
+Two rules come out of this, and they apply to anything added to this pipeline:
+
+- **every mapper here must memoise** (`GiNaC::exmap` keyed on the node, never on a `numeric`), and
+- **anything that reaches `collect_common_factors` or `normal()` must see the markers as atoms.**
+
+Masking allocates symbols, so it shifts GiNaC's symbol serials and hence the canonical factor order,
+exactly as skipping `normal()` does in §2.1: expect permuted products and renumbered `subexpr_N` /
+`_jc` temporaries, with the numeric constants unchanged. `PYOOMPH_DISABLE_UNIT_MASK=1` restores the
+old path and is part of the codegen fingerprint (`sw_no_unit_mask`).
+
+The one exception is `GiNaCMultiRetCallback`: it is the only pyginacstruct whose `subs()` descends
+into what it wraps, so a base unit inside one is invisible to the masker but still reached by the
+`bu -> 1` substitution. A marker whose argument contains a callback is not masked, or the unit symbol
+would be emitted into the generated C. The remaining walls behind all of this — GiNaC's own quadratic
+`replace_with_symbol`, and the code writer — are in
+[subexpression_unit_analysis_stall.md](subexpression_unit_analysis_stall.md).
+
 ### 2.3 A unit under a symbolic exponent kills the process — GiNaC bug, patched
 
 `collect_base_units()` opens with `collect_common_factors(expand(arg))`, and GiNaC's
@@ -1669,10 +1704,14 @@ All change how pyoomph gets there or what it reports, never what it computes.
 | `PYOOMPH_DISABLE_UNIT_PRESCAN` | restore the unconditional `expand().normal()` in `add_residual` (§2) |
 | `PYOOMPH_UNIT_FASTCHECK` | ask `collect_base_units` before normalising, for dimensional contributions — off by default (§2.2) |
 | `PYOOMPH_PARANOID_UNIT_PRESCAN` | do the skipped normalisation anyway and raise if it disagrees; covers both the prescan and the fast check |
+| `PYOOMPH_DISABLE_UNIT_MASK` | do not hide already-analysed nested `subexpression()` markers behind placeholder symbols during `add_residual` (§2.2b) |
+| `PYOOMPH_UNIT_CCF_MAX_TERMS` | term count above which `collect_base_units` skips `GiNaC::collect_common_factors` (default 2000, and nothing measured comes near it - the largest sum in the reference set has 48 terms). `=1` forces the skip everywhere, which is how it gets exercised. See [subexpression_unit_analysis_stall.md](subexpression_unit_analysis_stall.md) §5.2 |
+| `PYOOMPH_DISABLE_REIM_FOLD` | stop `subexpression()` reporting the real/imaginary part of a marker whose content is provably real, i.e. restore the behaviour in which the azimuthal split multiplies products out into `2*4^(n-1)` terms. Only affects azimuthal models; see [subexpression_unit_analysis_stall.md](subexpression_unit_analysis_stall.md) §5.1 |
 | `PYOOMPH_DISABLE_EXPAND_MEMO` | turn off the placeholder-expansion memo (on by default, §3) |
 | `PYOOMPH_POISON_UNREQUIRED` | signalling NaN into every shape buffer the pass did not require; `=all` is the positive control. See [assembly_overhead.md](assembly_overhead.md) §3.1 - it is what found the Hessian flag defect of §9.4.15 |
 | `PYOOMPH_DISABLE_SHAPE_FAMILY_SPLIT`, `PYOOMPH_*_HANG_FILL_CACHE`, `PYOOMPH_DISABLE_ASSEMBLY_EXTDATA_SPLIT` | the assembly-overhead levers, [assembly_overhead.md](assembly_overhead.md) §6 |
 | `PYOOMPH_TIME_ADD_RESIDUAL` | per-phase timing of `add_residual`/`expand_placeholders` on stderr, with mapper entries, memo hits and distinct-subexpression counts |
+| `PYOOMPH_TIME_WRITE_CODE` | the same for the emission half, `write_code`: per residual set, `MakeResidualSteady`, each `write_generic_RJM` (unsteady/steady/parameter), the Hessian, the `dResidual/dParameter` differentiation, the trailing writers and a TOTAL. Entries under 1 ms are suppressed |
 | `PYOOMPH_DEBUG_HOIST` | report on stderr why a **Hessian** entry could not be split for hoisting, with the atoms and their trial-index classes (§9.4.8). It is read only in `hoist_hessian_entry`; the Jacobian half has no reporting, contrary to what this table used to claim |
 | `PYOOMPH_DISABLE_BUFFER_ALIASES` | emit the fully qualified `shapeinfo->`/`eleminfo->` access at every use site instead of binding the loop-invariant part to a local at the top of the integration-point body (§13) |
 | `PYOOMPH_DISABLE_PARAM_RECIPROCALS` | divide by a global parameter instead of multiplying by a hoisted `_rgp_<i>` reciprocal (§13.7). The one switch here that changes the arithmetic, so it is also the A/B lever for that |

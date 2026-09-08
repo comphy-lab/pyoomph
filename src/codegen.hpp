@@ -26,6 +26,7 @@ The main author may be contacted at c.diddens@utwente.nl
 #include <vector>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include "expressions.hpp"
 #include "jitbridge.h"
 
@@ -263,6 +264,33 @@ namespace pyoomph
 
    class FiniteElementCodeSubExpression;
    class SubExpressionsToStructs; // defined in codegen.cpp; FiniteElementCode owns one per Hessian pass
+
+   // "Have I already been here?" for a walk over an expression DAG, keyed on node identity.
+   //
+   // A residual with nested subexpression() markers is a DAG, and every GiNaC traversal is a tree
+   // traversal, so a scan without such a set is exponential in the nesting depth
+   // (dev_docs/code_generation.md 2). Pointer identity is the exact key, because the sharing is
+   // literally the same node reached twice.
+   //
+   // The `alive` vector is not an optimisation, it is what makes the pointer key SOUND. `op(i)` on an
+   // add or a mul does not return a stored child: expairseq::op() recombines the pair and hands back a
+   // freshly built node. Without a reference held, that node dies when the recursion returns and the
+   // allocator promptly reuses its address for the next term - which the set then reports as already
+   // visited, and the walk silently skips a whole subtree. Measured, not theorised: it dropped a
+   // Jacobian entry (and its contributes_to_jacobian flag) from custom_math_dimensional_tennis.
+   class DagVisitedSet
+   {
+      std::set<const GiNaC::basic *> seen;
+      std::vector<GiNaC::ex> alive; // keeps every visited node addressable, see above
+   public:
+      // True if this node had not been seen before, i.e. if the caller should descend into it.
+      bool visit(const GiNaC::ex &e)
+      {
+         if (!seen.insert(&GiNaC::ex_to<GiNaC::basic>(e)).second) return false;
+         alive.push_back(e);
+         return true;
+      }
+   };
    // Lightweight GiNaC-wrapped handle to a common-subexpression-eliminated (CSE) expression: just
    // pairs the owning code with the underlying GiNaC expression. The actual bookkeeping (substitution
    // symbol, required fields, etc.) lives in FiniteElementCodeSubExpression, looked up via resolve_subexpression().
@@ -445,11 +473,28 @@ namespace pyoomph
       // shared subtree once per parent and rebuilds it into separate copies, so a residual with many
       // nested subexpression() markers costs exponentially much.
       GiNaC::exmap cache;
+      // Diagnostics, only maintained under PYOOMPH_TIME_ADD_RESIDUAL (printed by add_residual):
+      // how often the mapper was entered, how often the memo answered, how many distinct nodes were
+      // seen (by hash) and how often collect_base_units() was actually called. The gap between
+      // "calls" and "distinct" is the DAG-as-tree blowup this mapper used to pay in full.
+      unsigned long n_calls = 0;
+      unsigned long n_hits = 0;
+      unsigned long n_cbu_calls = 0;
+      std::unordered_set<unsigned> distinct_nodes;
+      // One masker per mapper, i.e. per residual contribution, so all markers of that contribution
+      // share the placeholder symbols.
+      pyoomph::expressions::SubexpressionMasker masker;
 
    public:
       DrawUnitsOutOfSubexpressions(FiniteElementCode *code_) : code(code_) {}
       GiNaC::ex operator()(const GiNaC::ex &inp) override;
       GiNaC::ex do_map(const GiNaC::ex &inp);
+      unsigned long get_n_calls() const { return n_calls; }
+      unsigned long get_n_hits() const { return n_hits; }
+      unsigned long get_n_distinct() const { return distinct_nodes.size(); }
+      unsigned long get_n_cbu_calls() const { return n_cbu_calls; }
+      unsigned long get_n_masked() const { return masker.n_masked(); }
+      pyoomph::expressions::SubexpressionMasker &get_masker() { return masker; }
    };
 
    // GiNaC::map_function that strips expressions::subexpression(...) markers back out again (replacing
@@ -1223,6 +1268,7 @@ namespace pyoomph
       std::vector<std::string> *hoisted_array_decls = nullptr;
       std::string write_buffer_alias_declarations(const std::string &indent, const std::string &body) const; // only the aliases `body` mentions
       void register_global_parameters_in(const GiNaC::ex &e, std::set<unsigned> &used_local_indices); // Print-free registration pre-pass over an expression (descends into subexpressions and multi-ret invocations); fills used_local_indices with the local slots occurring in e
+      void register_global_parameters_in(const GiNaC::ex &e, std::set<unsigned> &used_local_indices, DagVisitedSet &visited); // As above; `visited` stops a node shared by several paths of the residual DAG from being descended into once per path
       std::vector<FiniteElementCodeSubExpression> subexpressions; // All CSE'd subexpressions registered for this code, in creation order (indices referenced by GiNaCSubExpression)
       std::vector<GiNaC::ex> multi_return_calls; // All distinct multi-return callback invocations registered for this code, in creation order
       // Those invocations whose SECOND-derivative tensor the pass currently being generated actually
@@ -1278,6 +1324,7 @@ namespace pyoomph
       // Collects, respectively, all distinct ShapeExpansions / TestFunctions occurring anywhere in expression inp
       // (used to determine which shape-function tables must be computed before evaluating inp).
       std::set<ShapeExpansion> get_all_shape_expansions_in(GiNaC::ex inp, bool merge_no_jacobian = true, bool merge_expansion_modes = true, bool merge_no_hessian = true);
+      void gather_shape_expansions_in(const GiNaC::ex &inp, std::set<ShapeExpansion> &res, DagVisitedSet &visited); // Raw collection half of the above, without the flag merging; `visited` keeps the DAG from being walked as a tree
       std::set<TestFunction> get_all_test_functions_in(GiNaC::ex inp);
 
       void fill_callback_info(JITFuncSpec_Table_FiniteElement_t *ft); // Fills the JIT function table's callback-function-pointer entries (parameters, custom math functions, multi-return calls) for the compiled element

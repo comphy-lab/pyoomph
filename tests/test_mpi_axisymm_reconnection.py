@@ -342,16 +342,23 @@ def test_the_overlap_guard_rejects_on_every_rank_or_on_none(tmp_path, nproc, dis
 #: these have to be equal, not close.
 _EXACT = ("n_fragments", "npoints", "nnode", "nelem", "n_nonfinite", "field")
 
-#: Sums over the transferred fields. Slack, and deliberately: the handful of nodes that no rank can
-#: locate in the old mesh - the fresh cap of a pinch, the fresh bridge of a coalescence, which by
-#: construction lie outside the old geometry everywhere - fall back to a nearest-node blend, and that
-#: blend is rank-local. The destination mesh is still replicated when it runs, so each rank blends
-#: from its own share of the old mesh and the owner's answer is the one that survives the
-#: re-distribution. Measured here: 3 of ~400 nodes, moving the sums by up to 2e-4 relative and
-#: varying with the number of ranks. A value that landed on the WRONG SIDE of the event would move
-#: them by O(1), which is what this still catches - as do umin/umax/fmin/fmax, which are exact.
-#: (Pre-existing, and not specific to a topological change; see dev_docs/distributed_remeshing.md.)
-_SUM_TOL = 2e-3
+#: Sums over the transferred fields. Slack, and deliberately, though far less so than it used to be.
+#:
+#: The handful of nodes that no rank can locate in the old mesh - the fresh cap of a pinch, the fresh
+#: bridge of a coalescence, which by construction lie outside the old geometry everywhere - fall back
+#: to a nearest-node blend. That blend used to be rank-local, and since the destination mesh is still
+#: replicated when it runs, each rank blended from its own share of the old mesh and the owner's
+#: answer was the one that survived the re-distribution: 4 of ~400 nodes, off by O(0.25) each, moving
+#: the coalescence sum by 2.6e-3 relative at 4 ranks and by a different amount at every other rank
+#: count. Mesh::nodal_interpolate_from now resolves those two nearest nodes GLOBALLY (an MPI_MINLOC
+#: over the ranks), so they come out exactly as they do serially and 2 and 4 ranks agree to 1e-11.
+#:
+#: What is left is the ordinary interpolation residual of a located node near the event, measured at
+#: 4.5e-5 relative for the coalescence and 2.9e-5 for the pinch; the tolerance is that with a 10x
+#: margin. A value that landed on the WRONG SIDE of the event would move the sums by O(1), which is
+#: what this catches - as do umin/umax/fmin/fmax, which are exact.
+#: (See dev_docs/axisymm_reconnection_coalescence_4.md and dev_docs/distributed_remeshing.md.)
+_SUM_TOL = 5e-4
 
 
 def _near(got, expected, tol, where):

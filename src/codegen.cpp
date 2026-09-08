@@ -241,29 +241,50 @@ namespace pyoomph
 	// wrappers and multi-ret invocation arguments, which a plain preorder walk would treat as opaque.
 	void FiniteElementCode::register_global_parameters_in(const GiNaC::ex &e, std::set<unsigned> &used_local_indices)
 	{
-		for (GiNaC::const_preorder_iterator i = e.preorder_begin(); i != e.preorder_end(); ++i)
+		DagVisitedSet visited;
+		register_global_parameters_in(e, used_local_indices, visited);
+	}
+
+	// A residual is a DAG - that is what subexpression() is for - and this used to be a
+	// const_preorder_iterator loop, i.e. a TREE walk: a node reachable by k paths was visited k times,
+	// exponentially many in the nesting depth. Note that the markers are NOT opaque here: inside
+	// write_code the residual still holds plain expressions::subexpression() FUNCTION applications
+	// (SubExpressionsToStructs only turns them into GiNaCSubExpression structs further down), so the
+	// generic descent below walks straight through them and the explosion is theirs.
+	//
+	// So it is an explicit descent with a visited set keyed on node identity: the DAG shares the
+	// actual GiNaC nodes, so a pointer compare is exact. Skipping a node already seen is provably
+	// lossless - this only collects into a set, and the registration side effect happened on the
+	// first visit, in the same first-encounter order.
+	void FiniteElementCode::register_global_parameters_in(const GiNaC::ex &e, std::set<unsigned> &used_local_indices, DagVisitedSet &visited)
+	{
+		if (!visited.visit(e))
+			return;
+		if (GiNaC::is_a<GiNaC::GiNaCGlobalParameterWrapper>(e))
 		{
-			if (GiNaC::is_a<GiNaC::GiNaCGlobalParameterWrapper>(*i))
+			const auto &p = GiNaC::ex_to<GiNaC::GiNaCGlobalParameterWrapper>(e).get_struct();
+			unsigned global_index = p.cme->get_global_index();
+			if (!global_parameter_to_local_indices.count(global_index))
 			{
-				const auto &p = GiNaC::ex_to<GiNaC::GiNaCGlobalParameterWrapper>(*i).get_struct();
-				unsigned global_index = p.cme->get_global_index();
-				if (!global_parameter_to_local_indices.count(global_index))
-				{
-					unsigned local_index = global_parameter_to_local_indices.size();
-					local_parameter_symbols.push_back(*i);
-					global_parameter_to_local_indices.insert(std::make_pair(global_index, local_index));
-				}
-				used_local_indices.insert(global_parameter_to_local_indices[global_index]);
+				unsigned local_index = global_parameter_to_local_indices.size();
+				local_parameter_symbols.push_back(e);
+				global_parameter_to_local_indices.insert(std::make_pair(global_index, local_index));
 			}
-			else if (GiNaC::is_a<GiNaC::GiNaCSubExpression>(*i))
-			{
-				register_global_parameters_in(GiNaC::ex_to<GiNaC::GiNaCSubExpression>(*i).get_struct().expr, used_local_indices);
-			}
-			else if (GiNaC::is_a<GiNaC::GiNaCMultiRetCallback>(*i))
-			{
-				register_global_parameters_in(GiNaC::ex_to<GiNaC::GiNaCMultiRetCallback>(*i).get_struct().invok.op(1), used_local_indices);
-			}
+			used_local_indices.insert(global_parameter_to_local_indices[global_index]);
+			return;
 		}
+		if (GiNaC::is_a<GiNaC::GiNaCSubExpression>(e))
+		{
+			register_global_parameters_in(GiNaC::ex_to<GiNaC::GiNaCSubExpression>(e).get_struct().expr, used_local_indices, visited);
+			return;
+		}
+		if (GiNaC::is_a<GiNaC::GiNaCMultiRetCallback>(e))
+		{
+			register_global_parameters_in(GiNaC::ex_to<GiNaC::GiNaCMultiRetCallback>(e).get_struct().invok.op(1), used_local_indices, visited);
+			return;
+		}
+		for (size_t i = 0; i < e.nops(); i++)
+			register_global_parameters_in(e.op(i), used_local_indices, visited);
 	}
 
 	// Screens the symbolic source expression(s) of ONE generated C function for global parameters
@@ -421,7 +442,32 @@ namespace pyoomph
 	// and a function-local static would cost a guard-variable acquire load every time.
 	static const bool __time_add_residual_on = getenv("PYOOMPH_TIME_ADD_RESIDUAL") != NULL;
 	static const bool __expand_memo_on = getenv("PYOOMPH_DISABLE_EXPAND_MEMO") == NULL;
+	// Masking of already-analysed nested subexpression() markers during the unit split; see
+	// pyoomph::expressions::SubexpressionMasker. PYOOMPH_DISABLE_UNIT_MASK=1 restores the old path.
+	static const bool __unit_mask_on = getenv("PYOOMPH_DISABLE_UNIT_MASK") == NULL;
 	static inline bool __time_add_residual() { return __time_add_residual_on; }
+	// PYOOMPH_TIME_WRITE_CODE=1 does the same for the emission half, FiniteElementCode::write_code:
+	// which residual set, which routine (RJM / steady / Hessian / dResidual-dParameter) and which
+	// of the trailing code writers the time goes into. Deliberately a sibling switch rather than a
+	// reuse of PYOOMPH_TIME_ADD_RESIDUAL: the two phases are usually investigated separately and the
+	// ingestion breakdown is per contribution, i.e. very chatty, on exactly the models whose
+	// emission is slow. See dev_docs/code_generation.md.
+	static const bool __time_write_code_on = getenv("PYOOMPH_TIME_WRITE_CODE") != NULL;
+	struct __wc_phase_timer
+	{
+		std::chrono::steady_clock::time_point t0;
+		std::string name;
+		double *accum;
+		__wc_phase_timer(const std::string &n, double *acc = NULL) : t0(std::chrono::steady_clock::now()), name(n), accum(acc) {}
+		~__wc_phase_timer()
+		{
+			double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+			if (accum)
+				*accum += dt;
+			else if (__time_write_code_on && dt > 1e-3)
+				std::cerr << "[write_code] " << name << " " << dt << " s" << std::endl;
+		}
+	};
 	struct __phase_timer
 	{
 		std::chrono::steady_clock::time_point t0;
@@ -508,10 +554,55 @@ namespace pyoomph
 	protected:
 		FiniteElementCode *code;
 
+		// Two hash-bucket tables, both the same idiom as ReplaceFieldsToNonDimFields (key by
+		// gethash(), confirm the bucket with is_equal):
+		//  - `memo` makes this mapper a DAG walk instead of a tree walk. The side effects it skips on a
+		//    hit are all idempotent registrations of exactly the input it is skipping (the multi-return
+		//    call is already resolved, the subexpression is already in the list), so a hit reproduces
+		//    the first visit exactly.
+		//  - `known` replaces the linear is_equal scan over `subexpressions` that decided whether a
+		//    marker had been seen. That was O(N^2) in the number of distinct markers, and a droplet with
+		//    UNIFAC activity coefficients has of the order of 440 of them. First-encounter numbering is
+		//    kept, so the subexpr_N names do not move.
+		struct MemoEntry
+		{
+			GiNaC::ex key, value;
+		};
+		std::unordered_map<unsigned, std::vector<MemoEntry>> memo;
+		std::unordered_map<unsigned, std::vector<GiNaC::ex>> known;
+
+		bool already_known(const GiNaC::ex &e)
+		{
+			auto &bucket = known[e.gethash()];
+			for (auto &k : bucket)
+				if (k.is_equal(e))
+					return true;
+			bucket.push_back(e);
+			return false;
+		}
+
 	public:
 		std::vector<FiniteElementCodeSubExpression> subexpressions;
 		SubExpressionsToStructs(FiniteElementCode *code_) : code(code_) {}
 		GiNaC::ex operator()(const GiNaC::ex &inp) override
+		{
+			// Numbers are not cached, for the reason given on ReplaceFieldsToNonDimFields::operator():
+			// GiNaC keys them by value, so an exact and an inexact -1 would share an entry.
+			if (GiNaC::is_a<GiNaC::numeric>(inp))
+				return inp;
+			const unsigned h = inp.gethash();
+			auto it = memo.find(h);
+			if (it != memo.end())
+				for (auto &e : it->second)
+					if (e.key.is_equal(inp))
+						return e.value;
+			GiNaC::ex out = do_map(inp);
+			memo[h].push_back(MemoEntry{inp, out});
+			return out;
+		}
+
+	protected:
+		GiNaC::ex do_map(const GiNaC::ex &inp)
 		{
 			if (is_ex_the_function(inp, expressions::subexpression))
 			{
@@ -530,14 +621,7 @@ namespace pyoomph
 
 				GiNaC::ex res = GiNaC::GiNaCSubExpression(SubExpression(code, mapped_ex));
 				auto &st = GiNaC::ex_to<GiNaC::GiNaCSubExpression>(res).get_struct();
-				bool found = false;
-				for (unsigned int j = 0; j < subexpressions.size(); j++)
-					if (st.expr.is_equal(subexpressions[j].get_expression()))
-					{
-						found = true;
-						break;
-					}
-				if (!found)
+				if (!already_known(st.expr))
 				{
 					std::set<ShapeExpansion> sub_shapeexps = code->get_all_shape_expansions_in(st.expr);
 					std::set<TestFunction> sub_testfuncs = code->get_all_test_functions_in(st.expr);
@@ -618,7 +702,12 @@ namespace pyoomph
 							}
 						}
 					}
-					subexpressions.push_back(FiniteElementCodeSubExpression(st.expr.map(*this), GiNaC::potential_real_symbol("subexpr_" + std::to_string(subexpressions.size())), sub_shapeexps));
+					// st.expr is mapped_ex, i.e. already mapped once above. Mapping it again here doubled
+					// the work per nesting level and could not change anything: the markers inside are
+					// GiNaCSubExpression structs by now, which ex::map does not descend into. It also had
+					// to be a no-op for the code to work at all, since the returned wrapper carries the
+					// once-mapped st.expr and resolve_subexpression() matches the two against each other.
+					subexpressions.push_back(FiniteElementCodeSubExpression(st.expr, GiNaC::potential_real_symbol("subexpr_" + std::to_string(subexpressions.size())), sub_shapeexps));
 				}
 
 				return res;
@@ -735,9 +824,51 @@ namespace pyoomph
 		FiniteElementCode *code;
 		bool extra_steady_routine;
 
+		// Memo, same idiom as ReplaceFieldsToNonDimFields (hash bucket, confirmed by is_equal, mutable
+		// state replayed on a hit). ex::map walks the residual DAG as a tree, so without it a shared
+		// subexpression() body is rebuilt once per path and the rebuild is not free: the marker is
+		// still a plain subexpression() function here, so re-emitting it re-fires subexpression_eval.
+		// On the deeply nested synthetic azimuthal case this pass was 4.4 s per residual set at depth 5
+		// and, per the RSS trace, the whole peak of the run - materialised copies of shared subtrees.
+		// The only mutable state is the monotone extra_steady_routine flag, recorded per entry and
+		// OR'ed back in on a hit, so a cached branch still reports the rewrite it performed.
+		struct MemoEntry
+		{
+			GiNaC::ex key, value;
+			bool needs_steady;
+		};
+		std::unordered_map<unsigned, std::vector<MemoEntry>> memo;
+
 	public:
 		MakeResidualSteady(FiniteElementCode *_code) : code(_code), extra_steady_routine(false) {}
 		GiNaC::ex operator()(const GiNaC::ex &inp) override
+		{
+			// Numbers are never cached: GiNaC hashes and compares them by value, so an exact -1 and an
+			// inexact -1.0 share a key and the memo would hand back whichever was met first, which the
+			// generated C is not indifferent to (see ReplaceFieldsToNonDimFields::operator()). A leaf
+			// costs nothing here anyway.
+			if (GiNaC::is_a<GiNaC::numeric>(inp))
+				return inp;
+			const unsigned h = inp.gethash();
+			auto it = memo.find(h);
+			if (it != memo.end())
+				for (auto &e : it->second)
+					if (e.key.is_equal(inp))
+					{
+						extra_steady_routine = extra_steady_routine || e.needs_steady;
+						return e.value;
+					}
+			const bool steady_before = extra_steady_routine;
+			extra_steady_routine = false;
+			GiNaC::ex res = do_map(inp);
+			const bool needs_steady = extra_steady_routine;
+			extra_steady_routine = steady_before || needs_steady;
+			memo[h].push_back(MemoEntry{inp, res, needs_steady});
+			return res;
+		}
+
+	protected:
+		GiNaC::ex do_map(const GiNaC::ex &inp)
 		{
 			if (GiNaC::is_a<GiNaC::GiNaCShapeExpansion>(inp))
 			{
@@ -798,7 +929,52 @@ namespace pyoomph
 				return inp.map(*this);
 		}
 
+	public:
 		bool require_extra_steady_routine() const { return extra_steady_routine; }
+	};
+
+	// A memoising ex::subs of ONE expression for another.
+	//
+	// ex::subs is a tree operation, so on a residual with nested subexpression() markers - which are
+	// still plain function applications during code emission, i.e. transparent - it rebuilds a shared
+	// body once per path. It is what dominated write_code's parameter-derivative loop once the
+	// derivative itself was memoised (318a9a79): at depth 6 of the deeply nested synthetic azimuthal
+	// case, 6.59 s of substitution against 0.006 s of differentiation.
+	//
+	// Same hash-bucket memo as ReplaceFieldsToNonDimFields, and no mutable state to replay.
+	// GiNaCMultiRetCallback is the one node whose own subs() looks inside what it wraps while ex::map
+	// does not (see dev_docs/subexpression_unit_analysis_stall.md 4.1), so those are handed to the real
+	// subs rather than mapped - still once per distinct node, thanks to the memo.
+	class MemoisedSubs : public GiNaC::map_function
+	{
+	protected:
+		GiNaC::ex from, to;
+		GiNaC::exmap as_map;
+		struct MemoEntry
+		{
+			GiNaC::ex key, value;
+		};
+		std::unordered_map<unsigned, std::vector<MemoEntry>> memo;
+
+	public:
+		MemoisedSubs(const GiNaC::ex &from_, const GiNaC::ex &to_) : from(from_), to(to_) { as_map[from_] = to_; }
+		GiNaC::ex operator()(const GiNaC::ex &inp) override
+		{
+			if (inp.is_equal(from))
+				return to;
+			// Numbers are not cached, for the reason given on ReplaceFieldsToNonDimFields::operator().
+			if (GiNaC::is_a<GiNaC::numeric>(inp))
+				return inp;
+			const unsigned h = inp.gethash();
+			auto it = memo.find(h);
+			if (it != memo.end())
+				for (auto &e : it->second)
+					if (e.key.is_equal(inp))
+						return e.value;
+			GiNaC::ex res = (GiNaC::is_a<GiNaC::GiNaCMultiRetCallback>(inp) ? inp.subs(as_map) : inp.map(*this));
+			memo[h].push_back(MemoEntry{inp, res});
+			return res;
+		}
 	};
 
 	// GiNaC tree-mapper that replaces every global-parameter wrapper by its current numerical value,
@@ -826,9 +1002,24 @@ namespace pyoomph
 	// cancelled symbolically by GiNaC outside of the subexpression boundary.
 	GiNaC::ex DrawUnitsOutOfSubexpressions::operator()(const GiNaC::ex &inp)
 	{
+		if (__time_add_residual())
+		{
+			n_calls++;
+			distinct_nodes.insert(inp.gethash());
+		}
+		// Never look a number up in the cache: GiNaC compares numbers by value, so an exact -2 and an
+		// inexact -2.0 are the same key, and ex::compare() unifies what it finds equal by rebinding
+		// one ex to the other - so the lookup alone can turn an exact exponent inexact in place. See
+		// the long comment on SubExpressionsToRealAndImag in expressions.cpp.
+		if (GiNaC::is_a<GiNaC::numeric>(inp))
+			return inp;
 		GiNaC::exmap::const_iterator cached = cache.find(inp);
 		if (cached != cache.end())
+		{
+			if (__time_add_residual())
+				n_hits++;
 			return cached->second;
+		}
 		GiNaC::ex result = this->do_map(inp);
 		cache[inp] = result;
 		return result;
@@ -849,20 +1040,82 @@ namespace pyoomph
 				std::cout << "PROCESSING " << inp << std::endl
 						  << "YIELDS " << arg << std::endl
 						  << std::endl;
-			if (!expressions::collect_base_units(arg, factor, unit, rest))
+			// Every nested marker in "arg" has already been through this branch (the mapper works
+			// bottom-up), i.e. it is a subexpression() whose content is proven free of base units.
+			// Hiding those behind placeholder symbols is what keeps the unit analysis linear in the
+			// DAG instead of exponential in the nesting depth - see SubexpressionMasker.
+			GiNaC::ex marg = (__unit_mask_on ? masker.mask(arg) : arg);
+			std::chrono::steady_clock::time_point __t_cbu0;
+			if (__time_add_residual())
+			{
+				n_cbu_calls++;
+				__t_cbu0 = std::chrono::steady_clock::now();
+				// Announced before the call, so that a split which never returns is still
+				// identifiable - which is the shape this pass keeps failing in. Only for arguments
+				// large enough to be that split; a residual has many small ones.
+				if (marg.nops() > 200)
+					std::cerr << "[add_residual]   ph:units large split #" << n_cbu_calls << " entering "
+							  << GiNaC::ex_to<GiNaC::basic>(marg).class_name() << " nops " << marg.nops()
+							  << " masked_total " << masker.n_masked() << std::endl;
+			}
+			bool __cbu_ok = expressions::collect_base_units(marg, factor, unit, rest);
+			if (__time_add_residual())
+			{
+				// ... and reported again with its duration when it does return.
+				double __dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - __t_cbu0).count();
+				if (__dt > 0.5)
+					std::cerr << "[add_residual]   ph:units slow split #" << n_cbu_calls << " " << __dt
+							  << " s " << GiNaC::ex_to<GiNaC::basic>(marg).class_name()
+							  << " nops " << marg.nops() << " masked_total " << masker.n_masked() << std::endl;
+			}
+			if (!__cbu_ok)
 			{
 				std::ostringstream oss;
 				oss << std::endl
 					<< "INPUT: " << inp << std::endl
 					<< "PROCESSED ARG:" << arg << std::endl
-					<< "numerical part: " << factor << "unit part:" << unit << "rest part:" << rest << std::endl;
+					<< "numerical part: " << masker.unmask(factor) << "unit part:" << masker.unmask(unit) << "rest part:" << masker.unmask(rest) << std::endl;
 				throw_runtime_error("Cannot extract the unit from the subexpression:" + oss.str());
+			}
+			if (__unit_mask_on)
+			{
+				// All three, not just "rest": a placeholder can end up in an exponent of "unit" (the
+				// power branches of collect_base_units) or, when the split cannot decide its sign, in
+				// "factor".
+				factor = masker.unmask(factor);
+				unit = masker.unmask(unit);
+				rest = masker.unmask(rest);
 			}
 			if (pyoomph_verbose)
 				std::cout << "SEP: " << arg << "  n " << factor << " u " << unit << "  r  " << rest << std::endl;
+			GiNaC::ex out = expressions::subexpression(rest);
+			// allow() must see exactly the ex that is returned: an enclosing marker meets this very
+			// node again (ex::map hands the shared node back), and that is what makes it maskable.
+			//
+			// Except when the marker hides a multi-return callback. GiNaCMultiRetCallback is the one
+			// pyginacstruct with a subs() that descends into what it wraps (codegen.cpp), while
+			// nothing else does - not ex::map, not const_preorder_iterator. So a base unit inside a
+			// callback's invocation is invisible to collect_base_units()'s "rest is dimensionless"
+			// tail check and to this masker, but is still reached by the bu -> 1 substitution at the
+			// end of add_residual. Masking such a marker would hide it from that substitution, and
+			// the unit symbol would be emitted into the generated C (gcc: 'mol' undeclared - which is
+			// how this was found, on test_diffusivity_estimates' finite-difference thermodynamic
+			// factor). The rule is inductive: a nested marker that hides a callback is not allowed
+			// either, so it is still a visible function node in the scan below.
+			bool hides_multiret = false;
+			for (GiNaC::const_preorder_iterator i = marg.preorder_begin(); i != marg.preorder_end(); ++i)
+			{
+				if (GiNaC::is_a<GiNaC::GiNaCMultiRetCallback>(*i))
+				{
+					hides_multiret = true;
+					break;
+				}
+			}
+			if (!hides_multiret)
+				masker.allow(out);
 			if (pyoomph_verbose)
-				std::cout << "RET: " << (factor * unit * expressions::subexpression(rest)) << std::endl;
-			return factor * unit * expressions::subexpression(rest);
+				std::cout << "RET: " << (factor * unit * out) << std::endl;
+			return factor * unit * out;
 		}
 		else if (is_ex_the_function(inp, expressions::Diff))
 		{
@@ -871,25 +1124,42 @@ namespace pyoomph
 			// op(1) below would walk the whole (already processed) tree again
 			GiNaC::ex mapped = inp.map(*this);
 			GiNaC::ex arg = mapped.op(0); // Descent recursively through nested subexpressions
-			if (!expressions::collect_base_units(arg, factor, unit, rest))
+			GiNaC::ex marg = (__unit_mask_on ? masker.mask(arg) : arg); // same masking as above
+			if (__time_add_residual())
+				n_cbu_calls++;
+			if (!expressions::collect_base_units(marg, factor, unit, rest))
 			{
 				std::ostringstream oss;
 				oss << std::endl
 					<< "INPUT: " << inp << std::endl
 					<< "PROCESSED ARG:" << arg << std::endl
-					<< "numerical part: " << factor << "unit part:" << unit << "rest part:" << rest << std::endl;
+					<< "numerical part: " << masker.unmask(factor) << "unit part:" << masker.unmask(unit) << "rest part:" << masker.unmask(rest) << std::endl;
 				throw_runtime_error("Cannot extract the unit from the derivative numerator:" + oss.str());
 			}
 			GiNaC::ex factor2, unit2, rest2;
 			GiNaC::ex arg2 = mapped.op(1); // Descent recursively through nested subexpressions
-			if (!expressions::collect_base_units(arg2, factor2, unit2, rest2))
+			GiNaC::ex marg2 = (__unit_mask_on ? masker.mask(arg2) : arg2);
+			if (__time_add_residual())
+				n_cbu_calls++;
+			if (!expressions::collect_base_units(marg2, factor2, unit2, rest2))
 			{
 				std::ostringstream oss;
 				oss << std::endl
 					<< "INPUT: " << inp << std::endl
 					<< "PROCESSED ARG:" << arg2 << std::endl
-					<< "numerical part: " << factor2 << "unit part:" << unit2 << "rest part:" << rest2 << std::endl;
+					<< "numerical part: " << masker.unmask(factor2) << "unit part:" << masker.unmask(unit2) << "rest part:" << masker.unmask(rest2) << std::endl;
 				throw_runtime_error("Cannot extract the unit from the derivative denominator:" + oss.str());
+			}
+			if (__unit_mask_on)
+			{
+				// Diff() evaluates on construction, so it must never see a placeholder: unmask all six
+				// pieces before assembling the result.
+				factor = masker.unmask(factor);
+				unit = masker.unmask(unit);
+				rest = masker.unmask(rest);
+				factor2 = masker.unmask(factor2);
+				unit2 = masker.unmask(unit2);
+				rest2 = masker.unmask(rest2);
 			}
 			//		return (unit/unit2)*expressions::Diff(factor*rest,factor2*rest2);
 			return (factor / factor2) * (unit / unit2) * expressions::Diff(rest, factor2 * rest2);
@@ -991,6 +1261,11 @@ namespace pyoomph
 		// harmless at all for the generated C source: an exponent that comes back inexact makes
 		// print_simplest_form's ExactifyWholeNumberExponents necessary, and without it a reciprocal
 		// x^(-1) is printed as a multiplication by x. A leaf costs nothing to expand anyway.
+		// The lookup is the dangerous half, not the answer: ex::compare() unifies two ex's it finds
+		// equal by rebinding one's pointer to the other's (ex.h, ex::share), so looking an exact -2
+		// up against a stored -2.0 rewrites the power it is the exponent of to X^(-2.0) IN PLACE.
+		// That is what broke the azimuthal split's own cache; see SubExpressionsToRealAndImag in
+		// expressions.cpp.
 		if (GiNaC::is_a<GiNaC::numeric>(inp))
 			return do_replace(inp);
 		const unsigned h = inp.gethash();
@@ -4217,39 +4492,8 @@ namespace pyoomph
 	std::set<ShapeExpansion> FiniteElementCode::get_all_shape_expansions_in(GiNaC::ex inp, bool merge_no_jacobian, bool merge_expansion_modes, bool merge_no_hessian)
 	{
 		std::set<ShapeExpansion> res;
-		for (GiNaC::const_preorder_iterator i = inp.preorder_begin(); i != inp.preorder_end(); ++i)
-		{
-			//			std::cout << *i << std::endl;
-			if (GiNaC::is_a<GiNaC::GiNaCShapeExpansion>(*i))
-			{
-				auto &shapeexp = (GiNaC::ex_to<GiNaC::GiNaCShapeExpansion>(*i)).get_struct();
-				//&		  	std::cout << "FOUND SHAPE EXPANSION  " << &shapeexp << std::endl;
-				res.insert(shapeexp);
-			}
-			else if (GiNaC::is_a<GiNaC::GiNaCSubExpression>(*i))
-			{
-				GiNaC::GiNaCSubExpression se = GiNaC::ex_to<GiNaC::GiNaCSubExpression>(*i);
-				std::set<ShapeExpansion> sub = get_all_shape_expansions_in(se.get_struct().expr, merge_no_jacobian, merge_expansion_modes, merge_no_hessian);
-				for (auto &se : sub)
-				{
-					res.insert(se);
-				}
-			}
-			else if (GiNaC::is_a<GiNaC::GiNaCMultiRetCallback>(*i))
-			{
-				//std::cout << "GOT MULTIRET CB "  << (*i) << std::endl;
-				
-				GiNaC::GiNaCMultiRetCallback se = GiNaC::ex_to<GiNaC::GiNaCMultiRetCallback>(*i);
-				//std::cout << "GOT MULTIRET CB " << "INVOK "  << (se.get_struct().invok) << std::endl;
-				//std::cout << "GOT MULTIRET CB " << "INVOK OP1 "  << (se.get_struct().invok.op(1)) << std::endl;
-				std::set<ShapeExpansion> sub = get_all_shape_expansions_in(se.get_struct().invok.op(1), merge_no_jacobian, merge_expansion_modes, merge_no_hessian);
-				for (auto &se : sub)
-				{
-					//std::cout << "GOT MULTIRET CB " << "INSERTING "  << GiNaC::GiNaCShapeExpansion(se) << std::endl;
-					res.insert(se);
-				}
-			}
-		}
+		DagVisitedSet visited;
+		gather_shape_expansions_in(inp, res, visited);
 
 		if (merge_no_jacobian || merge_expansion_modes || merge_no_hessian)
 		{
@@ -4278,6 +4522,54 @@ namespace pyoomph
 		return res;
 	}
 
+	// The raw collection half: an explicit descent with a visited set instead of the former
+	// const_preorder_iterator loop, so that a node shared by several paths of the residual DAG is
+	// visited once rather than once per path (see register_global_parameters_in above for why pointer
+	// identity is the right key, and why the markers are transparent here). The flag merging stays in
+	// the wrapper: it only ever clears flags, so doing it once on the union is the same set as doing
+	// it on every sub-result and again at the end, which is what the recursive version did.
+	void FiniteElementCode::gather_shape_expansions_in(const GiNaC::ex &inp, std::set<ShapeExpansion> &res, DagVisitedSet &visited)
+	{
+		if (!visited.visit(inp))
+			return;
+		if (GiNaC::is_a<GiNaC::GiNaCShapeExpansion>(inp))
+		{
+			res.insert((GiNaC::ex_to<GiNaC::GiNaCShapeExpansion>(inp)).get_struct());
+			return;
+		}
+		if (GiNaC::is_a<GiNaC::GiNaCSubExpression>(inp))
+		{
+			gather_shape_expansions_in(GiNaC::ex_to<GiNaC::GiNaCSubExpression>(inp).get_struct().expr, res, visited);
+			return;
+		}
+		if (GiNaC::is_a<GiNaC::GiNaCMultiRetCallback>(inp))
+		{
+			gather_shape_expansions_in(GiNaC::ex_to<GiNaC::GiNaCMultiRetCallback>(inp).get_struct().invok.op(1), res, visited);
+			return;
+		}
+		for (size_t i = 0; i < inp.nops(); i++)
+			gather_shape_expansions_in(inp.op(i), res, visited);
+	}
+
+	// Every distinct node of the expression DAG rooted at `e`, in preorder, each exactly once.
+	//
+	// This is the drop-in replacement for a const_preorder_iterator loop over a residual. The iterator
+	// walks the DAG as a TREE - a node reachable by k paths is handed out k times - which is
+	// exponential in the nesting depth of the subexpression() markers, and the markers are transparent
+	// to it because they are still plain function applications at code-emission time. The scans that
+	// use this only test node types and perform idempotent registrations, so seeing each node once is
+	// all they need. Nodes below a pyginacstruct are NOT enumerated, exactly as the iterator does not
+	// enumerate them (nops()==0); the collectors that must look inside a marker struct recurse
+	// explicitly instead (gather_shape_expansions_in).
+	static void collect_dag_nodes(const GiNaC::ex &e, std::vector<GiNaC::ex> &out, DagVisitedSet &visited)
+	{
+		if (!visited.visit(e))
+			return;
+		out.push_back(e);
+		for (size_t i = 0; i < e.nops(); i++)
+			collect_dag_nodes(e.op(i), out, visited);
+	}
+
 	// Collects every distinct TestFunction structure appearing anywhere in expression `inp` (simple
 	// preorder scan; unlike get_all_shape_expansions_in, test functions are not expected inside
 	// subexpression(...) wrappers since subexpressions may not depend on test functions - see
@@ -4285,8 +4577,12 @@ namespace pyoomph
 	std::set<TestFunction> FiniteElementCode::get_all_test_functions_in(GiNaC::ex inp)
 	{
 		std::set<TestFunction> res;
-		for (GiNaC::const_preorder_iterator i = inp.preorder_begin(); i != inp.preorder_end(); ++i)
+		DagVisitedSet __visited;
+		std::vector<GiNaC::ex> __nodes;
+		collect_dag_nodes(inp, __nodes, __visited);
+		for (const GiNaC::ex &__node : __nodes)
 		{
+			const GiNaC::ex *i = &__node;
 			//			std::cout << *i << std::endl;
 			if (GiNaC::is_a<GiNaC::GiNaCTestFunction>(*i))
 			{
@@ -4317,6 +4613,10 @@ namespace pyoomph
 		MeshToCoordinateShapes(FiniteElementCode *code_) : code(code_) {}
 		GiNaC::ex operator()(const GiNaC::ex &inp) override
 		{
+			// Numbers bypass the cache; a lookup of one can rewrite an exact number inexact in place.
+			// See the comment on SubExpressionsToRealAndImag in expressions.cpp.
+			if (GiNaC::is_a<GiNaC::numeric>(inp))
+				return inp;
 			GiNaC::exmap::const_iterator cached = cache.find(inp);
 			if (cached != cache.end())
 				return cached->second;
@@ -4916,8 +5216,20 @@ namespace pyoomph
 		if (expanded.is_zero())
 			return 0;
 		DrawUnitsOutOfSubexpressions units_out_of_subexpressions(this);
-		GiNaC::ex repl = units_out_of_subexpressions(expanded);
-		GiNaC::ex expa = repl.expand().evalm().normal();
+		GiNaC::ex repl;
+		{
+			__phase_timer __t("  ph:eaen_DrawUnits");
+			repl = units_out_of_subexpressions(expanded);
+		}
+		GiNaC::ex expa;
+		{
+			// Same hazard class as add_residual's expand().normal(), and not masked: this entry point
+			// is used for scales and single components rather than for whole residuals, and no case
+			// has yet been measured where it is the wall. If one turns up, mask `repl` here the way
+			// add_residual does - and unmask on every return path.
+			__phase_timer __t("  ph:eaen_expand_normal");
+			expa = repl.expand().evalm().normal();
+		}
 		GiNaC::lst sublist;
 		if (collected_units_and_factor)
 		{
@@ -5170,11 +5482,27 @@ namespace pyoomph
 		*/
 
 		GiNaC::ex repl;
+		DrawUnitsOutOfSubexpressions units_out_of_subexpressions(this);
 		{
 			__phase_timer __t("DrawUnitsOutOfSubexpressions");
-			DrawUnitsOutOfSubexpressions units_out_of_subexpressions(this);
 			repl = units_out_of_subexpressions(expanded);
+			if (__time_add_residual())
+				std::cerr << "[add_residual]   ph:units calls " << units_out_of_subexpressions.get_n_calls()
+						  << " memo_hits " << units_out_of_subexpressions.get_n_hits()
+						  << " distinct " << units_out_of_subexpressions.get_n_distinct()
+						  << " cbu_calls " << units_out_of_subexpressions.get_n_cbu_calls()
+						  << " masked " << units_out_of_subexpressions.get_n_masked() << std::endl;
 		}
+		// Everything below - the prescan, expand().normal(), the surviving-unit scan and the
+		// bu -> 1 substitution - walks the whole contribution again, and every one of those is a tree
+		// operation over what is a DAG. The markers the pass above emitted are base-unit-free by
+		// collect_base_units()'s tail check, so masking them keeps all of it linear in the DAG: a
+		// masked marker can neither hide a surviving unit nor swallow a needed bu -> 1 substitution.
+		// Markers that were not emitted here are not maskable and stay fully visible.
+		// (Synthetic depth-6 nested-marker residual: base_unit_prescan 5.3 s and repl.subs(sublist)
+		// 25.4 s, both growing ~x10 per nesting level, before this.)
+		expressions::SubexpressionMasker &masker = units_out_of_subexpressions.get_masker();
+		GiNaC::ex repl_masked = (__unit_mask_on ? masker.mask(repl) : repl);
 		// `expa` is read only by the base-unit check below; the residual actually stored is
 		// repl.subs(sublist). Normalising a residual with rational nonlinearities puts all the
 		// denominators over a common one and costs seconds per contribution, all discarded. Since
@@ -5189,7 +5517,7 @@ namespace pyoomph
 		bool may_be_dimensional = prescan_disabled;
 		{
 			__phase_timer __t("base_unit_prescan");
-			for (GiNaC::const_preorder_iterator i = repl.preorder_begin(); i != repl.preorder_end() && !may_be_dimensional; ++i)
+			for (GiNaC::const_preorder_iterator i = repl_masked.preorder_begin(); i != repl_masked.preorder_end() && !may_be_dimensional; ++i)
 			{
 				if (!GiNaC::is_a<GiNaC::symbol>(*i))
 					continue;
@@ -5219,19 +5547,19 @@ namespace pyoomph
 		{
 			__phase_timer __t("collect_base_units_fastcheck");
 			GiNaC::ex f_, u_, r_;
-			if (expressions::collect_base_units(repl, f_, u_, r_) && u_.is_equal(1))
+			if (expressions::collect_base_units(repl_masked, f_, u_, r_) && u_.is_equal(1))
 				units_proven_to_cancel = true;
 		}
 		GiNaC::ex expa;
 		if (may_be_dimensional && !units_proven_to_cancel)
 		{
 			__phase_timer __t("expand().normal()");
-			expa = repl.expand().normal();
+			expa = repl_masked.expand().normal();
 		}
 		else if (units_proven_to_cancel && getenv("PYOOMPH_PARANOID_UNIT_PRESCAN"))
 		{
 			// Cross-check of the fast path: run the authoritative computation and insist it would
-			// have accepted too.
+			// have accepted too. On the unmasked contribution, for the same reason as below.
 			GiNaC::ex check = repl.expand().normal();
 			for (auto &bu : base_units)
 			{
@@ -5254,7 +5582,9 @@ namespace pyoomph
 		{
 			// Opt-in cross-check of the invariant above: do the work the prescan just skipped and
 			// insist it agrees. Only for validating this optimisation against real (dimensional)
-			// models; it is strictly slower than not having the prescan at all.
+			// models; it is strictly slower than not having the prescan at all. Deliberately on the
+			// *unmasked* contribution, so that it also catches a base unit hiding inside a masked
+			// marker - which would be the one way masking could make the prescan lie.
 			GiNaC::ex check = repl.expand().normal();
 			for (auto &bu : base_units)
 			{
@@ -5300,28 +5630,54 @@ namespace pyoomph
 					sublist.append(bu.second == 1);
 					continue;
 				}
-				throw_runtime_error(this->format_dimensional_error(add, expa, "The added residual contribution"));
+				throw_runtime_error(this->format_dimensional_error(add, masker.unmask(expa), "The added residual contribution"));
 			}
 			sublist.append(bu.second == 1);
 		}
 		delete __t_bu;
 
 		__phase_timer __t_subs("repl.subs(sublist)");
-		GiNaC::ex final_contrib = repl.subs(sublist);
+		GiNaC::ex final_contrib_masked = repl_masked.subs(sublist);
+		GiNaC::ex final_contrib = final_contrib_masked;
+		if (__unit_mask_on)
+		{
+			__phase_timer __t_unmask("unmask(final_contrib)");
+			final_contrib = masker.unmask(final_contrib_masked);
+		}
 		//		 GiNaC::ex final_contrib=expa.subs(sublist);
 		//		  GiNaC::ex final_contrib=expanded;
 		if (pyoomph_verbose)
 			std::cout << "Adding residual " << final_contrib << std::endl;
 
-		for (GiNaC::const_preorder_iterator i = final_contrib.preorder_begin(); i != final_contrib.preorder_end(); ++i)
 		{
-			if (GiNaC::is_a<GiNaC::matrix>(*i))
+			// Every node of the DAG has to be looked at once, not once per path to it: a preorder walk
+			// of the unmasked residual is the same tree-over-a-DAG traversal as everywhere else in this
+			// file, and after the phases above it was all that was left of add_residual (5.2 s of 5.3 s
+			// on the synthetic depth-6 case). So scan the masked form, and then each masked marker's
+			// interior once - itself masked, so the nested markers stay leaves. Coverage is identical:
+			// the union of those is every node of the residual.
+			__phase_timer __t_mat("matrix_scan");
+			auto scan_for_matrix = [this](const GiNaC::ex &e)
 			{
-				std::ostringstream oss;
-				oss << std::endl
-					<< *i << std::endl;
-				throw_runtime_error("Apparently, the added residual contains vectors or matrices. Please contract everything to scalar via dot or double_dot. Problematic term:" + oss.str());
+				for (GiNaC::const_preorder_iterator i = e.preorder_begin(); i != e.preorder_end(); ++i)
+				{
+					if (GiNaC::is_a<GiNaC::matrix>(*i))
+					{
+						std::ostringstream oss;
+						oss << std::endl
+							<< *i << std::endl;
+						throw_runtime_error("Apparently, the added residual contains vectors or matrices. Please contract everything to scalar via dot or double_dot. Problematic term:" + oss.str());
+					}
+				}
+			};
+			if (__unit_mask_on)
+			{
+				scan_for_matrix(final_contrib_masked);
+				for (const auto &m : masker.get_masked_markers())
+					scan_for_matrix(masker.mask(m.second.op(0)));
 			}
+			else
+				scan_for_matrix(final_contrib);
 		}
 
 		if (warn_on_large_numerical_factor)
@@ -5848,8 +6204,12 @@ namespace pyoomph
 	void FiniteElementCode::mark_further_required_fields(GiNaC::ex expr, const std::string &for_what)
 	{
 		// Mark other requirements
-		for (GiNaC::const_preorder_iterator i = expr.preorder_begin(); i != expr.preorder_end(); ++i)
+		DagVisitedSet __visited;
+		std::vector<GiNaC::ex> __nodes;
+		collect_dag_nodes(expr, __nodes, __visited);
+		for (const GiNaC::ex &__node : __nodes)
 		{
+			const GiNaC::ex *i = &__node;
 			if (GiNaC::is_a<GiNaC::GiNaCNormalSymbol>(*i))
 			{
 				const pyoomph::NormalSymbol &sp = GiNaC::ex_to<GiNaC::GiNaCNormalSymbol>(*i).get_struct();
@@ -6001,9 +6361,15 @@ namespace pyoomph
 	{
 		//std::set<GiNaC::GiNaCSpatialIntegralSymbol> dx_symbs;
 		std::set<GiNaC::ex, GiNaC::ex_is_less> dx_symbs;
-		// First, gather all dx terms
-		for (GiNaC::const_preorder_iterator i = inp.preorder_begin(); i != inp.preorder_end(); ++i)
+		// First, gather all dx terms. Only this gather is a DAG walk; the coeff() calls below are
+		// shallow - basic::coeff does not descend into a function's arguments, so a subexpression()
+		// marker is a leaf to them.
+		DagVisitedSet __visited;
+		std::vector<GiNaC::ex> __nodes;
+		collect_dag_nodes(inp, __nodes, __visited);
+		for (const GiNaC::ex &__node : __nodes)
 		{
+			const GiNaC::ex *i = &__node;
 			if (GiNaC::is_a<GiNaC::GiNaCSpatialIntegralSymbol>(*i))
 			{
 				if (pyoomph_verbose)
@@ -6466,12 +6832,18 @@ namespace pyoomph
 
 		// Everything printed below (residual entries, Jacobian/mass derivatives, CSE bodies) derives
 		// from resi, so screening resi covers the whole function
+		// gp_scope must live until the END of this function: it is what makes
+		// GiNaCGlobalParameterWrapper::print reference the hoisted pyoomph_gparam_<i> local instead of
+		// falling back to the double indirection. Only the scans are timed.
 		GlobalParameterFunctionScope gp_scope(this, {resi});
-		gp_scope.write_declarations(os, "  ");
-
-		std::set<ShapeExpansion> all_shapeexps = get_all_shape_expansions_in(resi, true);
-
-		std::set<TestFunction> all_testfuncs = get_all_test_functions_in(resi);
+		std::set<ShapeExpansion> all_shapeexps;
+		std::set<TestFunction> all_testfuncs;
+		{
+			__wc_phase_timer __t("    RJM:param_scan+shape_scan");
+			gp_scope.write_declarations(os, "  ");
+			all_shapeexps = get_all_shape_expansions_in(resi, true);
+			all_testfuncs = get_all_test_functions_in(resi);
+		}
 		std::set<FiniteElementField *,FiniteElementFieldPtrLess> indices_required;
 		for (auto &sp : all_shapeexps)
 		{
@@ -6494,7 +6866,10 @@ namespace pyoomph
 		}
 
 		// Mark other requirements
-		mark_further_required_fields(resi, "ResJac[" + std::to_string(residual_index) + "]");
+		{
+			__wc_phase_timer __t("    RJM:mark_further_required_fields");
+			mark_further_required_fields(resi, "ResJac[" + std::to_string(residual_index) + "]");
+		}
 
 
 		if (this->coordinates_as_dofs)
@@ -6562,14 +6937,18 @@ namespace pyoomph
 			}
 		}
 
-		GiNaC::ex spatial_integral_portion_Eulerian = extract_spatial_integral_part(resi, true, false);	  // resi.coeff(get_dx(false), 1) * get_dx(false);
-		if (pyoomph::pyoomph_verbose)
+		GiNaC::ex spatial_integral_portion_Eulerian, spatial_integral_portion_Lagrangian, spatial_integral_portion_NodalDelta;
 		{
-			std::cout << "Full residual: " << resi << std::endl;
-			std::cout << "Eulerian part of the residual: " << spatial_integral_portion_Eulerian << std::endl;
+			__wc_phase_timer __t("    RJM:extract_spatial_integral_part");
+			spatial_integral_portion_Eulerian = extract_spatial_integral_part(resi, true, false);	  // resi.coeff(get_dx(false), 1) * get_dx(false);
+			if (pyoomph::pyoomph_verbose)
+			{
+				std::cout << "Full residual: " << resi << std::endl;
+				std::cout << "Eulerian part of the residual: " << spatial_integral_portion_Eulerian << std::endl;
+			}
+			spatial_integral_portion_Lagrangian = extract_spatial_integral_part(resi, false, true); // resi.coeff(get_dx(true), 1) * get_dx(true);
+			spatial_integral_portion_NodalDelta = resi.coeff(get_nodal_delta(), 1);
 		}
-		GiNaC::ex spatial_integral_portion_Lagrangian = extract_spatial_integral_part(resi, false, true); // resi.coeff(get_dx(true), 1) * get_dx(true);
-		GiNaC::ex spatial_integral_portion_NodalDelta = resi.coeff(get_nodal_delta(), 1);
 
 		if (!spatial_integral_portion_Lagrangian.is_zero())
 			this->mark_shapes_required("ResJac[" + std::to_string(residual_index) + "]", spaces[0], "psi");
@@ -6617,8 +6996,12 @@ namespace pyoomph
 
 			ipt_body << "    // SUBEXPRESSIONS" << std::endl
 			   << std::endl;
-			spatial_integral_portion = this->write_code_subexpressions(ipt_body, "     ", spatial_integral_portion, spatial_shape_exps, false);
+			{
+				__wc_phase_timer __t("    RJM:write_code_subexpressions");
+				spatial_integral_portion = this->write_code_subexpressions(ipt_body, "     ", spatial_integral_portion, spatial_shape_exps, false);
+			}
 
+			__wc_phase_timer __t_contrib("    RJM:contributions+loop assembly");
 			ipt_body << "    //START: Contribution of the spaces" << std::endl;
 			ipt_body << "    double _res_contrib,_J_contrib;" << std::endl;
 			for (auto *sp : allspaces)
@@ -7430,7 +7813,13 @@ namespace pyoomph
 		auto print_named_ex_map = [&](const std::map<std::string, GiNaC::ex> &m)
 		{ for (auto &kv : m) { os << kv.first << "="; print_ex(kv.second); } };
 
-		os << "FMT10\n"; // Bump whenever this function's coverage/format changes
+		os << "FMT11\n"; // Bump whenever this function's coverage/format changes
+		// FMT11: the two switches of the azimuthal real/imaginary split are covered -
+		// PYOOMPH_DISABLE_REIM_FOLD (whether subexpression() reports the real/imaginary part of a
+		// provably real marker, which changes how far the split expands products) and
+		// PYOOMPH_UNIT_CCF_MAX_TERMS (the term count above which collect_base_units skips
+		// collect_common_factors). Both change what write_code() emits - measured, on the two
+		// azimuthal reference cases and the synthetic one - so both have to be in here.
 		// FMT10: the hanging-node split (split_rjm_by_hang, PYOOMPH_DISABLE_HANG_SPLIT) is covered, and
 		// so is PYOOMPH_DISABLE_RJM_SPLIT, which decides the same kind of thing and was missing.
 		// FMT9: the Z2 compound-flux grouping and its per-group normalization/weight are covered
@@ -7451,7 +7840,10 @@ namespace pyoomph
 		   << " sw_unit_fastcheck=" << (getenv("PYOOMPH_UNIT_FASTCHECK") != NULL)
 		   << " sw_no_unit_prescan=" << (getenv("PYOOMPH_DISABLE_UNIT_PRESCAN") != NULL)
 		   << " sw_no_rjm_split=" << (getenv("PYOOMPH_DISABLE_RJM_SPLIT") != NULL)
-		   << " sw_no_hang_split=" << (getenv("PYOOMPH_DISABLE_HANG_SPLIT") != NULL) << "\n";
+		   << " sw_no_hang_split=" << (getenv("PYOOMPH_DISABLE_HANG_SPLIT") != NULL)
+		   << " sw_no_unit_mask=" << !__unit_mask_on
+		   << " sw_no_reim_fold=" << (getenv("PYOOMPH_DISABLE_REIM_FOLD") != NULL)
+		   << " sw_ccf_max=" << (getenv("PYOOMPH_UNIT_CCF_MAX_TERMS") ? getenv("PYOOMPH_UNIT_CCF_MAX_TERMS") : "default") << "\n";
 		os << "dim=" << nodal_dim << " lagr_dim=" << lagr_dim << " max_dt_order=" << max_dt_order << " integration_order=" << integration_order << "\n";
 		os << "generate_hessian=" << generate_hessian << " assemble_hessian_by_symmetry=" << assemble_hessian_by_symmetry << "\n";
 		os << "analytical_jacobian=" << analytical_jacobian << " analytical_position_jacobian=" << analytical_position_jacobian << "\n";
@@ -7656,6 +8048,7 @@ namespace pyoomph
 	// advanced to 2 (fully finalized) once done.
 	void FiniteElementCode::write_code(std::ostream &os)
 	{
+		__wc_phase_timer __t_total("TOTAL");
 		__current_code = this;
 		this->hoist_coeff_counter = 0; // names are per code, not per process - see codegen.hpp
 		this->emitted_nohang_entry_points.clear(); // Refilled by write_generic_RJM; a rewrite must not inherit the last one's decisions
@@ -7725,11 +8118,18 @@ namespace pyoomph
 				// specialising the branch away. MakeResidualSteady is a pure GiNaC map, so hoisting it
 				// above the write changes nothing else.
 				MakeResidualSteady make_steady(this);
-				GiNaC::ex steady_residual = make_steady(residual[resind]);
+				GiNaC::ex steady_residual;
+				{
+					__wc_phase_timer __t("res[" + std::to_string(resind) + "] MakeResidualSteady");
+					steady_residual = make_steady(residual[resind]);
+				}
 				extra_steady_routine[resind] = make_steady.require_extra_steady_routine();
 
 				record_jacobian_blocks_for_flags = (get_derive_jacobian_by_expansion_mode() == NULL);
-				write_generic_RJM(os, "ResidualAndJacobian" + std::to_string(resind), residual[resind], true, !extra_steady_routine[resind], true); // Hanging unsteady routine
+				{
+					__wc_phase_timer __t("res[" + std::to_string(resind) + "] RJM");
+					write_generic_RJM(os, "ResidualAndJacobian" + std::to_string(resind), residual[resind], true, !extra_steady_routine[resind], true); // Hanging unsteady routine
+				}
 				record_jacobian_blocks_for_flags = false;
 				os << std::endl;
 
@@ -7738,25 +8138,70 @@ namespace pyoomph
 					os << std::endl;
 					// The steady twin gets the hang split too: a stationary solve is the common case, and
 					// elements_assembly.cpp picks the Steady slot without ever looking at the unsteady one.
-					write_generic_RJM(os, "ResidualAndJacobianSteady" + std::to_string(resind), steady_residual, true, true, true); // Hanging steady routine
+					{
+						__wc_phase_timer __t("res[" + std::to_string(resind) + "] RJM steady");
+						write_generic_RJM(os, "ResidualAndJacobianSteady" + std::to_string(resind), steady_residual, true, true, true); // Hanging steady routine
+					}
 					os << std::endl;
 				}
 
 				if (generate_hessian)
 				{
 					has_constant_mass_matrix_for_sure[resind]=true; // Might change during writing the Hessian
+					__wc_phase_timer __t("res[" + std::to_string(resind) + "] Hessian");
 					has_hessian_contribution[resind] = write_generic_Hessian(os, "HessianVectorProduct" + std::to_string(resind), residual[resind], true);
 					os << std::endl;
 				}
 
 				GiNaC::potential_real_symbol gp_dummy("_global_param_");
+				double __t_dp_subs = 0.0, __t_dp_diff = 0.0, __t_dp_write = 0.0;
+				// Which of the parameters this residual set actually mentions. local_parameter_symbols
+				// is process-wide over all residual sets and all the other expression families, so on a
+				// model with several parameters most entries of the loop below differentiate a residual
+				// that does not contain the parameter at all, only to find the result is zero. That is
+				// not a cheap way to find out: substituting and differentiating rebuilds the whole
+				// residual DAG as a tree (GiNaC::diff is not memoised, and subexpression_expl_deriv
+				// re-enters the evaluating subexpression() on the way out), and on the deeply nested
+				// azimuthal synthetic case it was 65% of the entire code-emission time - for two
+				// residual sets whose derivative was identically zero.
+				//
+				// The scan is the same one write_generic_RJM already runs through
+				// GlobalParameterFunctionScope, and it is now linear in the DAG. A parameter absent from
+				// the residual has an identically zero derivative, so this takes exactly the same `else`
+				// branch as before and the emitted PYOOMPH_NULL entry is unchanged. The converse is not
+				// assumed: a parameter that IS present still gets differentiated and still gets to be
+				// found zero.
+				std::set<unsigned> params_in_residual;
+				register_global_parameters_in(steady_residual, params_in_residual);
+				// One ambient-flag configuration for the whole loop (nothing below touches the codegen
+				// flags), so the derivative of a marker can be memoised across it - see
+				// expressions::SubexpressionDerivativeCacheScope. Without it the diff below walks the
+				// residual DAG as a tree.
+				expressions::SubexpressionDerivativeCacheScope __subexpr_deriv_cache_scope;
 				for (unsigned int i = 0; i < local_parameter_symbols.size(); i++) // Only parameters in Residuals releveant (e.g. not in integral expressions)
 				{
+					if (!params_in_residual.count(i))
+					{
+						local_parameter_has_deriv[resind].push_back(false);
+						continue;
+					}
 					GiNaC::ex p = local_parameter_symbols[i];
-					GiNaC::ex dres_dp = steady_residual.subs(p == gp_dummy).diff(gp_dummy); // Take the steady residual only here
+					GiNaC::ex dres_dp;
+					{
+						GiNaC::ex substituted;
+						{
+							__wc_phase_timer __t("", &__t_dp_subs);
+							MemoisedSubs to_dummy(p, gp_dummy);
+							substituted = to_dummy(steady_residual);
+						}
+						__wc_phase_timer __t("", &__t_dp_diff);
+						dres_dp = substituted.diff(gp_dummy); // Take the steady residual only here
+					}
 					if (!dres_dp.is_zero())													// Need to write the dresidual_dparameter function
 					{
-						dres_dp = dres_dp.subs(gp_dummy == p);
+						__wc_phase_timer __t("", &__t_dp_write);
+						MemoisedSubs back_to_param(gp_dummy, p);
+						dres_dp = back_to_param(dres_dp);
 						os << std::endl;
 						os << "//Derivative wrt. global parameter " << p << std::endl;
 						std::ostringstream oss;
@@ -7767,6 +8212,10 @@ namespace pyoomph
 					else
 						local_parameter_has_deriv[resind].push_back(false);
 				}
+				if (__time_write_code_on && (__t_dp_subs > 1e-3 || __t_dp_diff > 1e-3 || __t_dp_write > 1e-3))
+					std::cerr << "[write_code] res[" << resind << "] dRes/dParam over " << local_parameter_symbols.size()
+							  << " params: subs " << __t_dp_subs << " s, diff " << __t_dp_diff
+							  << " s, write " << __t_dp_write << " s" << std::endl;
 			}
 			else
 			{
@@ -7776,6 +8225,7 @@ namespace pyoomph
 
 		residual_index = 0;
 
+		__wc_phase_timer __t_rest("trailing writers (ICs, Dirichlet, geom.Jac, Z2, expressions, info)");
 		for (unsigned int i = 0; i < IC_names.size(); i++)
 		{
 			write_code_initial_condition(os, i, IC_names[i]);

@@ -4517,6 +4517,193 @@ namespace pyoomph
       }
       source_nodes.assign(uniq.begin(), uniq.end());
     }
+
+    // Under a distributed source the search below must not be answered from this rank's share alone.
+    // Nothing above could place these nodes - they lie outside the old geometry on EVERY rank, so
+    // the pooling had nothing to hand over - and each rank would then blend from whatever piece of
+    // the old mesh it happens to hold, with the re-distribution keeping the owner's copy. That made
+    // the answer a function of the partition: on the coalescence bridge, exactly 1.0 serially and
+    // 0.758 at four ranks, which was the whole of the drift measured in
+    // dev_docs/axisymm_reconnection_coalescence_4.md. So the two nearest source nodes are found
+    // GLOBALLY here, which reproduces the serial answer by construction.
+    //
+    // Halo copies are dropped first, or the same physical source node would be offered by two ranks
+    // and could be picked as both the first and the second nearest.
+    std::map<oomph::Node *, std::vector<double>> global_blend;
+    std::map<oomph::Node *, std::pair<double, double>> global_lambda;
+#ifdef OOMPH_HAS_MPI
+    if (shared_across_ranks)
+    {
+      {
+        std::vector<oomph::Node *> owned;
+        owned.reserve(source_nodes.size());
+        for (oomph::Node *m : source_nodes)
+          if (!m->is_halo())
+            owned.push_back(m);
+        source_nodes.swap(owned);
+      }
+
+      MPI_Comm mc = this->get_problem()->communicator_pt()->mpi_comm();
+      const int myrank = this->get_problem()->communicator_pt()->my_rank();
+
+      // The very order share_interpolation_across_ranks() walks, so that entry k is the same node on
+      // every rank. missing_nodes cannot be used for this: it is a set of POINTERS, ordered by the
+      // addresses the allocator happened to hand out, which differ from rank to rank.
+      std::vector<oomph::Node *> todo;
+      {
+        std::set<oomph::Node *> seen;
+        for (unsigned int ie = 0; ie < this->nelement(); ie++)
+        {
+          BulkElementBase *deste = dynamic_cast<BulkElementBase *>(this->element_pt(ie));
+          for (unsigned int ine = 0; ine < deste->nnode(); ine++)
+          {
+            oomph::Node *nn = deste->node_pt(ine);
+            if (!node_is_in_scope(nn, boundary_index, interface_case))
+              continue;
+            if (!seen.insert(nn).second)
+              continue;
+            if (missing_nodes.count(nn) && !completed_nodes.count(nn))
+              todo.push_back(nn);
+          }
+        }
+      }
+
+      // One flat buffer per winner, laid out per node as
+      //   [have][is_boundary_node][nlagrangian] [ntstorage x field_map] [per interface field: valid,
+      //   ntstorage values] [(position ntstorage - 1) x ndim] [nlagrangian]
+      // The destination mesh is replicated, so every rank computes the same strides.
+      const unsigned nfm = field_map.size(), ninter = inter_field_map.size();
+      const unsigned N = todo.size();
+      std::vector<unsigned> off(N + 1, 0), ntst(N, 0), post(N, 0), ndimn(N, 0), nlag(N, 0);
+      for (unsigned k = 0; k < N; k++)
+      {
+        oomph::Node *nn = todo[k];
+        ntst[k] = nn->time_stepper_pt()->ntstorage();
+        post[k] = nn->position_time_stepper_pt()->ntstorage();
+        ndimn[k] = nn->ndim();
+        nlag[k] = static_cast<pyoomph::Node *>(nn)->nlagrangian();
+        off[k + 1] = off[k] + 3 + ntst[k] * nfm + ninter * (1 + ntst[k]) +
+                     (post[k] ? (post[k] - 1) * ndimn[k] : 0) + nlag[k];
+      }
+      const unsigned total = off[N];
+
+      // Each rank's own two nearest, by the same rule the serial search below uses: strictly closer
+      // wins, so among equals the first one visited is kept.
+      std::vector<oomph::Node *> best1(N, NULL), best2(N, NULL);
+      std::vector<double> dd1(N, 1e40), dd2(N, 1e40);
+      for (unsigned k = 0; k < N; k++)
+      {
+        oomph::Vector<double> xnode = todo[k]->position();
+        for (oomph::Node *m : source_nodes)
+        {
+          oomph::Vector<double> xm = m->position();
+          double dist = 0;
+          for (unsigned di = 0; di < xm.size(); di++)
+            dist += (xnode[di] - xm[di]) * (xnode[di] - xm[di]);
+          if (dist < dd1[k])
+          {
+            dd2[k] = dd1[k];
+            best2[k] = best1[k];
+            dd1[k] = dist;
+            best1[k] = m;
+          }
+          else if (dist < dd2[k])
+          {
+            dd2[k] = dist;
+            best2[k] = m;
+          }
+        }
+      }
+
+      // Two MINLOC rounds. The globally nearest node is somebody's local nearest; the globally
+      // second nearest is then either the winner's local second or another rank's local nearest, so
+      // offering exactly that in the second round is enough. MINLOC breaks a tie by the lower rank,
+      // which is what makes the winner unique.
+      struct DistRank { double v; int r; };
+      std::vector<DistRank> cand(N), win1(N), win2(N);
+      for (unsigned k = 0; k < N; k++) { cand[k].v = dd1[k]; cand[k].r = myrank; }
+      if (N)
+        MPI_Allreduce(&cand[0], &win1[0], (int)N, MPI_DOUBLE_INT, MPI_MINLOC, mc);
+      for (unsigned k = 0; k < N; k++)
+      {
+        cand[k].v = (win1[k].r == myrank ? dd2[k] : dd1[k]);
+        cand[k].r = myrank;
+      }
+      if (N)
+        MPI_Allreduce(&cand[0], &win2[0], (int)N, MPI_DOUBLE_INT, MPI_MINLOC, mc);
+
+      std::vector<double> buf(2 * total, 0.0);
+      for (unsigned k = 0; k < N; k++)
+      {
+        for (unsigned w = 0; w < 2; w++)
+        {
+          const int winner = (w == 0 ? win1[k].r : win2[k].r);
+          const double wd = (w == 0 ? win1[k].v : win2[k].v);
+          if (winner != myrank || wd > 1e39)
+            continue;
+          oomph::Node *m = (w == 0 ? best1[k] : (win1[k].r == myrank ? best2[k] : best1[k]));
+          if (!m)
+            continue;
+          auto *mb = dynamic_cast<oomph::BoundaryNodeBase *>(m);
+          pyoomph::Node *mp = static_cast<pyoomph::Node *>(m);
+          const unsigned mts = m->time_stepper_pt()->ntstorage();
+          const unsigned mpts = m->position_time_stepper_pt()->ntstorage();
+          double *pw = &buf[w * total + off[k]];
+          unsigned q = 0;
+          pw[q++] = 1.0;
+          pw[q++] = (mb ? 1.0 : 0.0);
+          pw[q++] = (double)mp->nlagrangian();
+          for (unsigned t = 0; t < ntst[k]; t++)
+            for (unsigned vi = 0; vi < nfm; vi++, q++)
+              if (field_map[vi] >= 0 && (unsigned)field_map[vi] < m->nvalue() && t < mts)
+                pw[q] = m->value(t, field_map[vi]);
+          for (auto interfield : inter_field_map)
+          {
+            const int src_i = (mb ? mb->index_of_first_value_assigned_by_face_element(interfield.second) : -1);
+            pw[q++] = (src_i >= 0 ? 1.0 : 0.0);
+            for (unsigned t = 0; t < ntst[k]; t++, q++)
+              if (src_i >= 0 && t < mts)
+                pw[q] = m->value(t, src_i);
+          }
+          for (unsigned t = 1; t < post[k]; t++)
+            for (unsigned i = 0; i < ndimn[k]; i++, q++)
+              if (t < mpts && i < m->ndim())
+                pw[q] = m->x(t, i);
+          for (unsigned i = 0; i < nlag[k]; i++, q++)
+            if (i < mp->nlagrangian())
+              pw[q] = mp->lagrangian_position(i);
+        }
+      }
+      if (!buf.empty())
+        MPI_Allreduce(MPI_IN_PLACE, &buf[0], (int)buf.size(), MPI_DOUBLE, MPI_SUM, mc);
+
+      for (unsigned k = 0; k < N; k++)
+      {
+        if (buf[off[k]] <= 0.0)
+          continue; // no rank holds a single source node: the node stays unset, as it did serially
+        const unsigned stride = off[k + 1] - off[k];
+        std::vector<double> pk(2 * stride, 0.0);
+        std::copy(buf.begin() + off[k], buf.begin() + off[k + 1], pk.begin());
+        double m1 = sqrt(win1[k].v), m2;
+        if (buf[total + off[k]] > 0.0)
+        {
+          std::copy(buf.begin() + total + off[k], buf.begin() + total + off[k + 1], pk.begin() + stride);
+          m2 = sqrt(win2[k].v);
+        }
+        else
+        {
+          // Exactly one source node in the whole (distributed) old mesh - the serial code's
+          // bestnode2 = bestnode.
+          std::copy(pk.begin(), pk.begin() + stride, pk.begin() + stride);
+          m2 = m1;
+        }
+        global_lambda[todo[k]] = std::make_pair(m1 > 1e-20 ? m2 / (m1 + m2) : 1.0,
+                                                m1 > 1e-20 ? m1 / (m1 + m2) : 0.0);
+        global_blend[todo[k]] = pk;
+      }
+    }
+#endif
+
     for (oomph::Node *n : missing_nodes)
     {
       if (completed_nodes.count(n))
@@ -4531,6 +4718,59 @@ namespace pyoomph
       // These are the nodes no element of the old mesh contains, which for a COALESCENCE is exactly
       // the fresh bridge: it is built where there was no liquid at all, so it cannot be located and
       // the located-node branch above never sees it. All they can get is the blend below.
+
+      // Distributed source: the two nearest source nodes were found globally above, and what is
+      // applied here is the winners' data rather than this rank's local best guess. Same arithmetic
+      // as the serial branch below, read out of the pooled buffer instead of off two node pointers.
+      if (shared_across_ranks)
+      {
+        auto gb = global_blend.find(n);
+        if (gb == global_blend.end())
+        {
+          oomph::Vector<double> xn = n->position();
+          unset_positions.push_back(std::vector<double>(xn.begin(), xn.end()));
+          continue;
+        }
+        const unsigned stride = gb->second.size() / 2;
+        const double *P1 = &gb->second[0];
+        const double *P2 = &gb->second[stride];
+        const double l1 = global_lambda[n].first, l2 = global_lambda[n].second;
+        const unsigned nts = n->time_stepper_pt()->ntstorage();
+        const unsigned pts = n->position_time_stepper_pt()->ntstorage();
+        const unsigned nd = n->ndim(), nl = static_cast<pyoomph::Node *>(n)->nlagrangian();
+        auto *nb = dynamic_cast<oomph::BoundaryNodeBase *>(n);
+        const bool both_boundary = (nb && P1[1] > 0.0 && P2[1] > 0.0);
+        unsigned q = 3;
+        for (unsigned t = 0; t < nts; t++)
+          for (unsigned vi = 0; vi < field_map.size(); vi++, q++)
+            if (!only_interface_fields && field_map[vi] >= 0 && vi < n->nvalue())
+              n->set_value(t, vi, P1[q] * l1 + P2[q] * l2);
+        for (auto interfield : inter_field_map)
+        {
+          const bool valid = (both_boundary && P1[q] > 0.0 && P2[q] > 0.0);
+          q++;
+          const int dest_i = (valid ? nb->index_of_first_value_assigned_by_face_element(interfield.first) : -1);
+          for (unsigned t = 0; t < nts; t++, q++)
+            if (dest_i >= 0)
+              n->set_value(t, dest_i, P1[q] * l1 + P2[q] * l2);
+        }
+        for (unsigned t = 1; t < pts; t++)
+          for (unsigned i = 0; i < nd; i++, q++)
+            if (!only_interface_fields)
+              n->x(t, i) = P1[q] * l1 + P2[q] * l2;
+        if (this->interpolated_lagrangian_coordinates_at_remeshing && !only_interface_fields && nl)
+        {
+          if ((unsigned)P1[2] != nl || (unsigned)P2[2] != nl)
+          {
+            throw_runtime_error("Cannot interpolate Lagrangian coordinates if the number of Lagrangian nodes is different");
+          }
+          for (unsigned i = 0; i < nl; i++)
+            static_cast<pyoomph::Node *>(n)->xi(i) = P1[q + i] * l1 + P2[q + i] * l2;
+        }
+        completed_nodes.insert(n);
+        continue;
+      }
+
       double mindist = 1e40;
       oomph::Node *bestnode = NULL;
       for (oomph::Node *m : source_nodes)

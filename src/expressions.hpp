@@ -26,6 +26,7 @@ The main author may be contacted at c.diddens@utwente.nl
 #include "pyginacstruct.hpp"
 #include <vector>
 #include <map>
+#include <set>
 #include "exception.hpp"
 #include <complex>
 
@@ -473,6 +474,74 @@ namespace pyoomph
     GiNaC::ex diff(const GiNaC::ex &what, const GiNaC::ex &wrto); // Symbolic differentiation that additionally understands pyoomph's placeholder functions (fields, test functions, ...), unlike plain GiNaC::diff
     bool collect_base_units(GiNaC::ex arg, GiNaC::ex &factor, GiNaC::ex &units, GiNaC::ex &rest); // Splits arg into a numeric factor, a product of base units, and a dimensionless remainder; returns false if arg is not unit-consistent
 
+    // Replaces already-analysed subexpression() markers by placeholder symbols, so that the unit
+    // analysis of an enclosing marker sees one leaf where a whole nested subtree stands.
+    //
+    // Why this is needed: DrawUnitsOutOfSubexpressions works strictly bottom-up, so by the time it
+    // analyses a marker's argument every nested marker in it has already been rewritten to
+    // factor*unit*subexpression(rest) with "rest" proven free of base units (the tail check of
+    // collect_base_units). collect_base_units nevertheless walks into all of them again - its opening
+    // collect_common_factors(expand(arg)) alone runs GiNaC's to_polynomial/replace_with_symbol over the
+    // full subtree of every function node, and contains_base_unit() traverses it twice more. Since a
+    // residual's markers form a DAG, doing that once per nesting level is exponential in the depth: a
+    // synthetic fan-out-2 chain went 0.4 s (depth 4), 5 s (5), 61 s (6) per contribution.
+    //
+    // Why it is semantics-preserving: collect_common_factors already treats every function node as an
+    // opaque temporary symbol internally, and a masked marker is dimensionless by construction, so the
+    // split it computes is the same one it would have computed on the unmasked argument. Masking only
+    // replaces GiNaC's per-call temporary by a stable symbol we own - and unmasking splices the
+    // already-built marker ex objects back in by pointer, rather than rebuilding their interiors.
+    //
+    // Only markers explicitly handed to allow() are masked, i.e. only the ones this pass emitted itself
+    // and therefore knows to be dimensionless. Everything else stays visible to the analysis.
+    class SubexpressionMasker
+    {
+    protected:
+      std::set<GiNaC::ex, GiNaC::ex_is_less> maskable; // markers proven dimensionless by this pass
+      GiNaC::exmap to_mask;                            // marker node -> placeholder symbol
+      GiNaC::exmap from_mask;                          // placeholder symbol -> marker node
+      unsigned long counter = 0;
+
+      // Both mappers memoise. An expression is a DAG and GiNaC::ex::map is a tree operation, so an
+      // unmemoised mapper would reintroduce exactly the blowup this class exists to remove.
+      class Masker : public GiNaC::map_function
+      {
+      protected:
+        SubexpressionMasker *owner;
+        GiNaC::exmap cache;
+
+      public:
+        Masker(SubexpressionMasker *o) : owner(o) {}
+        GiNaC::ex operator()(const GiNaC::ex &inp) override;
+      };
+      class Unmasker : public GiNaC::map_function
+      {
+      protected:
+        SubexpressionMasker *owner;
+        GiNaC::exmap cache;
+
+      public:
+        Unmasker(SubexpressionMasker *o) : owner(o) {}
+        GiNaC::ex operator()(const GiNaC::ex &inp) override;
+      };
+      Masker masker;
+      Unmasker unmasker;
+      friend class Masker;
+      friend class Unmasker;
+
+      GiNaC::ex get_placeholder(const GiNaC::ex &marker); // lazily creates one placeholder per marker
+
+    public:
+      SubexpressionMasker() : masker(this), unmasker(this) {}
+      void allow(const GiNaC::ex &marker) { maskable.insert(marker); }
+      bool is_allowed(const GiNaC::ex &marker) const { return maskable.count(marker) > 0; }
+      GiNaC::ex mask(const GiNaC::ex &inp) { return masker(inp); }
+      GiNaC::ex unmask(const GiNaC::ex &inp) { return unmasker(inp); }
+      unsigned long n_masked() const { return (unsigned long)from_mask.size(); }
+      // placeholder -> marker, for passes that want to visit every marker interior exactly once
+      const GiNaC::exmap &get_masked_markers() const { return from_mask; }
+    };
+
     // Substitutes field()/nondimfield() placeholders and global parameters occurring in arg by concrete expressions (used e.g. to numerically evaluate an expression by "calling" it with concrete field values)
     GiNaC::ex subs_fields(const GiNaC::ex &arg, const std::map<std::string, GiNaC::ex> &fields, const std::map<std::string, GiNaC::ex> &nondimfields, const std::map<std::string, GiNaC::ex> &globalparams);
 
@@ -549,6 +618,30 @@ namespace pyoomph
     DECLARE_FUNCTION_4P(unitvect) // Unit basis vector in a given direction/coordinate system
 
     DECLARE_FUNCTION_1P(subexpression) // Wraps an expression so it is factored out as a named local subexpression in the generated code instead of being inlined everywhere it is used
+
+    // RAII switch that memoises the derivative of a subexpression() marker for the duration of ONE
+    // symbolic differentiation pass.
+    //
+    // subexpression_expl_deriv() is `subexpression(wrapped.diff(deriv_arg))`, and GiNaC::diff is not
+    // memoised: a marker reachable by k paths through the residual DAG is differentiated k times, and
+    // every one of those rebuilds re-fires the evaluating subexpression() on the way out. That is the
+    // dominant cost of write_code on a deeply nested model.
+    //
+    // The derivative is NOT a function of (marker, symbol) alone - ShapeExpansion::derivative reads
+    // the ambient codegen flags (__deriv_subexpression_wrto, __derive_only_by_expansion_mode,
+    // __ignore_dpsi_coord_diffs_in_jacobian, __in_hessian, __in_pitchfork_symmetry_constraint) - so
+    // the cache may not outlive one flag configuration. Hence the scope: there is no cache at all
+    // unless one of these is alive, and it is discarded when it ends. Nest them freely; an inner
+    // scope gets its own table and restores the outer one.
+    class SubexpressionDerivativeCacheScope
+    {
+      void *prev;
+    public:
+      SubexpressionDerivativeCacheScope();
+      ~SubexpressionDerivativeCacheScope();
+      SubexpressionDerivativeCacheScope(const SubexpressionDerivativeCacheScope &) = delete;
+      SubexpressionDerivativeCacheScope &operator=(const SubexpressionDerivativeCacheScope &) = delete;
+    };
 
     DECLARE_FUNCTION_1P(get_real_part) // Real part of a (possibly complex-valued) expression
     DECLARE_FUNCTION_1P(get_imag_part) // Imaginary part of a (possibly complex-valued) expression
