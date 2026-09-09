@@ -9163,7 +9163,12 @@ class Problem(_pyoomph.Problem):
                     ndouttimes = numpy.linspace(float(soffs / TS), float(endout / TS), num=numouts + 1) #type:ignore
                 else:
                     dtout=outstep
-                    numouts=int(float((endtime - starttime)/dtout))
+                    # At least one interval. int() truncates, so a span of exactly one outstep - or of
+                    # slightly less than one after the usual floating-point shortfall - gave numouts=0,
+                    # and the outcntvalue line below then divided by it. A run() over a single output
+                    # interval is a perfectly ordinary call (stepping out in chunks and recording
+                    # between them), so it must not raise ZeroDivisionError.
+                    numouts=max(1,int(float((endtime - starttime)/dtout)))
                     # Absolute multiples of dtout, not a linspace anchored at the current time. That is
                     # what outstep_relative_to_zero means, and it makes the grid independent of where a
                     # run was resumed: since the time steps are clamped onto this grid, a linspace from
