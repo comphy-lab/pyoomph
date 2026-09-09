@@ -451,6 +451,7 @@ if(PYOOMPH_GENERATE_STUBS)
     COMMAND "${Python_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/cmake/generate_stubs.py"
             --module-dir "$<TARGET_FILE_DIR:_pyoomph_core>"
             --module-name "_pyoomph_core"
+            --expect-file "$<TARGET_FILE:_pyoomph_core>"
             --stage-dir "${PYOOMPH_STUB_STAGE_DIR}"
             --patch-script "${CMAKE_SOURCE_DIR}/src/nanobind/patch_stubs.py"
             --python "${Python_EXECUTABLE}"
