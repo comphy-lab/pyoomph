@@ -26,7 +26,7 @@ The current development version (**might be unstable**) is hosted at
 
 .. code:: bash
 
-      git clone https://www.github.com/ciddens/pyoomph.git 
+      git clone https://www.github.com/cdiddens/pyoomph.git 
    
 
 Before building it, a bunch of additional software has to be installed. For Mac, there is e.g. homebrew (https://brew.sh), which easily manages these additional packages. Hence, install homebrew by pasting the installation command from https://brew.sh.
