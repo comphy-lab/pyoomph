@@ -2832,8 +2832,18 @@ class Problem(_pyoomph.Problem):
                 has_arclength_data=True
                 _actual_dofs,_positional_dofs,pinned_values=self._get_all_values_at_current_time(True)            
                 dof_current=self.get_arclength_dof_current_vector()
+                # Slot 5 carries d(dof)/ds, whose pinned entries are zero (a pinned value does not move
+                # along the branch unless it is written from the continuation parameter itself).
+                # Slot 6 carries dof_current, i.e. VALUES, so its pinned entries must be the actual
+                # pinned values, not zeros. Zeroing them corrupted every node the adaptation creates
+                # next to a pinned one: the new node's slot-6 value is interpolated with the father
+                # element's shape functions, so it came out short by (shape weight)*(pinned value),
+                # and oomph-lib then reset the dofs to that in arc_length_step_solve_helper. On a
+                # moving mesh this teleports mesh_y next to a pinned wall by 3/8 of the wall position,
+                # folds the elements there, and the continuation sees inf/NaN residuals it cannot
+                # recover from by shrinking ds.
                 self.set_current_pinned_values(0*pinned_values,True,5)
-                self.set_current_pinned_values(0*pinned_values,True,6)
+                self.set_current_pinned_values(pinned_values,True,6)
                 if len(dof_deriv)>len(_actual_dofs):
                     # Strip the bifurcation tracker part... There is nothing you can do here
                     dof_deriv=dof_deriv[:len(_actual_dofs)]
@@ -9153,7 +9163,12 @@ class Problem(_pyoomph.Problem):
                     ndouttimes = numpy.linspace(float(soffs / TS), float(endout / TS), num=numouts + 1) #type:ignore
                 else:
                     dtout=outstep
-                    numouts=int(float((endtime - starttime)/dtout))
+                    # At least one interval. int() truncates, so a span of exactly one outstep - or of
+                    # slightly less than one after the usual floating-point shortfall - gave numouts=0,
+                    # and the outcntvalue line below then divided by it. A run() over a single output
+                    # interval is a perfectly ordinary call (stepping out in chunks and recording
+                    # between them), so it must not raise ZeroDivisionError.
+                    numouts=max(1,int(float((endtime - starttime)/dtout)))
                     # Absolute multiples of dtout, not a linspace anchored at the current time. That is
                     # what outstep_relative_to_zero means, and it makes the grid independent of where a
                     # run was resumed: since the time steps are clamped onto this grid, a linspace from
@@ -10014,8 +10029,10 @@ Patrick E. Farrell, Ásgeir Birkisson & Simon W. Funke, https://arxiv.org/pdf/14
                 dof_current=self.get_arclength_dof_current_vector()
                 # Store the arclength in the history
                 _actual_dofs,_positional_dofs,pinned_values=self._get_all_values_at_current_time(True)            
+                # Zeros for the derivative in slot 5, the real pinned values for the values in slot 6 -
+                # see the same pair in _adapt_with_interfacial_errors for what zeroing slot 6 costs.
                 self.set_current_pinned_values(0*pinned_values,True,5)
-                self.set_current_pinned_values(0*pinned_values,True,6)
+                self.set_current_pinned_values(pinned_values,True,6)
                 self.set_history_dofs(5,dof_deriv)
                 self.set_history_dofs(6,dof_current)
                 has_continuation_data=True
