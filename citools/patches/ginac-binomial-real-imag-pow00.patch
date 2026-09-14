@@ -1,0 +1,55 @@
+Stop GiNaC::power::real_part()/imag_part() from raising "pow(0,0) is undefined" on an integer power
+whose basis has a zero real or a zero imaginary part.
+
+Both build Re/Im of (a+I*b)^N from the binomial expansion and write each term as
+binomial(NN,n) * pow(a, NN-n) * pow(b, n). A binomial expansion needs the 0^0 == 1 convention for
+its end terms, and GiNaC's pow() refuses: pow(0,0) throws. So (I*x)^2, whose expansion contains the
+factor a^0 with a == Re(I*x) == 0, aborts code generation with a ValueError that says nothing about
+where it came from. Every terminating case is unchanged: pow(x,0) is 1 for every x for which the
+old code did not throw.
+
+pyoomph reaches it from the azimuthal real/imaginary split. subexpression() now reports the real and
+imaginary parts of a marker whose content is provably real (that is what keeps the split from
+multiplying products out, see dev_docs/subexpression_unit_analysis_stall.md), so mul::find_real_imag
+can now conclude that the real part of a factor is exactly zero, where before it produced a held
+real_part() node that was never zero. The GiNaC bug is independent of pyoomph - "ex e = pow(I*x, 2);
+e.real_part();" reproduces it - and is what to send upstream.
+
+--- a/ginac/power.cpp
++++ b/ginac/power.cpp
+@@ -662,6 +662,17 @@
+ 	return conjugate_function(*this).hold();
+ }
+ 
++// x^n for one factor of a binomial expansion, with the 0^0 == 1 convention that such an expansion
++// requires. GiNaC's pow() throws "power::eval(): pow(0,0) is undefined" instead, which makes
++// real_part()/imag_part() of an integer power abort whenever the basis has a zero real OR a zero
++// imaginary part - e.g. (I*x)^2, whose expansion contains a term with the factor a^0 = 0^0.
++static ex binomial_expansion_pow(const ex & x, long n)
++{
++	if (n == 0)
++		return _ex1;
++	return pow(x, n);
++}
++
+ ex power::real_part() const
+ {
+ 	// basis == a+I*b, exponent == c+I*d
+@@ -683,7 +694,7 @@
+ 		ex numer = N > 0 ? _ex1 : pow(pow(a,2) + pow(b,2), NN);
+ 		ex result = 0;
+ 		for (long n = 0; n <= NN; n += 2) {
+-			ex term = binomial(NN, n) * pow(a, NN-n) * pow(b, n) / numer;
++			ex term = binomial(NN, n) * binomial_expansion_pow(a, NN-n) * binomial_expansion_pow(b, n) / numer;
+ 			if (n % 4 == 0) {
+ 				result += term;  // sign: I^n w/ n == 4*m
+ 			} else {
+@@ -720,7 +731,7 @@
+ 		ex numer = N > 0 ? _ex1 : pow(pow(a,2) + pow(b,2), NN);
+ 		ex result = 0;
+ 		for (long n = 1; n <= NN; n += 2) {
+-			ex term = binomial(NN, n) * pow(a, NN-n) * pow(b, n) / numer;
++			ex term = binomial(NN, n) * binomial_expansion_pow(a, NN-n) * binomial_expansion_pow(b, n) / numer;
+ 			if (n % 4 == p) {
+ 				result += term;  // sign: I^n w/ n == 4*m+p
+ 			} else {

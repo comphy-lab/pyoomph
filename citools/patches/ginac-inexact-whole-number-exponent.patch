@@ -1,0 +1,78 @@
+Make GiNaC::power::real_part()/imag_part() use their integer-binomial branch for an INEXACT
+whole-number exponent too, instead of falling through to the polar form.
+
+Both decide whether the (exact, rational) binomial expansion of Re/Im of (a+I*b)^N applies by asking
+exponent.info(integer). An inexact 2.0 does not satisfy that even though the expansion is just as
+valid for it, so they take the general branch
+
+    |X|^c * exp(-d*atan2(b,a)) * cos(c*atan2(b,a) + d*log|X|)
+
+which is mathematically right and useless to a caller that must not have the basis appear inside a
+transcendental function. In pyoomph it is the dimensional analysis of a residual that then fails:
+the basis is a mass density, atan2 hides its units from collect_base_units(), and code generation
+aborts with "The added residual contribution is not dimensionless. It still carries the base units:
+kilogram, meter". The exponent reached that state through a cache that compared the exact -2 to a
+stored -2.0 - GiNaC hashes and compares numbers by value, and ex::compare() then unifies the two by
+pointer, rewriting the power in place.
+
+That cache is fixed in pyoomph, and keeping numbers exact is where the problem belongs. This is the
+backstop for the whole class: an exponent that is an integer VALUE is treated as the integer it is,
+by redoing the call with the exact number. Nothing else changes - every case that already took the
+binomial branch had an exact exponent and is untouched.
+
+This patch applies on top of ginac-binomial-real-imag-pow00.patch (it shares its context) and is
+worth sending upstream together with it.
+
+--- a/ginac/power.cpp
++++ b/ginac/power.cpp
+@@ -673,8 +673,38 @@
+ 	return pow(x, n);
+ }
+ 
++// An exponent that is an inexact numeric happening to be a whole number - 2.0 rather than 2 - as
++// the exact integer it is, or the expression unchanged if it is not one. real_part() and
++// imag_part() below decide whether they may use the (exact, real) integer-binomial expansion by
++// asking exponent.info(integer), which an inexact 2.0 does not satisfy even though the expansion is
++// just as valid for it. They then fall through to the general polar form
++// |X|^c*exp(-d*atan2(b,a))*cos(c*atan2(b,a)+d*log|X|), which is correct but useless to any caller
++// that has to keep the result free of transcendental functions of the basis - in pyoomph, the
++// dimensional analysis of a residual, which cannot separate the units of a basis that has landed
++// inside an atan2. Numbers should of course be kept exact in the first place; this is the backstop.
++static ex exact_whole_number_exponent(const ex & e)
++{
++	if (!is_exactly_a<numeric>(e))
++		return e;
++	const numeric & n = ex_to<numeric>(e);
++	if (n.is_crational() || !n.is_real())
++		return e;
++	const double d = n.to_double();
++	if (d > 1e15 || d < -1e15)
++		return e;
++	const long l = (long)d;
++	if ((double)l != d)
++		return e;
++	return numeric(l);
++}
++
+ ex power::real_part() const
+ {
++	{
++		const ex xexponent = exact_whole_number_exponent(exponent);
++		if (!are_ex_trivially_equal(xexponent, exponent))
++			return pow(basis, xexponent).real_part();
++	}
+ 	// basis == a+I*b, exponent == c+I*d
+ 	const ex a = basis.real_part();
+ 	const ex c = exponent.real_part();
+@@ -711,6 +741,11 @@
+ 
+ ex power::imag_part() const
+ {
++	{
++		const ex xexponent = exact_whole_number_exponent(exponent);
++		if (!are_ex_trivially_equal(xexponent, exponent))
++			return pow(basis, xexponent).imag_part();
++	}
+ 	// basis == a+I*b, exponent == c+I*d
+ 	const ex a = basis.real_part();
+ 	const ex c = exponent.real_part();
