@@ -463,6 +463,66 @@ namespace pyoomph
 			return false;
 		}
 
+		// See the class comment in expressions.hpp. One placeholder per distinct marker, created only
+		// when the marker is actually met inside something being masked - a plain symbol, deliberately
+		// not a possymbol and never registered in base_units, so collect_base_units() files it under
+		// "rest" like any other unknown symbol.
+		GiNaC::ex SubexpressionMasker::get_placeholder(const GiNaC::ex &marker)
+		{
+			GiNaC::exmap::const_iterator found = to_mask.find(marker);
+			if (found != to_mask.end())
+				return found->second;
+			GiNaC::ex ph = GiNaC::symbol("__semask" + std::to_string(counter++));
+			to_mask[marker] = ph;
+			from_mask[ph] = marker;
+			return ph;
+		}
+
+		GiNaC::ex SubexpressionMasker::Masker::operator()(const GiNaC::ex &inp)
+		{
+			// Numbers are never cached: GiNaC compares and hashes them by value, so an exact -1 and an
+			// inexact -1.0 would share a key here (same reasoning as ReplaceFieldsToNonDimFields).
+			if (GiNaC::is_a<GiNaC::numeric>(inp))
+				return inp;
+			if (is_ex_the_function(inp, subexpression) && owner->is_allowed(inp))
+				return owner->get_placeholder(inp); // an atom from here on - never descend into it
+			GiNaC::exmap::const_iterator cached = cache.find(inp);
+			if (cached != cache.end())
+				return cached->second;
+			GiNaC::ex res = inp.map(*this);
+			cache[inp] = res;
+			return res;
+		}
+
+		GiNaC::ex SubexpressionMasker::Unmasker::operator()(const GiNaC::ex &inp)
+		{
+			if (GiNaC::is_a<GiNaC::numeric>(inp))
+				return inp;
+			if (GiNaC::is_a<GiNaC::symbol>(inp))
+			{
+				GiNaC::exmap::const_iterator found = owner->from_mask.find(inp);
+				if (found != owner->from_mask.end())
+					return found->second; // the original marker ex, spliced back in by pointer
+				return inp;
+			}
+			GiNaC::exmap::const_iterator cached = cache.find(inp);
+			if (cached != cache.end())
+				return cached->second;
+			GiNaC::ex res = inp.map(*this);
+			cache[inp] = res;
+			return res;
+		}
+
+		// Set while collect_base_units is inside an expression whose size tripped the
+		// collect_common_factors gate below; see the comment there.
+		static thread_local bool __cbu_skip_ccf = false;
+		struct CollectCommonFactorsSkipScope
+		{
+			bool prev;
+			CollectCommonFactorsSkipScope(bool v) : prev(__cbu_skip_ccf) { __cbu_skip_ccf = __cbu_skip_ccf || v; }
+			~CollectCommonFactorsSkipScope() { __cbu_skip_ccf = prev; }
+		};
+
 		bool collect_base_units(GiNaC::ex arg, GiNaC::ex &factor, GiNaC::ex &units, GiNaC::ex &rest)
 		{
 			if (pyoomph_verbose)
@@ -472,7 +532,35 @@ namespace pyoomph
 			rest = 1;
 			factor = 1;
 			units = 1;
-			GiNaC::ex cl = GiNaC::collect_common_factors(GiNaC::expand(arg));
+			// collect_common_factors() is not needed for the analysis - the add branch below handles a
+			// sum term by term and insists that the terms agree on their unit, and the common-factor
+			// collection only changes WHICH factor gets hoisted; arg == factor*unit*rest holds either
+			// way. It is, however, superlinear in the number of terms (find_common_factor ->
+			// to_polynomial -> replace_with_symbol scans its repl vector linearly, and
+			// power::to_polynomial re-enters collect_common_factors for every negative-power basis).
+			// Measured on marker-atom sums: about M^1.4 for M terms in isolation, and the evaporating
+			// droplet's azimuthal mass-transfer residual reaches a 14806-term sum on which it did not
+			// return within sixteen minutes. So it is skipped above a term count;
+			// PYOOMPH_UNIT_CCF_MAX_TERMS moves the threshold. Below it nothing changes, which is what
+			// keeps the generated code of everything that used to work byte-identical - see
+			// dev_docs/subexpression_unit_analysis_stall.md.
+			static const unsigned ccf_max_terms = (getenv("PYOOMPH_UNIT_CCF_MAX_TERMS") ? (unsigned)atoi(getenv("PYOOMPH_UNIT_CCF_MAX_TERMS")) : 2000);
+			GiNaC::ex ex_arg = GiNaC::expand(arg);
+			// Once tripped, the decision holds for the WHOLE subtree, not just for this node. The add
+			// branch below recurses per term, and it is those per-term calls - one collect_common_factors
+			// on each of 14806 products of 10-14 atoms, each of which reaches gcd/find_common_factor -
+			// that the droplet actually spends its minutes in (gdb, frames
+			// collect_base_units:546 <- collect_base_units:616). Gating only the sum itself changes
+			// nothing measurable.
+			const bool skip_ccf = __cbu_skip_ccf || (GiNaC::is_exactly_a<GiNaC::add>(ex_arg) && ex_arg.nops() > ccf_max_terms);
+			// Under PYOOMPH_TIME_ADD_RESIDUAL the outermost skip is announced, so that a sweep with the
+			// threshold lowered reports how close the models one cares about get to it.
+			static const bool report_skips = getenv("PYOOMPH_TIME_ADD_RESIDUAL") != NULL;
+			if (skip_ccf && !__cbu_skip_ccf && report_skips)
+				std::cerr << "[add_residual]   ph:units ccf skipped, add with " << ex_arg.nops()
+						  << " terms (limit " << ccf_max_terms << ")" << std::endl;
+			CollectCommonFactorsSkipScope __ccf_scope(skip_ccf);
+			GiNaC::ex cl = (skip_ccf ? ex_arg : GiNaC::collect_common_factors(ex_arg));
 			// GiNaC::ex cl=GiNaC::expand(arg);
 			//  std::cout << "CL "  << cl <<  std::endl;
 			//  std::cout << "NOPS "  << cl.nops() <<  std::endl;
@@ -566,12 +654,17 @@ namespace pyoomph
 					units *= common_unit;
 					units=GiNaC::expand(units);
 					factor *= dominant_factor;
-					GiNaC::ex normalized_rest = 0;
+					// Collected into a vector and summed once. Accumulating with "+=" builds a new
+					// expairseq of length i at step i, i.e. it is quadratic in the number of terms -
+					// which is what a 14806-term marker argument in an azimuthally expanded
+					// mass-transfer residual spends minutes on.
+					GiNaC::exvector normalized_terms;
+					normalized_terms.reserve(cl.nops());
 					for (unsigned int i = 0; i < cl.nops(); i++)
 					{
-						normalized_rest += (factors[i] / dominant_factor) * terms[i];
+						normalized_terms.push_back((factors[i] / dominant_factor) * terms[i]);
 					}
-					rest *= normalized_rest;
+					rest *= GiNaC::add(normalized_terms);
 				}
 				else if (is_ex_the_function(cl, subexpression))
 				{
@@ -2146,6 +2239,62 @@ namespace pyoomph
 				return subexpression(wrapped).hold();
 		}
 
+		// Whether the expression a subexpression() wraps is provably real, memoised.
+		//
+		// This is what stops the azimuthal real/imaginary split from multiplying products out. The split
+		// (SubExpressionsToRealAndImag below) rewrites each complex marker into
+		// subexpression(real_part(m)) + I*subexpression(imag_part(m)), so its markers are real BY
+		// CONSTRUCTION - but GiNaC could not see that, because a function without a real_part_func falls
+		// back to basic::real_part, i.e. real_part_function(marker).hold(). mul::find_real_imag then
+		// treats every already-split factor as fully complex and finishes with rp.expand()/ip.expand(),
+		// which turns a product of n split factors into 2*4^(n-1) terms inside the next marker's
+		// argument. Measured: n=7 -> 8192 terms, n=8 -> 32768, and the evaporating droplet's
+		// mass-transfer residual reached 14806, on which the unit analysis did not return within
+		// sixteen minutes.
+		//
+		// Answering "is it real" makes that product 2^(n-1) terms instead: each factor's real and
+		// imaginary parts become single markers rather than held real_part()/imag_part() pairs. GiNaC's
+		// own real_part_function already reports imag_part == 0, so the property propagates up the
+		// nesting by induction and every level of the split stays short.
+		//
+		// The memo is not optional: the question is answered per marker, the answer is computed by
+		// asking the same question of every nested marker, and the argument is a DAG - so without it the
+		// query is exponential in the nesting depth, which is the defect this is fixing.
+		// PYOOMPH_DISABLE_REIM_FOLD=1 restores the old, unknowing behaviour and is the A/B lever.
+		static const bool __reim_fold_on = getenv("PYOOMPH_DISABLE_REIM_FOLD") == NULL;
+
+		static bool subexpression_wrapped_is_real(const ex &wrapped)
+		{
+			static thread_local std::unordered_map<unsigned, std::vector<std::pair<GiNaC::ex, bool>>> memo;
+			const unsigned h = wrapped.gethash();
+			{
+				auto it = memo.find(h);
+				if (it != memo.end())
+					for (auto &e : it->second)
+						if (e.first.is_equal(wrapped))
+							return e.second;
+			}
+			// May recurse into this function for nested markers; the table is looked up again afterwards
+			// because that recursion can have rehashed it.
+			const bool res = wrapped.imag_part().is_zero();
+			memo[h].push_back(std::make_pair(wrapped, res));
+			return res;
+		}
+
+		static ex subexpression_real_part(const ex &wrapped)
+		{
+			if (__reim_fold_on && subexpression_wrapped_is_real(wrapped))
+				return subexpression(wrapped);
+			return GiNaC::real_part_function(subexpression(wrapped)).hold();
+		}
+
+		static ex subexpression_imag_part(const ex &wrapped)
+		{
+			if (__reim_fold_on && subexpression_wrapped_is_real(wrapped))
+				return 0;
+			return GiNaC::imag_part_function(subexpression(wrapped)).hold();
+		}
+
 		// GiNaC's generic (implicit) derivative_func is disabled -- differentiating a subexpression() must always go through
 		// expl_derivative_func below (which recurses via wrapped.diff() and re-wraps the result), never via GiNaC's default chain-rule machinery
 		static ex subexpression_deriv(const ex &, unsigned)
@@ -2153,12 +2302,53 @@ namespace pyoomph
 			throw_runtime_error("Cannot derive a subexpression");
 		}
 
+		// Memo table of SubexpressionDerivativeCacheScope (expressions.hpp), which is where the reasoning
+		// about its lifetime lives. Hash bucket confirmed by is_equal, the same idiom as
+		// ReplaceFieldsToNonDimFields; keyed on the pair (wrapped argument, differentiation symbol),
+		// since one pass differentiates by several symbols and markers of different codes hash alike.
+		struct SubexpressionDerivCache
+		{
+			struct Entry
+			{
+				GiNaC::ex wrapped, wrto, value;
+			};
+			std::unordered_map<unsigned, std::vector<Entry>> memo;
+		};
+		static thread_local SubexpressionDerivCache *__subexpr_deriv_cache = NULL;
+
 		static ex subexpression_expl_deriv(const ex &wrapped, const symbol &deriv_arg)
 		{
-			return subexpression(wrapped.diff(deriv_arg));
+			if (!__subexpr_deriv_cache)
+				return subexpression(wrapped.diff(deriv_arg));
+			const unsigned h = wrapped.gethash();
+			auto &bucket = __subexpr_deriv_cache->memo[h];
+			for (auto &e : bucket)
+				if (e.wrapped.is_equal(wrapped) && e.wrto.is_equal(deriv_arg))
+					return e.value;
+			ex res = subexpression(wrapped.diff(deriv_arg));
+			// Re-fetch: the recursive diff above can have inserted into the same table.
+			__subexpr_deriv_cache->memo[h].push_back(SubexpressionDerivCache::Entry{wrapped, deriv_arg, res});
+			return res;
 		}
 
-		REGISTER_FUNCTION(subexpression, eval_func(subexpression_eval).evalf_func(subexpression_evalf).derivative_func(subexpression_deriv).expl_derivative_func(subexpression_expl_deriv))
+		// A held subexpression() is always scalar: subexpression_eval above pushes a matrix argument down
+		// into its entries and only ever holds the scalar branch. Declaring that statically stops
+		// GiNaC::function::return_type() from walking the first-operand chain (through every mul factor and
+		// every nested marker) to rediscover it on each query - and subexpression_eval itself asks exactly
+		// that question of its argument. The dynamic answer is already commutative, so the canonical
+		// ordering of products is unchanged.
+		REGISTER_FUNCTION(subexpression, eval_func(subexpression_eval).evalf_func(subexpression_evalf).derivative_func(subexpression_deriv).expl_derivative_func(subexpression_expl_deriv).real_part_func(subexpression_real_part).imag_part_func(subexpression_imag_part).set_return_type(GiNaC::return_types::commutative))
+
+		SubexpressionDerivativeCacheScope::SubexpressionDerivativeCacheScope() : prev(__subexpr_deriv_cache)
+		{
+			__subexpr_deriv_cache = new SubexpressionDerivCache();
+		}
+
+		SubexpressionDerivativeCacheScope::~SubexpressionDerivativeCacheScope()
+		{
+			delete __subexpr_deriv_cache;
+			__subexpr_deriv_cache = static_cast<SubexpressionDerivCache *>(prev);
+		}
 
 		////////////////
 
@@ -2306,6 +2496,22 @@ namespace pyoomph
 		public:
 			GiNaC::ex operator()(const GiNaC::ex & inp) override
 			{
+				// A number is never looked up in, nor entered into, the cache - and the lookup is the
+				// dangerous half. GiNaC hashes and compares numbers by value, not by representation
+				// (numeric::calchash: "3 and 3.0 share the same hashvalue"), so an exact -2 and an
+				// inexact -2.0 are one and the same key here. Worse, ex::compare() *unifies* two ex's
+				// it finds equal by rebinding one's pointer to the other's (ex.h, ex::share), so a
+				// mere cache lookup of the exact -2 that is the exponent of a power rewrites that
+				// power to X^(-2.0) IN PLACE, and the cache then hands back the inexact number too.
+				// An inexact whole-number exponent is not cosmetic: power::real_part() takes its
+				// integer-binomial branch only for exponent.info(integer), which an inexact -2.0 is
+				// not, so it falls through to the polar form and puts the (dimensional) basis inside
+				// an atan2, where the unit analysis cannot separate the units - the evaporating
+				// droplet died in add_residual with "the added residual contribution is not
+				// dimensionless" on exactly this. Same reasoning as ReplaceFieldsToNonDimFields and
+				// SubexpressionMasker, both of which already refuse to cache a number.
+				if (GiNaC::is_a<GiNaC::numeric>(inp))
+					return inp;
 				GiNaC::exmap::const_iterator found = cache.find(inp);
 				if (found != cache.end())
 					return found->second;

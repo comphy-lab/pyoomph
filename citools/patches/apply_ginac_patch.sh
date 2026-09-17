@@ -19,13 +19,19 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # The first two fix the same class of bug (GiNaC hashing the ASLR-dependent
 # address of an RTTI type-name string instead of something deterministic) in
 # two different spots; the third stops power::to_polynomial() recursing
-# forever on a negative integer power of a power with a symbolic exponent.
+# forever on a negative integer power of a power with a symbolic exponent; the
+# fourth stops power::real_part()/imag_part() raising pow(0,0) on the end terms
+# of their binomial expansion; the fifth lets those two use that binomial branch
+# for an inexact whole-number exponent (2.0) as well, instead of falling through
+# to a polar form that buries the basis in an atan2.
 # See each patch's own header comment for the full rationale. Applied in
 # order; add further patches to this list as found.
 patches=(
     "ginac-deterministic-hash-seed.patch"
     "ginac-deterministic-constant-hash.patch"
     "ginac-to-polynomial-symbolic-exponent.patch"
+    "ginac-binomial-real-imag-pow00.patch"
+    "ginac-inexact-whole-number-exponent.patch"
 )
 
 for patch_name in "${patches[@]}"; do

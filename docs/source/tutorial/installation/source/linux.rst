@@ -13,7 +13,7 @@ The current development version (**might be unstable**) is hosted at
 
 .. code:: bash
 
-      git clone https://www.github.com/ciddens/pyoomph.git 
+      git clone https://www.github.com/cdiddens/pyoomph.git 
 
 
 Once you have cloned the repository with git, you first have to install a few packages. On a Debian/Ubuntu distribution, you have to do e.g.

@@ -36,7 +36,7 @@
 import pytest
 
 from pyoomph import ODEEquations, Problem, _pyoomph
-from pyoomph.expressions import heaviside, piecewise_geq0, var, var_and_test
+from pyoomph.expressions import heaviside, piecewise_geq0, subexpression, var, var_and_test
 from pyoomph.expressions.units import meter, micro, milli, second
 
 
@@ -168,3 +168,26 @@ def test_compiled_piecewise_agrees_on_a_vanishing_condition(tmp_path):
     assert values["u_pw"] == pytest.approx(3 * 1e-3, rel=1e-12)
     # heaviside is 1/2 at zero, both symbolically and in the generated code, so it interpolates
     assert values["u_hv"] == pytest.approx(0.5 * (3 * 1e-3 + 20 * 1e-6), rel=1e-12)
+
+
+def test_units_of_nested_subexpressions():
+    """A dimensional subexpression() whose interior is a chain of nested markers.
+
+    GiNaC_collect_units() is the public entry point of the same unit split that the code generator
+    drives through DrawUnitsOutOfSubexpressions, but it sees the markers unprocessed and without the
+    placeholder masking the generator applies internally (SubexpressionMasker, src/expressions.hpp).
+    So this pins the contract that the masking has to reproduce: every unit comes out to the top,
+    the marker nesting survives the split, and what stays inside is dimensionless.
+    """
+    x = var("x")
+    inner = subexpression(x * meter + 2 * meter)          # [meter]
+    middle = subexpression(inner * inner / meter)         # [meter], one level up
+    outer = subexpression(middle * inner * second / meter)  # [meter*second], two levels up
+
+    factor, unit, rest = _split(outer)
+    assert (unit - meter * second).is_zero(), "units left inside the marker: " + str(unit)
+    assert (factor - 8).is_zero(), str(factor)   # 2 from each of the three inner sums
+    # nothing dimensional is left inside, and the marker nesting is still there
+    _, rest_unit, _ = _split(rest)
+    assert (rest_unit - 1).is_zero(), str(rest_unit)
+    assert str(rest).count("subexpression(") == 4, str(rest)
