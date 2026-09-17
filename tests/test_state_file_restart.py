@@ -238,6 +238,64 @@ class RestartProblem(Problem):
         self += eqs @ "domain"
 
 
+class PinnedHistoryProblem(Problem):
+    """Small moving mesh with both field and positional Dirichlet histories."""
+
+    def define_problem(self):
+        self.set_linear_solver("superlu")
+        self += RectangularQuadMesh(N=1, size=[1, 1])
+        equations = MovingMeshEqs() + PseudoElasticMesh()
+        equations += DirichletBC(u=2, mesh_x=True, mesh_y=0) @ "bottom"
+        self += equations @ "domain"
+        self.write_states = False
+
+
+def test_pinned_nodal_histories_survive_state_roundtrip(tmp_path):
+    """BC reapplication owns slot 0 but must not erase stored time histories."""
+    fname = str(tmp_path / "pinned-history.dump")
+    expected = {}
+    with PinnedHistoryProblem() as writer:
+        writer.set_output_directory(str(tmp_path / "w_pinned_history"))
+        writer.initialise()
+        mesh = writer.get_mesh("domain")
+        u_index = mesh.get_nodal_field_indices()["u"]
+        for ordinal, node in enumerate(mesh.boundary_nodes("bottom")):
+            assert node.is_pinned(u_index)
+            assert node.variable_position_pt().is_pinned(0)
+            assert node.variable_position_pt().is_pinned(1)
+            for slot in range(1, node.ntstorage()):
+                node.set_value_at_t(slot, u_index, 10.0 * slot + ordinal)
+            for slot in range(1, node.variable_position_pt().ntstorage()):
+                node.set_x_at_t(slot, 0, 20.0 * slot + ordinal)
+                node.set_x_at_t(slot, 1, -30.0 * slot - ordinal)
+            expected[ordinal] = (
+                float(node.value(u_index)),
+                tuple(float(node.value_at_t(slot, u_index)) for slot in range(1, node.ntstorage())),
+                tuple(
+                    (float(node.x_at_t(slot, 0)), float(node.x_at_t(slot, 1)))
+                    for slot in range(1, node.variable_position_pt().ntstorage())
+                ),
+            )
+        writer.save_state(fname, quiet=True)
+
+    with PinnedHistoryProblem() as reader:
+        reader.set_output_directory(str(tmp_path / "r_pinned_history"))
+        reader.load_state(fname, quiet=True)
+        mesh = reader.get_mesh("domain")
+        u_index = mesh.get_nodal_field_indices()["u"]
+        actual = {}
+        for ordinal, node in enumerate(mesh.boundary_nodes("bottom")):
+            actual[ordinal] = (
+                float(node.value(u_index)),
+                tuple(float(node.value_at_t(slot, u_index)) for slot in range(1, node.ntstorage())),
+                tuple(
+                    (float(node.x_at_t(slot, 0)), float(node.x_at_t(slot, 1)))
+                    for slot in range(1, node.variable_position_pt().ntstorage())
+                ),
+            )
+        assert actual == expected
+
+
 def _advance(problem, nsteps, adaptive):
     if adaptive:
         now = problem.get_current_time(dimensional=False, as_float=True)

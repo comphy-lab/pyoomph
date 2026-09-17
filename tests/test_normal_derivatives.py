@@ -44,11 +44,13 @@
 
 import math
 
+import numpy
 import pytest
 
 from pyoomph import *
 from pyoomph.expressions import *
 from pyoomph.meshes.simplemeshes import RectangularQuadMesh, CuboidBrickMesh, CircularMesh
+from pyoomph.meshes.mesh import MeshTemplate
 
 
 class _Bulk(Equations):
@@ -112,6 +114,186 @@ def _measure(mesh_factory, interface, dim, move=None, coordsys=None, nrefine=0):
 def _assert_identities(res, tol=1e-11):
     assert res["sym"] < tol, "grad(normal) is not symmetric: %.3e" % res["sym"]
     assert res["tang"] < tol, "grad(normal) is not tangential: %.3e" % res["tang"]
+
+
+class _ScaledLineMesh(MeshTemplate):
+    """One exact C2 line embedded in 2D, scaled without changing its shape."""
+
+    def __init__(self, scale, curvature=0.0):
+        super().__init__()
+        self.scale = scale
+        self.curvature = curvature
+
+    def define_geometry(self):
+        domain = self.new_domain("line", nodal_dimension=2)
+
+        def point(q):
+            return self.add_node(self.scale * q,
+                                 self.scale * (0.3 * q + self.curvature * q * q))
+
+        domain.add_line_1d_C2(point(0.0), point(0.5), point(1.0))
+
+
+class _ScaledQuadMesh(MeshTemplate):
+    """One explicit Q2 square whose nodes are never coordinate-deduplicated."""
+
+    def __init__(self, scale):
+        super().__init__()
+        self.scale = scale
+
+    def define_geometry(self):
+        domain = self.new_domain("domain", nodal_dimension=2)
+        nodes = [
+            self.add_node(self.scale * i / 2, self.scale * j / 2)
+            for j in range(3) for i in range(3)
+        ]
+        domain.add_quad_2d_C2(*nodes)
+        self.add_facet_to_boundary("top", nodes[6:9], [nodes[6], nodes[8]])
+
+
+_NORMAL_SCALES = [1.0, 1e-6, 1e-10, 1e-12, 1e-18]
+
+
+@pytest.mark.parametrize("scale", _NORMAL_SCALES)
+def test_line_normals_are_scale_safe_at_current_and_history_positions(scale):
+    from pyoomph.equations.ALE import LaplaceSmoothedMesh
+
+    current = numpy.array([-0.3, 1.0])
+    current /= numpy.linalg.norm(current)
+    previous = numpy.array([0.25, 1.0])
+    previous /= numpy.linalg.norm(previous)
+
+    class P(Problem):
+        def define_problem(self):
+            self.add_mesh(_ScaledLineMesh(scale))
+            n = var("normal")
+            n_old = evaluate_in_past(n, 1, apply_on_others=True)
+            equations = LaplaceSmoothedMesh()
+            equations += ElementSpace("C2")
+            equations += IntegralObservables(
+                length=1,
+                nx=n[0], ny=n[1], norm2=dot(n, n),
+                old_nx=n_old[0], old_ny=n_old[1], old_norm2=dot(n_old, n_old),
+            )
+            self.add_equations(equations @ "line")
+
+    with P() as problem:
+        problem.initialise()
+        for node in problem.get_mesh("line").nodes():
+            q = node.x(0) / scale
+            node.set_x_at_t(1, 0, scale * q)
+            node.set_x_at_t(1, 1, scale * (-0.25 * q))
+        values = problem.get_mesh("line").evaluate_all_observables()
+
+    length = float(values["length"])
+    got = numpy.array([float(values["nx"]), float(values["ny"])]) / length
+    got_old = numpy.array([float(values["old_nx"]), float(values["old_ny"])]) / length
+    assert numpy.allclose(got, current, rtol=0.0, atol=2e-14)
+    assert numpy.allclose(got_old, previous, rtol=0.0, atol=2e-14)
+    assert abs(float(values["norm2"]) / length - 1.0) < 2e-14
+    assert abs(float(values["old_norm2"]) / length - 1.0) < 2e-14
+
+
+@pytest.mark.parametrize("scale", _NORMAL_SCALES)
+def test_line_normal_position_jacobian_matches_scale_relative_finite_difference(scale):
+    from pyoomph.equations.ALE import LaplaceSmoothedMesh
+
+    class NormalResidual(Equations):
+        def define_fields(self):
+            self.define_scalar_field("u", "C2")
+
+        def define_residuals(self):
+            u, u_test = var_and_test("u")
+            self.add_residual(weak(u + dot(var("normal"), vector(0.37, -0.61)),
+                                   u_test))
+
+    class P(Problem):
+        def define_problem(self):
+            self.add_mesh(_ScaledLineMesh(scale, curvature=0.35))
+            self.add_equations(
+                (LaplaceSmoothedMesh() + ElementSpace("C2") + NormalResidual()) @ "line"
+            )
+
+    with P() as problem:
+        problem.initialise()
+        mesh = problem.get_mesh("line")
+        nodes = sorted(mesh.nodes(), key=lambda node: node.x(0))
+        moved = nodes[1]
+        column = moved.variable_position_pt().eqn_number(1)
+        assert column >= 0
+        field_index = mesh.element_pt(0).get_jit_code().get_nodal_field_indices()["u"]
+        rows = [node.eqn_number(field_index) for node in nodes]
+        assert all(row >= 0 for row in rows)
+
+        _, jacobian = problem.assemble_jacobian(with_residual=True)
+        analytical = numpy.asarray(jacobian[rows, column].todense()).reshape(-1)
+
+        original = moved.x(1)
+        epsilon = 2e-6 * scale
+        moved.set_x(1, original + epsilon)
+        residual_plus, _ = problem.assemble_jacobian(with_residual=True)
+        moved.set_x(1, original - epsilon)
+        residual_minus, _ = problem.assemble_jacobian(with_residual=True)
+        moved.set_x(1, original)
+        finite_difference = (numpy.asarray(residual_plus)[rows] -
+                             numpy.asarray(residual_minus)[rows]) / (2 * epsilon)
+
+    assert numpy.allclose(analytical, finite_difference, rtol=2e-6, atol=2e-8), \
+        "scale=%g analytic=%r finite_difference=%r" % (scale, analytical, finite_difference)
+
+
+@pytest.mark.parametrize("scale", [1.0, 1e-6, 1e-12, 1e-18])
+def test_bulk_boundary_normal_position_jacobian_is_scale_safe(scale):
+    """Exercise InterfaceElementBase, as used by a 2-D free surface."""
+    from pyoomph.equations.ALE import LaplaceSmoothedMesh
+
+    class NormalResidual(Equations):
+        def define_fields(self):
+            self.define_scalar_field("u", "C2")
+
+        def define_residuals(self):
+            u, u_test = var_and_test("u")
+            self.add_residual(weak(u + dot(var("normal"), vector(0.37, -0.61)),
+                                   u_test))
+
+    class P(Problem):
+        def __init__(self):
+            super().__init__()
+            self.initial_adaption_steps = 0
+
+        def define_problem(self):
+            self.add_mesh(_ScaledQuadMesh(scale))
+            self.add_equations(
+                (LaplaceSmoothedMesh() + ElementSpace("C2")) @ "domain"
+            )
+            self.add_equations(NormalResidual() @ "domain/top")
+
+    with P() as problem:
+        problem.initialise()
+        boundary = problem.get_mesh("domain/top")
+        nodes = sorted(boundary.nodes(), key=lambda node: node.x(0))
+        moved = nodes[1]
+        column = moved.variable_position_pt().eqn_number(1)
+        assert column >= 0
+        field_index = boundary.element_pt(0).get_jit_code().get_nodal_field_indices()["u"]
+        rows = [node.eqn_number(field_index) for node in nodes]
+        assert all(row >= 0 for row in rows)
+
+        _, jacobian = problem.assemble_jacobian(with_residual=True)
+        analytical = numpy.asarray(jacobian[rows, column].todense()).reshape(-1)
+
+        original = moved.x(1)
+        epsilon = 2e-6 * scale
+        moved.set_x(1, original + epsilon)
+        residual_plus, _ = problem.assemble_jacobian(with_residual=True)
+        moved.set_x(1, original - epsilon)
+        residual_minus, _ = problem.assemble_jacobian(with_residual=True)
+        moved.set_x(1, original)
+        finite_difference = (numpy.asarray(residual_plus)[rows] -
+                             numpy.asarray(residual_minus)[rows]) / (2 * epsilon)
+
+    assert numpy.allclose(analytical, finite_difference, rtol=2e-6, atol=2e-8), \
+        "scale=%g analytic=%r finite_difference=%r" % (scale, analytical, finite_difference)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -335,6 +517,38 @@ def test_moving_mesh_curvature_hessian():
 # ---------------------------------------------------------------------------------------------
 # Things that must be refused rather than answered wrongly
 # ---------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("bad_coordinate", [0.0, float("nan")])
+def test_degenerate_line_tangent_is_reported_after_assembly(bad_coordinate, capfd):
+    """The failure path must not leak NaNs through the generated element loop."""
+    from pyoomph.equations.ALE import LaplaceSmoothedMesh
+
+    class NormalResidual(Equations):
+        def define_fields(self):
+            self.define_scalar_field("u", "C2")
+
+        def define_residuals(self):
+            u, u_test = var_and_test("u")
+            self.add_residual(
+                weak(u + dot(var("normal"), vector(0.37, -0.61)), u_test)
+            )
+
+    class P(Problem):
+        def define_problem(self):
+            self.add_mesh(_ScaledLineMesh(1.0))
+            self.add_equations(
+                (LaplaceSmoothedMesh() + ElementSpace("C2") + NormalResidual()) @ "line"
+            )
+
+    with P() as problem:
+        problem.initialise()
+        for node in problem.get_mesh("line").nodes():
+            node.set_x(0, bad_coordinate)
+            node.set_x(1, 0.0)
+        with pytest.raises(RuntimeError, match="OomphException"):
+            problem.assemble_jacobian(with_residual=True)
+        assert "cannot normalise" in capfd.readouterr().err
+
 
 def test_second_spatial_derivative_of_the_normal_is_refused():
     class Eq(Equations):

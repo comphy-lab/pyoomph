@@ -10358,6 +10358,37 @@ Patrick E. Farrell, Ásgeir Birkisson & Simon W. Funke, https://arxiv.org/pdf/14
             mesh = self._meshdict[meshname]
             assert not isinstance(mesh,InterfaceMesh)            
             mesh._define_state_file(state,additional_info={})
+        # Boundary-condition hooks run while the loaded interfaces are rebuilt below. They must set
+        # slot 0 to the boundary's value, but several of them also initialise every history slot as
+        # if the node were new. These nodes are not new: their history, derivative and predictor
+        # slots came from the state file and are the time discretisation being resumed. Park all
+        # nodal histories now, including additional interface values owned by bulk nodes, after mesh
+        # state loading and before actions_after_adapt().
+        loaded_nodal_histories:dict[int,tuple[Any,tuple[tuple[float,...],...],dict[int,tuple[float,...]]]]={}
+        if not state.save:
+            for _mesh in self._meshdict.values():
+                if isinstance(_mesh,InterfaceMesh) or isinstance(_mesh,ODEStorageMesh):
+                    continue
+                for _node in _mesh.nodes():
+                    _identity=id(_node)
+                    _positions=tuple(
+                        tuple(float(_node.x_at_t(_slot,_component))
+                              for _component in range(_node.ndim()))
+                        for _slot in range(1,_node.variable_position_pt().ntstorage())
+                    )
+                    _values={
+                        int(_index):tuple(
+                            float(_node.value_at_t(_slot,_index))
+                            for _slot in range(1,_node.ntstorage())
+                        )
+                        for _index in range(_node.nvalue())
+                    }
+                    _existing=loaded_nodal_histories.get(_identity)
+                    if _existing is None:
+                        loaded_nodal_histories[_identity]=(_node,_positions,_values)
+                    else:
+                        _existing[2].update(_values)
+            self._parked_loaded_nodal_histories=loaded_nodal_histories
         # Interface and skeleton element data, i.e. everything a facet field owns: DL/D0 and the nodal
         # DG spaces alike live in the interface element's own internal Data, and no other block of the
         # file holds them. Without this the file could only reproduce the bulk state and would refit
@@ -10738,6 +10769,7 @@ Patrick E. Farrell, Ásgeir Birkisson & Simon W. Funke, https://arxiv.org/pdf/14
         # actions_after_adapt on purpose: rebuild_after_adapt refits whatever this process was holding
         # onto the loaded geometry, and the file's values must overwrite that approximation, not race it.
         self._apply_interface_states()
+        loaded_nodal_histories=getattr(self,"_parked_loaded_nodal_histories",{})
         self.setup_pinning()
         self.reapply_boundary_conditions()
         self._apply_parked_continuation_data()
@@ -10758,6 +10790,31 @@ Patrick E. Farrell, Ásgeir Birkisson & Simon W. Funke, https://arxiv.org/pdf/14
             self.actions_before_transient_solve()
         elif self._last_bc_setting=="stationary":
             self.actions_before_stationary_solve()
+        # actions_after_remeshing() itself reapplies the boundary conditions, and the solve-mode
+        # hooks above may do so once more. Restore only after that final lifecycle point. Slot 0 stays
+        # exactly as those conditions established it; only stored history/derivative/predictor slots
+        # are restored.
+        _live_nodes={
+            id(_node):_node
+            for _mesh in self._meshdict.values()
+            if not isinstance(_mesh,InterfaceMesh) and not isinstance(_mesh,ODEStorageMesh)
+            for _node in _mesh.nodes()
+        }
+        _missing_loaded_nodes=set(loaded_nodal_histories)-set(_live_nodes)
+        if _missing_loaded_nodes:
+            raise RuntimeError(
+                "Loaded bulk nodes disappeared while restoring nodal histories"
+            )
+        for _identity,(_node,_positions,_values) in loaded_nodal_histories.items():
+            if _live_nodes[_identity] is not _node:
+                raise RuntimeError("Bulk node identity changed while restoring loaded nodal histories")
+            for _slot,_history in enumerate(_positions,start=1):
+                for _component,_value in enumerate(_history):
+                    _node.set_x_at_t(_slot,_component,_value)
+            for _index,_history in _values.items():
+                for _slot,_value in enumerate(_history,start=1):
+                    _node.set_value_at_t(_slot,_index,_value)
+        self._parked_loaded_nodal_histories=None
         self.set_interpolate_new_interface_dofs(True) # Activate the interpolation again, good for spatial adaptivity
         return True
 

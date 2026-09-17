@@ -33,8 +33,51 @@ The main author may be contacted at c.diddens@utwente.nl
 #include "expressions.hpp"
 #include "timestepper.hpp"
 
+#include <cmath>
+
 namespace pyoomph
 {
+	namespace
+	{
+		double record_degenerate_line_tangent(const char *context, const char *reason)
+		{
+			std::string message = std::string(context) + ": cannot normalise a " + reason +
+				" line tangent; the interface element is collapsed or non-finite.";
+			if (BulkElementBase::inverted_elements_detected++ == 0)
+			{
+				BulkElementBase::inverted_element_message = message;
+			}
+			// Complete the assembly with a finite placeholder.  The surrounding
+			// Problem::InvertedElementScope discards it and raises unanimously
+			// after every rank has left the element loop.
+			return 1.0;
+		}
+
+		double scale_safe_line_tangent_length(double &tx, double &ty, const char *context)
+		{
+			if (!std::isfinite(tx) || !std::isfinite(ty))
+			{
+				tx = 1.0;
+				ty = 0.0;
+				return record_degenerate_line_tangent(context, "non-finite");
+			}
+			const double scale = std::fmax(std::fabs(tx), std::fabs(ty));
+			if (!(scale > 0.0))
+			{
+				tx = 1.0;
+				ty = 0.0;
+				return record_degenerate_line_tangent(context, "zero");
+			}
+			const double length = scale * std::hypot(tx / scale, ty / scale);
+			if (!(length > 0.0) || !std::isfinite(length))
+			{
+				tx = 1.0;
+				ty = 0.0;
+				return record_degenerate_line_tangent(context, "non-finite-length");
+			}
+			return length;
+		}
+	}
 
 	// Element shape-quality measure: ratio of the smallest Jacobian determinant encountered at any
 	// integration point to the element's mean Jacobian (i.e. mean element size). A value close to 1
@@ -92,21 +135,21 @@ namespace pyoomph
 					dxds[d] += this->nodal_position(l, d) * dpsi(l, 0);
 				}
 			}
-			double denom = 0.0;
-			for (unsigned int d = 0; d < nodal_dim; d++)
-				denom += dxds[d] * dxds[d];
-			if (denom < 1e-20)
-				denom = 1;
-			double denom_sqr=denom;
-			denom = sqrt(denom);
-			denom = 1 / (denom * denom * denom);
+			const double tangent_length = scale_safe_line_tangent_length(
+				dxds[0], dxds[1], "BulkElementBase::get_dnormal_dcoords_at_s");
+			const double inverse_tangent_length = 1.0 / tangent_length;
+			const double inverse_tangent_length_squared = inverse_tangent_length * inverse_tangent_length;
+			const double unit_tangent[2] = {
+				dxds[0] * inverse_tangent_length,
+				dxds[1] * inverse_tangent_length};
 			for (unsigned int i = 0; i < nodal_dim; i++)
 			{
 				for (unsigned l = 0; l < n_node; l++)
 				{
 					for (unsigned int k = 0; k < nodal_dim; k++)
 					{						
-						dnormal_dcoord[i][l][k] = dpsi(l, 0) * denom * (k == 1 ? -1 : 1) * dxds[i] * dxds[1 - k];
+						dnormal_dcoord[i][l][k] = dpsi(l, 0) * inverse_tangent_length *
+							(k == 1 ? -1 : 1) * unit_tangent[i] * unit_tangent[1 - k];
 					}
 				}
 			}
@@ -122,7 +165,12 @@ namespace pyoomph
 							{
 								for (unsigned int jp = 0; jp < nodal_dim; jp++)
 								{								 
-								 d2normal_dcoord2[i][l][j][lp][jp]=(i==1 ? -1 : 1)*(dpsi(l,0)*dpsi(lp,0))*denom*(( (j==jp && j!=i) ? 3*dxds[1-i] : dxds[1-(j==i ? jp : j)])-3*dxds[1-i]*dxds[j]*dxds[jp]/denom_sqr);
+									d2normal_dcoord2[i][l][j][lp][jp] =
+										(i == 1 ? -1 : 1) * dpsi(l, 0) * dpsi(lp, 0) *
+										inverse_tangent_length_squared *
+										(((j == jp && j != i) ? 3 * unit_tangent[1 - i] :
+											unit_tangent[1 - (j == i ? jp : j)]) -
+										 3 * unit_tangent[1 - i] * unit_tangent[j] * unit_tangent[jp]);
 								}												
 							}
 						}
@@ -304,12 +352,8 @@ namespace pyoomph
 					dxds[d] += this->nodal_position(history_index, l, d) * dpsi(l, 0);
 				}
 			}
-			double l = 0.0;
-			for (unsigned int d = 0; d < nodal_dim; d++)
-				l += dxds[d] * dxds[d];
-			if (l < 1e-20)
-				l = 1;
-			l = sqrt(l);
+			const double l = scale_safe_line_tangent_length(
+				dxds[0], dxds[1], "BulkElementBase::get_normal_at_s");
 			n[0] = -dxds[1] / l;
 			n[1] = dxds[0] / l;
 		}
