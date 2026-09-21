@@ -254,9 +254,15 @@ if(PYOOMPH_DOWNLOAD_CLN)
                        ${_pyoomph_autotools_common_flags}
                        ${CLN_EXTRA_CONFIGURE_FLAGS}
                        ${_pyoomph_cln_cxxflags}
-    # As with GiNaC below, skip "make install" for the subdirs we don't need
-    # (tests, examples, doc, benchmarks) - just the static library ("src")
-    # plus the headers, which the top-level Makefile installs directly.
+    # As with GiNaC below, skip the subdirs we don't need (tests, examples,
+    # doc, benchmarks) - just the static library ("src"), plus the headers,
+    # which the top-level Makefile installs directly. SUBDIRS has to be
+    # overridden on the BUILD command as well as on the install one: doc/
+    # regenerates a Texinfo manual with "makeinfo", which is a build-time
+    # dependency we do not otherwise have, and building it is a hard error
+    # when texinfo is not installed (see the GiNaC block below, where exactly
+    # that happened).
+    BUILD_COMMAND make SUBDIRS=src
     INSTALL_COMMAND make install SUBDIRS=src
     BUILD_BYPRODUCTS "${_cln_lib}"
   )
@@ -316,14 +322,39 @@ if(PYOOMPH_DOWNLOAD_GINAC)
                        --prefix=${PYOOMPH_THIRDPARTY_PREFIX}
                        ${_pyoomph_autotools_common_flags}
                        ${GINAC_EXTRA_CONFIGURE_FLAGS}
-    # GiNaC's own "make install" also descends into doc/ and tries to build
-    # the "ginac.info" Texinfo manual, which needs "makeinfo" (part of
-    # texinfo). We don't need the docs, and requiring texinfo just to build
-    # pyoomph is an unnecessary dependency, so skip that subdir entirely by
-    # overriding automake's SUBDIRS on the install command line.
+    # GiNaC descends into doc/ and tries to build the "ginac.info" Texinfo
+    # manual, which needs "makeinfo" (part of texinfo). We don't need the
+    # docs, and requiring texinfo just to build pyoomph is an unnecessary
+    # dependency, so skip that subdir entirely by overriding automake's
+    # SUBDIRS on the command line.
+    # On BUILD as well as on install: the tarball ships a prebuilt ginac.info,
+    # so the doc subdir is quiet on a first build and only wakes up on a
+    # RE-build, where configure has just rewritten doc/tutorial/version.texi
+    # and makeinfo is suddenly wanted for a manual nothing here reads. With
+    # makeinfo absent the recipe expands to an empty command and the build
+    # dies as "--no-split: command not found", which is what the first
+    # rebuild after the patch-step fix below ran into. This also skips
+    # check/, ginsh/ and tools/, none of which pyoomph links.
+    BUILD_COMMAND make SUBDIRS=ginac
     INSTALL_COMMAND make install SUBDIRS=ginac
     BUILD_BYPRODUCTS "${_ginac_lib}"
   )
+
+  # ExternalProject stamps the patch step once and never looks at the patches again. On an
+  # incremental build - which is what the nightly does, reusing the same build/ tree for months -
+  # the source stays extracted and patched as it was on the day it was downloaded, so a patch added
+  # since is simply absent from the library that ends up linked, with nothing in the build output
+  # saying so ("Nothing to be done for 'CMakeFiles/ginac_external.dir/build'"). That is how the
+  # 2026-09-08 nightly linked a GiNaC carrying only the two determinism patches while three more
+  # sat in citools/patches/, and how test_azimuthal_codegen.py came to fail on a fix that was in
+  # the tree. Make the patch step depend on the script and on every patch it applies: touching
+  # either re-runs patch -> configure -> build -> install. apply_ginac_patch.sh is idempotent (it
+  # skips what is already applied), so the re-run only adds what is new to the existing tree.
+  # CONFIGURE_DEPENDS so that adding a patch file re-runs CMake and is picked up by this glob.
+  file(GLOB _ginac_patch_files CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/citools/patches/*.patch")
+  ExternalProject_Add_StepDependencies(ginac_external patch
+    "${CMAKE_SOURCE_DIR}/citools/patches/apply_ginac_patch.sh" ${_ginac_patch_files})
+
   set(PYOOMPH_GINAC_INCLUDE_DIR_RESOLVED "${PYOOMPH_THIRDPARTY_PREFIX}/include")
   set(PYOOMPH_GINAC_LIBRARY "${_ginac_lib}")
 else()
