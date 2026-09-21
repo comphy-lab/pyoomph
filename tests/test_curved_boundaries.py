@@ -1277,6 +1277,36 @@ def test_intrinsic_and_parametric_dimensions_are_reported_separately():
     assert user.get_intrinsic_dimension() == 1
 
 
+def test_catmull_rom_inversion_survives_eleven_decades_of_grading():
+    # The interface polyline of a coalescence bridge remeshed at R_min ~ 1e-4 in units of the drop
+    # radius, with the mesh scaled by R_0: a far field reaching |x| ~ 1e4 and, next to a node at
+    # |x| ~ 1, segments graded geometrically down to chords of 3e-8. Gauss-Newton on the projection
+    # (c - p).c' = 0 has a roundoff floor of eps |x| / L ~ 3e-9 in the spline parameter there, so
+    # the old stopping test |dt| < 1e-12 (N - 1) could not be met however finely the seed table was
+    # refined, and every such remesh threw "Cannot invert spline". The position-space test resolves
+    # it; the round trip has to reproduce the node to roundoff at every scale of the curve.
+    L, x, y, pts = 3e-8, 1.0, 0.0, [[1.0, 0.0, 0.0]]
+    while x < 1e4:
+        x += L
+        y = 0.3 * (x - 1.0) + 1e-6 * (x - 1.0) ** 2
+        pts.append([x, y, 0.0])
+        L *= 1.2
+    spline = _pyoomph.CurvedEntityCatmullRomSpline(pts)
+    assert len(pts) > 100
+    for k in (0, 1, 2, 5, 20, 60, len(pts) // 2, len(pts) - 2, len(pts) - 1):
+        node = numpy.array(pts[k])
+        scale = max(1.0, numpy.abs(node).max())
+        s = spline.position_to_parametric(list(node))
+        back = numpy.array(spline.parametric_to_position(s))
+        assert numpy.abs(back - node).max() < 1e-12 * scale, (k, node, back)
+        if k + 1 < len(pts):
+            # A point in the interior of the segment, i.e. one gmsh would have placed there
+            s2 = spline.position_to_parametric(pts[k + 1])
+            mid = spline.parametric_to_position([0.5 * (s[0] + s2[0])])
+            again = numpy.array(spline.parametric_to_position(spline.position_to_parametric(mid)))
+            assert numpy.abs(again - numpy.array(mid)).max() < 1e-12 * scale, (k, mid, again)
+
+
 # --------------------------------------------------------------------------------------------
 # Coupled interfaces (dev_docs 19.4)
 # --------------------------------------------------------------------------------------------

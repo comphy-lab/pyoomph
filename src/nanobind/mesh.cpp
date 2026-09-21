@@ -384,7 +384,15 @@ void PyReg_Mesh(nb::module_ &m)
 		.def(nb::init<const std::vector<double> &, const std::vector<double> &, const std::vector<double> &>(), nb::arg("axis"), nb::arg("point_on_cylinder"), nb::arg("tangent"));
 
 	nb::class_<pyoomph::CurvedEntityCatmullRomSpline, pyoomph::MeshTemplateCurvedEntity>(m, "CurvedEntityCatmullRomSpline", "A curved entity interpolating a given set of points by a Catmull-Rom spline")
-		.def(nb::init<const std::vector<std::vector<double>> &>(), nb::arg("points"));
+		.def(nb::init<const std::vector<std::vector<double>> &>(), nb::arg("points"))
+		// The two directions of the chart, exposed so that the numerical inversion can be tested on the
+		// geometries that break it (see tests/test_curved_boundaries.py) without building a mesh.
+		.def("position_to_parametric", [](pyoomph::CurvedEntityCatmullRomSpline &self, const std::vector<double> &position)
+			 { std::vector<double> parametric(1); self.position_to_parametric(0, position, parametric); return parametric; },
+			 nb::arg("position"), "Arclength parameter of the point on the spline closest to `position`")
+		.def("parametric_to_position", [](pyoomph::CurvedEntityCatmullRomSpline &self, const std::vector<double> &parametric)
+			 { std::vector<double> position; self.parametric_to_position(0, parametric, position); return position; },
+			 nb::arg("parametric"), "Position on the spline at the given arclength parameter");
 
 	// The parametric coordinate is the outward unit normal, so no orientation is required; `tangent` is
 	// accepted and ignored so that existing callers keep working.

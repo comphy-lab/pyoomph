@@ -2723,15 +2723,17 @@ Index : Local coordinates (s0,s1,s2)
 		double troot = samples[minind];
 		std::vector<double> current, J;
 		bool converged = false;
+		double last_dt = 0.0, last_g = 0.0, last_xscale = 0.0;
 		for (unsigned iter = 0; iter < 100; iter++)
 		{
 			interpolate(troot, current);
 			dinterpolate(troot, J);
-			double f = 0.0, g = 0.0;
+			double f = 0.0, g = 0.0, xscale = 0.0;
 			for (unsigned int j = 0; j < dim; j++)
 			{
 				f += (current[j] - position[j]) * J[j];
 				g += J[j] * J[j];
+				xscale = std::max(xscale, std::max(fabs(position[j]), fabs(current[j])));
 			}
 			if (g < 1e-30)
 			{
@@ -2740,7 +2742,19 @@ Index : Local coordinates (s0,s1,s2)
 			}
 			double dt = f / g;
 			troot = std::min(std::max(troot - dt, 0.0), N - 1.0);
-			if (fabs(dt) < 1e-12 * std::max(1.0, N - 1.0))
+			last_dt = dt;
+			last_g = g;
+			last_xscale = xscale;
+			// Two ways to be done. (i) The parameter step is tiny on the scale of the chart. (ii) The
+			// displacement along the curve, |dt| |c'|, is at the roundoff of the coordinates that enter
+			// f = (c - p).c'. Test (ii) is what an interface graded towards a near-singular feature needs:
+			// a coalescence bridge remeshed at R_min ~ 1e-4 (in units of the drop radius, mesh scaled by
+			// R_0) puts spline segments of chord L ~ 3e-8 next to nodes at |x| ~ 1, so the roundoff of
+			// f/g is eps |x| / L ~ 3e-9 in t, above test (i) for any N. The iteration then sat at its
+			// floor and "Cannot invert spline" was thrown once the sample table had been refined to no
+			// effect. 1e-13 |x| is a few hundred eps above that floor and, at L/|x| = 3e-8, still 3e-6
+			// of the smallest element edge, i.e. far below the placement accuracy anything else has.
+			if (fabs(dt) < 1e-12 * std::max(1.0, N - 1.0) || fabs(dt) * sqrt(g) < 1e-13 * xscale)
 			{
 				converged = true;
 				break;
@@ -2757,7 +2771,13 @@ Index : Local coordinates (s0,s1,s2)
 				position_to_parametric(t, position, parametric);
 				return;
 			}
-			throw_runtime_error("Cannot invert spline");
+			std::ostringstream oss;
+			oss << "Cannot invert spline: " << N << " control points, " << samples.size() << " samples, position (";
+			for (unsigned int j = 0; j < dim; j++)
+				oss << (j ? ", " : "") << position[j];
+			oss << "), nearest sample at distance " << sqrt(mindist) << ", last Gauss-Newton step " << last_dt
+				<< " in t = " << fabs(last_dt) * sqrt(last_g) << " along the curve, coordinate scale " << last_xscale;
+			throw_runtime_error(oss.str());
 		}
 		parametric[0] = arclength_from_t(troot);
 	}
