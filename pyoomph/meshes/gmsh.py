@@ -83,6 +83,20 @@ NestedGmshCurveArg:TypeAlias = Union[GmshCurveArg, Sequence["NestedGmshCurveArg"
 NestedGmshSurfaceArg:TypeAlias = Union[GmshSurfaceArg, Sequence["NestedGmshSurfaceArg"]]
 
 
+
+def _line_tally(names) -> str:
+    """How many lines of each name the loop was given.
+
+    The bare list is hard to count by eye, and the count is the whole diagnosis: two
+    ``liquid_gas`` curves against one ``liquid_axisymm`` line means two fragments were handed
+    a single axis span, which no loop can close.
+    """
+    counts: Dict[str, int] = {}
+    for n in names:
+        counts[n] = counts.get(n, 0) + 1
+    return ", ".join("{} x{}".format(k, v) for k, v in sorted(counts.items()))
+
+
 class GmshSizeCallback:
     def __init__(self,default_resolution:float=1.0):
         self.gmsh:"GmshTemplate"
@@ -1182,8 +1196,10 @@ class GmshTemplate(MeshedMeshTemplate):
                                       algorithm=self.gmsh_options.get("algorithm",None),
                                       recombine_algo=self.gmsh_options.get("recombine_algo",None),
                                       postgen_cb=lambda: self._post_process(),mesh_mode=self.mesh_mode,mesh_size_callback=self._mesh_size_callback, quiet=self.get_problem().is_quiet())
+                llist = list(llist)
                 raise RuntimeError("Cannot close line loop" + (
-                    "" if name is None else " for surface " + name) + ". Cannot find the next element in the loop.\nLoop so far: " + (
+                    "" if name is None else " for surface " + name) + ". Cannot find the next element in the loop.\nLine tally: "
+                    + _line_tally(llist) + "\nLoop so far: " + (
                                        "\n".join(debug_info)) + "\n\nLine list:\n" + "\n".join(llist))
         if currentendpoint != startpoint:
             llist = map(lambda e: self._rev_names.get(e, "<unnamed>"), lst)
@@ -1195,8 +1211,10 @@ class GmshTemplate(MeshedMeshTemplate):
                                   algorithm=self.gmsh_options.get("algorithm",None),
                                   recombine_algo=self.gmsh_options.get("recombine_algo",None),
                                   postgen_cb=lambda: self._post_process(),mesh_mode=self.mesh_mode,mesh_size_callback=self._mesh_size_callback, quiet=self.get_problem().is_quiet())
+            llist = list(llist)
             raise RuntimeError("Could not close line loop" + (
-                "" if name is None else " for surface " + name) + ". Start and end not matching.\nLoop so far: " + (
+                "" if name is None else " for surface " + name) + ". Start and end not matching.\nLine tally: "
+                + _line_tally(llist) + "\nLoop so far: " + (
                                    "\n".join(debug_info)) + "\n\nLine list:\n" + "\n".join(llist))
 
         totalres.append(gmshres)
@@ -1369,8 +1387,7 @@ class GmshTemplate(MeshedMeshTemplate):
                 by spatial refinement are placed on the sphere rather than on the surface Gmsh
                 actually meshed. Pass ``True`` to work the sphere out from the bounding curves, or a
                 ``(cx, cy, cz)`` centre to state it explicitly.
-
-                This is opt-in on purpose. A ruled surface is *not* in general a sphere -- Gmsh's
+                This is opt-in on purpose: a ruled surface is *not* in general a sphere -- Gmsh's
                 built-in kernel does not produce an exact sphere from one even when the bounding
                 curves are great-circle arcs -- so pyoomph cannot assume it. Say so only when the
                 surface really is meant to be spherical; the mesh's own nodes on it are then also
