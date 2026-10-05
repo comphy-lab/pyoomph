@@ -29,6 +29,15 @@ updates using fast-forward-only pushes. An upstream history rewrite fails
 without publishing any refs. A merge conflict advances the pristine mirrors
 but leaves `comphy` unchanged and reports the conflicting paths.
 
+Default publication uses `github.token`, which does not trigger other
+workflows. Refs whose new commits change `.github/workflows/` are held at the
+last safe fast-forward until a maintainer reviews those files and dispatches
+the Action with **publish_workflows**. That reviewed path uses
+`COMPHY_SYNC_TOKEN` from the `comphy-sync` environment only; it must not be
+a repository secret, or unreviewed workflows could read it. Restrict that
+environment to the `comphy` branch and do not add required reviewers, or the
+daily run will wait.
+
 New upstream work is merged into a uniquely named candidate branch, retaining
 both parent commits. The Action builds an MPI-enabled Linux/Python 3.13 wheel
 and runs [the bounded verification procedure](comphy/VERIFICATION.md). A

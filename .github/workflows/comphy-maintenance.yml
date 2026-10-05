@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '23 5 * * *'
   workflow_dispatch:
+    inputs:
+      publish_workflows:
+        description: After review, publish mirrored refs that update .github/workflows
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -17,13 +22,16 @@ jobs:
     if: github.repository == 'comphy-lab/pyoomph' && github.ref == 'refs/heads/comphy'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    environment:
+      name: comphy-sync
+      url: https://github.com/comphy-lab/pyoomph/actions/runs/${{ github.run_id }}
     permissions:
       contents: write
     outputs:
       candidate_sha: ${{ steps.report.outputs.candidate_sha }}
       verify: ${{ steps.report.outputs.verify }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
       - name: Test maintenance logic without GitHub writes
@@ -31,9 +39,17 @@ jobs:
       - name: Mirror upstream and prepare candidate
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 comphy/sync.py --publish --report receipts/sync.json
+          COMPHY_SYNC_TOKEN: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish_workflows == 'true' && secrets.COMPHY_SYNC_TOKEN || '' }}
+          PUBLISH_WORKFLOWS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish_workflows == 'true' }}
+        run: |
+          extra=()
+          if [ "$PUBLISH_WORKFLOWS" = "true" ]; then
+            extra+=(--publish-workflows)
+          fi
+          python3 comphy/sync.py --publish --report receipts/sync.json "${extra[@]}"
       - name: Select candidate checks
         id: report
+        if: always() && hashFiles('receipts/sync.json') != ''
         env:
           EVENT_NAME: ${{ github.event_name }}
         run: |
@@ -41,14 +57,17 @@ jobs:
           import json, os
           from pathlib import Path
           report = json.loads(Path('receipts/sync.json').read_text())
+          status = report.get('status', '')
           with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
-              print('candidate_sha=' + report['candidate_sha'], file=out)
-              verify = report['status'] == 'candidate' or os.environ['EVENT_NAME'] == 'workflow_dispatch'
+              print('candidate_sha=' + report.get('candidate_sha', ''), file=out)
+              verify = status == 'candidate' or (
+                  os.environ['EVENT_NAME'] == 'workflow_dispatch'
+                  and status in ('current', 'candidate', 'workflow-review'))
               print('verify=' + str(verify).lower(), file=out)
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
               print('### Upstream tracking\n```json\n' + json.dumps(report, indent=2) + '\n```', file=out)
           PY
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         if: always()
         with:
           name: comphy-sync
@@ -71,12 +90,12 @@ jobs:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
     steps:
       - name: Checkout trusted verification driver
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           path: control
           persist-credentials: false
       - name: Checkout exact candidate
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           ref: ${{ needs.sync.outputs.candidate_sha }}
           path: candidate
@@ -120,7 +139,7 @@ jobs:
             --candidate-sha "$CANDIDATE_SHA" --source candidate --report receipts/verification.json
       - name: Retain candidate evidence
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: comphy-verification
           path: |
