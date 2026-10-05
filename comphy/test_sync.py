@@ -65,6 +65,11 @@ class GitFixture:
         self._run(self.source, "commit", "--quiet", "-m", message)
         return self.revision(self.source, "HEAD")
 
+    def merge(self, first: str, second: str, message: str) -> str:
+        self._run(self.source, "checkout", "--quiet", "--detach", first)
+        self._run(self.source, "merge", "--quiet", "--no-ff", "-m", message, second)
+        return self.revision(self.source, "HEAD")
+
     def push(self, remote: Path, **branches: str) -> None:
         refspecs = [f"{sha}:refs/heads/{branch}" for branch, sha in branches.items()]
         self._run(self.source, "push", "--quiet", remote, *refspecs)
@@ -403,6 +408,50 @@ class PrepareIntegrationTests(unittest.TestCase):
         self.assertEqual(report["mirrors"]["main"]["publish"], graph["upstream_main"])
         self.assertEqual(report["mirrors"]["main"]["after"], extra["main_workflow"])
         self.assertIn(".github/workflows/upstream-main.yml", report["workflow_gate"]["main"]["paths"])
+
+
+class PublishableRevisionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        SCRATCHPAD.mkdir(exist_ok=True)
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(
+            prefix="comphy-sync-publishable-", dir=SCRATCHPAD)
+        self.fixture = GitFixture(Path(self.temporary.name))
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def test_skips_non_descendant_merge_side_commits(self):
+        workflow = (
+            "name: unreviewed\n"
+            "on: [push]\n"
+            "jobs:\n"
+            "  x:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - run: true\n"
+        )
+        old = self.fixture.commit(self.fixture.base, {"old.txt": "old\n"}, "Old tip")
+        source = self.fixture.commit(old, {"source.txt": "source\n"}, "Source")
+        side = self.fixture.commit(self.fixture.base, {"side.txt": "side\n"}, "Side")
+        merged = self.fixture.merge(source, side, "Merge side")
+        new = self.fixture.commit(
+            merged, {".github/workflows/unreviewed.yml": workflow}, "Workflow")
+
+        listed = self.fixture._run(
+            self.fixture.source, "rev-list", "--reverse", f"{old}..{new}"
+        ).stdout.split()
+        self.assertIn(side, listed)
+        self.assertFalse(sync.ancestor(self.fixture.source, old, side))
+
+        target, paths = sync.publishable_revision(
+            self.fixture.source, old, new, allow_workflows=False)
+        self.assertEqual(paths, [".github/workflows/unreviewed.yml"])
+        self.assertEqual(target, merged)
+        self.assertNotEqual(target, side)
+        self.assertTrue(sync.ancestor(self.fixture.source, old, target))
 
 
 class GitHelperTests(unittest.TestCase):

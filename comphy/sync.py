@@ -119,7 +119,8 @@ def publishable_revision(root: Path, old: str, new: str, *, allow_workflows: boo
     if allow_workflows or not paths:
         return new, paths
     safe = old
-    for commit in git(root, "rev-list", "--reverse", f"{old}..{new}").stdout.split():
+    for commit in git(root, "rev-list", "--reverse", "--topo-order",
+                      "--ancestry-path", f"{old}..{new}").stdout.split():
         if workflow_paths(root, old, commit):
             break
         safe = commit
