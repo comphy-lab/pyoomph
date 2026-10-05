@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+from contextlib import redirect_stdout
+from io import StringIO
 import json
 import os
 from pathlib import Path
@@ -394,9 +396,13 @@ class GitHelperTests(unittest.TestCase):
         with mock.patch.dict(os.environ, environ, clear=False):
             with mock.patch.object(sync, "prepare", side_effect=error):
                 with mock.patch.object(sys, "argv", argv):
-                    with self.assertRaises(SystemExit) as ctx:
-                        sync.main()
+                    with redirect_stdout(StringIO()) as stdout:
+                        with self.assertRaises(SystemExit) as ctx:
+                            sync.main()
         self.assertEqual(ctx.exception.code, 1)
+        logged = stdout.getvalue()
+        self.assertIn("cannot update workflow files", logged)
+        self.assertNotIn(token, logged)
         report_text = report_path.read_text()
         report = json.loads(report_text)
         self.assertEqual(report["status"], "error")
