@@ -2,9 +2,12 @@
 """Offline integration tests for the comphy fork synchroniser."""
 from __future__ import annotations
 
+import base64
+import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -224,10 +227,11 @@ class PrepareIntegrationTests(unittest.TestCase):
             return original_git(root, *args, **kwargs)
 
         with mock.patch.object(sync, "git", side_effect=race_before_push):
-            with self.assertRaises(subprocess.CalledProcessError):
+            with self.assertRaises(RuntimeError) as ctx:
                 self.prepare()
 
         self.assertTrue(raced)
+        self.assertRegex(str(ctx.exception), r"non-fast-forward|rejected|failed to push")
         heads = self.fixture.remote_heads(self.fixture.fork)
         self.assertEqual(heads["refs/heads/main"], race)
         self.assertEqual(heads["refs/heads/develop"], graph["fork_develop"])
@@ -274,6 +278,132 @@ class PrepareIntegrationTests(unittest.TestCase):
             self.fixture.remote_revision(self.fixture.fork, "refs/heads/develop"),
             graph["upstream_develop"],
         )
+
+
+class GitHelperTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        SCRATCHPAD.mkdir(exist_ok=True)
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(
+            prefix="comphy-sync-helpers-", dir=SCRATCHPAD)
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def test_redact_secrets_strips_tokens_and_basic_auth(self):
+        token = "ghs_secretvalue123"
+        auth = base64.b64encode(("x-access-token:" + token).encode()).decode()
+        text = (
+            f"fatal: Authentication failed for {token}\n"
+            f"AUTHORIZATION: basic {auth}\n"
+        )
+        with mock.patch.dict(os.environ, {"GH_TOKEN": token, "GITHUB_TOKEN": token}):
+            redacted = sync.redact_secrets(text)
+        self.assertNotIn(token, redacted)
+        self.assertNotIn(auth, redacted)
+        self.assertIn("***", redacted)
+        self.assertIn("Authentication failed", redacted)
+
+    def test_git_failure_includes_stderr(self):
+        root = Path(self.temporary.name) / "empty-repo"
+        root.mkdir()
+        sync.git(root, "init", "--quiet")
+        with self.assertRaises(RuntimeError) as ctx:
+            sync.git(root, "rev-parse", "--verify", "refs/heads/missing")
+        self.assertIn("Needed a single revision", str(ctx.exception))
+        self.assertNotIn("exited", str(ctx.exception))
+
+    def test_git_failure_redacts_token_from_stderr(self):
+        token = "ghs_super_secret_value"
+        completed = subprocess.CompletedProcess(
+            args=["git", "push", "--atomic", "fork"],
+            returncode=1,
+            stdout="",
+            stderr=(
+                "remote: error: GH013: Repository rule violations found\n"
+                f"remote: refusing token {token}\n"
+            ),
+        )
+        with mock.patch.dict(os.environ, {"GH_TOKEN": token}):
+            with mock.patch("subprocess.run", return_value=completed):
+                with self.assertRaises(RuntimeError) as ctx:
+                    sync.git(Path("."), "push", "--atomic", "fork")
+        self.assertIn("Repository rule violations", str(ctx.exception))
+        self.assertNotIn(token, str(ctx.exception))
+        self.assertIn("***", str(ctx.exception))
+
+    def test_format_command_error_uses_called_process_stderr(self):
+        token = "ghs_called_process_token"
+        error = subprocess.CalledProcessError(
+            1,
+            ["git", "push", "--atomic", "fork"],
+            output="",
+            stderr=(
+                " ! [remote rejected] main (cannot update workflow files)\n"
+                f"Authorization: {token}\n"
+            ),
+        )
+        with mock.patch.dict(os.environ, {"GH_TOKEN": token}):
+            message = sync.format_command_error(error)
+        self.assertIn("cannot update workflow files", message)
+        self.assertNotIn(token, message)
+        self.assertNotIn("returned non-zero exit status", message)
+
+    def test_publish_environment_ignores_checkout_credentials(self):
+        token = "ghs_pat_value"
+        leaked = "AUTHORIZATION: basic leaked-checkout-token"
+        with mock.patch.dict(os.environ, {
+            "GH_TOKEN": token,
+            "GITHUB_TOKEN": "ghs_actions_token",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
+            "GIT_CONFIG_VALUE_0": leaked,
+        }):
+            env = sync.publish_environment(token)
+        auth = base64.b64encode(("x-access-token:" + token).encode()).decode()
+        self.assertNotIn("GITHUB_TOKEN", env)
+        self.assertNotIn("GH_TOKEN", env)
+        self.assertEqual(env["GIT_CONFIG_COUNT"], "1")
+        self.assertEqual(
+            env["GIT_CONFIG_KEY_0"],
+            "http.https://github.com/comphy-lab/pyoomph.git.extraheader",
+        )
+        self.assertEqual(env["GIT_CONFIG_VALUE_0"], "AUTHORIZATION: basic " + auth)
+        self.assertNotIn("leaked-checkout-token", env["GIT_CONFIG_VALUE_0"])
+        self.assertNotIn("ghs_actions_token", env.get("GIT_CONFIG_VALUE_0", ""))
+
+    def test_main_records_redacted_git_stderr(self):
+        token = "ghs_not_a_real_token"
+        stderr = (
+            "remote: error: GH013: Repository rule violations found\n"
+            f"remote: GITHUB_TOKEN cannot update workflow files ({token})\n"
+            " ! [remote rejected] main "
+            "(refusing to allow a GitHub App to create or update workflow files)\n"
+        )
+        error = subprocess.CalledProcessError(
+            1, ["git", "push", "--atomic", "fork"], "", stderr)
+        report_path = Path(self.temporary.name) / "receipts" / "sync.json"
+        argv = ["sync.py", "--publish", "--report", str(report_path)]
+        environ = {
+            "GH_TOKEN": token,
+            "GITHUB_TOKEN": token,
+            "GITHUB_REPOSITORY": "comphy-lab/pyoomph",
+        }
+        with mock.patch.dict(os.environ, environ, clear=False):
+            with mock.patch.object(sync, "prepare", side_effect=error):
+                with mock.patch.object(sys, "argv", argv):
+                    with self.assertRaises(SystemExit) as ctx:
+                        sync.main()
+        self.assertEqual(ctx.exception.code, 1)
+        report_text = report_path.read_text()
+        report = json.loads(report_text)
+        self.assertEqual(report["status"], "error")
+        self.assertIn("cannot update workflow files", report["error"])
+        self.assertIn("remote rejected", report["error"])
+        self.assertNotIn(token, report["error"])
+        self.assertNotIn(token, report_text)
 
 
 if __name__ == "__main__":

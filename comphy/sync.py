@@ -10,16 +10,66 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+from urllib.parse import quote
 
 FORK = "https://github.com/comphy-lab/pyoomph.git"
 UPSTREAM = "https://github.com/cdiddens/pyoomph.git"
+TOKEN_ENV_KEYS = ("GH_TOKEN", "GITHUB_TOKEN")
+
+
+def collected_secrets(*extra: str) -> list[str]:
+    secrets = [value for value in extra if value]
+    for key in TOKEN_ENV_KEYS:
+        value = os.environ.get(key, "")
+        if value:
+            secrets.append(value)
+    derived: list[str] = []
+    for secret in secrets:
+        derived.append(base64.b64encode(("x-access-token:" + secret).encode()).decode())
+        derived.append(quote(secret, safe=""))
+    unique: list[str] = []
+    for secret in (*secrets, *derived):
+        if secret and secret not in unique:
+            unique.append(secret)
+    unique.sort(key=len, reverse=True)
+    return unique
+
+
+def redact_secrets(text: str, *extra: str) -> str:
+    if not text:
+        return text
+    redacted = text
+    for secret in collected_secrets(*extra):
+        redacted = redacted.replace(secret, "***")
+    return redacted
+
+
+def format_command_error(exc: BaseException) -> str:
+    chunks: list[str] = []
+    for part in (getattr(exc, "stderr", None), getattr(exc, "stdout", None)):
+        if isinstance(part, bytes):
+            part = part.decode("utf-8", errors="replace")
+        if part:
+            chunks.append(part.strip())
+    if not chunks:
+        chunks.append(str(exc))
+    return redact_secrets("\n".join(chunks).strip())
 
 
 def git(root: Path, *args: str, check: bool = True, env=None):
-    return subprocess.run(
+    result = subprocess.run(
         ["git", "-C", str(root), *args], text=True, capture_output=True,
-        check=check, env=env, timeout=180,
+        check=False, env=env, timeout=180,
     )
+    if result.stdout:
+        result.stdout = redact_secrets(result.stdout)
+    if result.stderr:
+        result.stderr = redact_secrets(result.stderr)
+    if check and result.returncode:
+        detail = (result.stderr or result.stdout or "").strip()
+        command = " ".join(("git", *args))
+        raise RuntimeError(detail or f"{command} exited {result.returncode}")
+    return result
 
 
 def revision(root: Path, ref: str) -> str:
@@ -41,6 +91,18 @@ def anonymous_environment():
     }
     environment.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
                        GIT_TERMINAL_PROMPT="0", GIT_ASKPASS="/bin/false")
+    return environment
+
+
+def publish_environment(token: str):
+    """Authenticate fork pushes with GH_TOKEN only; ignore checkout credentials."""
+    environment = anonymous_environment()
+    auth = base64.b64encode(("x-access-token:" + token).encode()).decode()
+    environment.update(
+        GIT_CONFIG_COUNT="1",
+        GIT_CONFIG_KEY_0="http.https://github.com/comphy-lab/pyoomph.git.extraheader",
+        GIT_CONFIG_VALUE_0="AUTHORIZATION: basic " + auth,
+    )
     return environment
 
 
@@ -130,17 +192,14 @@ def main():
         token = os.environ.get("GH_TOKEN", "")
         if not token:
             parser.error("GH_TOKEN is required")
-        auth = base64.b64encode(("x-access-token:" + token).encode()).decode()
-        env.update(GIT_CONFIG_COUNT="1",
-                   GIT_CONFIG_KEY_0="http.https://github.com/comphy-lab/pyoomph.git.extraheader",
-                   GIT_CONFIG_VALUE_0="AUTHORIZATION: basic " + auth)
+        env = publish_environment(token)
     args.report.parent.mkdir(parents=True, exist_ok=True)
     report = {"status": "error", "published": False}
     try:
         with tempfile.TemporaryDirectory(prefix="comphy-sync-", dir=args.report.parent) as directory:
             prepare(Path(directory), FORK, UPSTREAM, publish=args.publish, push_env=env, report=report)
     except (RuntimeError, subprocess.SubprocessError) as exc:
-        report["error"] = str(exc)
+        report["error"] = format_command_error(exc)
         report["status"] = "error"
     args.report.write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2))
