@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: '23 5 * * *'
   workflow_dispatch:
+    inputs:
+      publish_workflows:
+        description: After review, publish mirrored refs that update .github/workflows
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -17,6 +22,9 @@ jobs:
     if: github.repository == 'comphy-lab/pyoomph' && github.ref == 'refs/heads/comphy'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    environment:
+      name: comphy-sync
+      url: https://github.com/comphy-lab/pyoomph/actions/runs/${{ github.run_id }}
     permissions:
       contents: write
     outputs:
@@ -30,11 +38,18 @@ jobs:
         run: python3 -m unittest discover -s comphy -p test_sync.py -v
       - name: Mirror upstream and prepare candidate
         env:
-          # Fine-grained PAT with Contents + Workflows; GITHUB_TOKEN cannot update workflows.
-          GH_TOKEN: ${{ secrets.COMPHY_SYNC_TOKEN || github.token }}
-        run: python3 comphy/sync.py --publish --report receipts/sync.json
+          GH_TOKEN: ${{ github.token }}
+          COMPHY_SYNC_TOKEN: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish_workflows == 'true' && secrets.COMPHY_SYNC_TOKEN || '' }}
+          PUBLISH_WORKFLOWS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.publish_workflows == 'true' }}
+        run: |
+          extra=()
+          if [ "$PUBLISH_WORKFLOWS" = "true" ]; then
+            extra+=(--publish-workflows)
+          fi
+          python3 comphy/sync.py --publish --report receipts/sync.json "${extra[@]}"
       - name: Select candidate checks
         id: report
+        if: always() && hashFiles('receipts/sync.json') != ''
         env:
           EVENT_NAME: ${{ github.event_name }}
         run: |
@@ -42,9 +57,12 @@ jobs:
           import json, os
           from pathlib import Path
           report = json.loads(Path('receipts/sync.json').read_text())
+          status = report.get('status', '')
           with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
-              print('candidate_sha=' + report['candidate_sha'], file=out)
-              verify = report['status'] == 'candidate' or os.environ['EVENT_NAME'] == 'workflow_dispatch'
+              print('candidate_sha=' + report.get('candidate_sha', ''), file=out)
+              verify = status == 'candidate' or (
+                  os.environ['EVENT_NAME'] == 'workflow_dispatch'
+                  and status in ('current', 'candidate', 'workflow-review'))
               print('verify=' + str(verify).lower(), file=out)
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
               print('### Upstream tracking\n```json\n' + json.dumps(report, indent=2) + '\n```', file=out)

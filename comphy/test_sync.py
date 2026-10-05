@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import base64
-from contextlib import redirect_stdout
+from contextlib import redirect_stdout, redirect_stderr
 from io import StringIO
 import json
 import os
@@ -115,6 +115,38 @@ class GitFixture:
             "comphy": comphy,
         }
 
+    def add_workflow_commits(self, *, main_parent: str, develop_parent: str,
+                             source_first: bool = True) -> dict[str, str]:
+        result: dict[str, str] = {}
+        if source_first:
+            main_parent = self.commit(
+                main_parent, {"more-main.txt": "more main\n"}, "Upstream main source")
+            develop_parent = self.commit(
+                develop_parent, {"more-develop.txt": "more develop\n"}, "Upstream develop source")
+            result["main_source"] = main_parent
+            result["develop_source"] = develop_parent
+        workflow = (
+            "name: unreviewed\n"
+            "on: [push]\n"
+            "jobs:\n"
+            "  x:\n"
+            "    runs-on: ubuntu-latest\n"
+            "    steps:\n"
+            "      - run: true\n"
+        )
+        result["main_workflow"] = self.commit(
+            main_parent,
+            {".github/workflows/upstream-main.yml": workflow},
+            "Upstream main workflow",
+        )
+        result["develop_workflow"] = self.commit(
+            develop_parent,
+            {".github/workflows/upstream-develop.yml": workflow},
+            "Upstream develop workflow",
+        )
+        self.push(self.upstream, main=result["main_workflow"], develop=result["develop_workflow"])
+        return result
+
 
 class PrepareIntegrationTests(unittest.TestCase):
     @classmethod
@@ -129,12 +161,13 @@ class PrepareIntegrationTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
-    def prepare(self, name: str = "sync"):
+    def prepare(self, name: str = "sync", *, publish_workflows: bool = False):
         return sync.prepare(
             self.fixture.checkout(name),
             os.fspath(self.fixture.fork),
             os.fspath(self.fixture.upstream),
             publish=True,
+            publish_workflows=publish_workflows,
         )
 
     def test_fast_forwards_mirrors_and_preserves_comphy(self):
@@ -281,6 +314,96 @@ class PrepareIntegrationTests(unittest.TestCase):
             graph["upstream_develop"],
         )
 
+    def test_workflow_files_wait_for_reviewed_publication(self):
+        graph = self.fixture.populate()
+        baseline = self.prepare("baseline")
+        extra = self.fixture.add_workflow_commits(
+            main_parent=graph["upstream_main"],
+            develop_parent=graph["upstream_develop"],
+        )
+
+        gated = self.prepare("gated")
+
+        self.assertEqual(
+            self.fixture.remote_revision(self.fixture.fork, "refs/heads/main"),
+            extra["main_source"],
+        )
+        self.assertEqual(
+            self.fixture.remote_revision(self.fixture.fork, "refs/heads/develop"),
+            extra["develop_source"],
+        )
+        self.assertEqual(
+            self.fixture.remote_revision(self.fixture.fork, "refs/heads/comphy"),
+            graph["comphy"],
+        )
+        self.assertNotEqual(
+            self.fixture.remote_revision(self.fixture.fork, "refs/heads/main"),
+            extra["main_workflow"],
+        )
+        self.assertIn("main", gated["workflow_gate"])
+        self.assertIn("develop", gated["workflow_gate"])
+        self.assertEqual(
+            gated["workflow_gate"]["main"]["paths"],
+            [".github/workflows/upstream-main.yml"],
+        )
+        self.assertNotIn(
+            f"{extra['main_workflow']}:refs/heads/main", gated["intended_refspecs"])
+        self.assertNotIn(
+            f"{extra['develop_workflow']}:refs/heads/develop", gated["intended_refspecs"])
+        self.assertEqual(gated["status"], "candidate")
+        self.assertEqual(gated["mirrors"]["develop"]["publish"], extra["develop_source"])
+        names = self.fixture._run(
+            self.fixture.fork, "ls-tree", "-r", "--name-only", gated["candidate_sha"]
+        ).stdout.splitlines()
+        self.assertNotIn(".github/workflows/upstream-develop.yml", names)
+        self.assertNotEqual(gated["candidate_sha"], baseline["candidate_sha"])
+
+        reviewed = self.prepare("reviewed", publish_workflows=True)
+
+        self.assertEqual(
+            self.fixture.remote_revision(self.fixture.fork, "refs/heads/main"),
+            extra["main_workflow"],
+        )
+        self.assertEqual(
+            self.fixture.remote_revision(self.fixture.fork, "refs/heads/develop"),
+            extra["develop_workflow"],
+        )
+        self.assertEqual(reviewed["workflow_gate"], {})
+        self.assertIn(
+            f"{extra['main_workflow']}:refs/heads/main", reviewed["intended_refspecs"])
+        names = self.fixture._run(
+            self.fixture.fork, "ls-tree", "-r", "--name-only", reviewed["candidate_sha"]
+        ).stdout.splitlines()
+        self.assertIn(".github/workflows/upstream-develop.yml", names)
+        self.assertEqual(
+            self.fixture.remote_revision(self.fixture.fork, "refs/heads/comphy"),
+            graph["comphy"],
+        )
+
+    def test_workflow_only_update_publishes_no_refs_until_review(self):
+        graph = self.fixture.populate()
+        baseline = self.prepare("baseline")
+        self.fixture._run(
+            self.fixture.fork, "update-ref", "refs/heads/comphy", baseline["candidate_sha"])
+        extra = self.fixture.add_workflow_commits(
+            main_parent=graph["upstream_main"],
+            develop_parent=graph["upstream_develop"],
+            source_first=False,
+        )
+        heads_before = self.fixture.remote_heads(self.fixture.fork)
+
+        report = self.prepare("workflow-only")
+
+        self.assertEqual(report["status"], "workflow-review")
+        self.assertEqual(report["publication"], "no-changes")
+        self.assertFalse(report["published"])
+        self.assertEqual(report["intended_refspecs"], [])
+        self.assertEqual(self.fixture.remote_heads(self.fixture.fork), heads_before)
+        self.assertEqual(report["candidate_sha"], baseline["candidate_sha"])
+        self.assertEqual(report["mirrors"]["main"]["publish"], graph["upstream_main"])
+        self.assertEqual(report["mirrors"]["main"]["after"], extra["main_workflow"])
+        self.assertIn(".github/workflows/upstream-main.yml", report["workflow_gate"]["main"]["paths"])
+
 
 class GitHelperTests(unittest.TestCase):
     @classmethod
@@ -301,7 +424,7 @@ class GitHelperTests(unittest.TestCase):
             f"fatal: Authentication failed for {token}\n"
             f"AUTHORIZATION: basic {auth}\n"
         )
-        with mock.patch.dict(os.environ, {"GH_TOKEN": token, "GITHUB_TOKEN": token}):
+        with mock.patch.dict(os.environ, {"GH_TOKEN": token, "GITHUB_TOKEN": token, "COMPHY_SYNC_TOKEN": token}):
             redacted = sync.redact_secrets(text)
         self.assertNotIn(token, redacted)
         self.assertNotIn(auth, redacted)
@@ -410,6 +533,21 @@ class GitHelperTests(unittest.TestCase):
         self.assertIn("remote rejected", report["error"])
         self.assertNotIn(token, report["error"])
         self.assertNotIn(token, report_text)
+
+    def test_main_publish_workflows_requires_environment_token(self):
+        report_path = Path(self.temporary.name) / "receipts" / "sync.json"
+        argv = ["sync.py", "--publish", "--publish-workflows", "--report", str(report_path)]
+        environ = {
+            "GH_TOKEN": "ghs_actions_token",
+            "COMPHY_SYNC_TOKEN": "",
+            "GITHUB_REPOSITORY": "comphy-lab/pyoomph",
+        }
+        with mock.patch.dict(os.environ, environ, clear=False):
+            with mock.patch.object(sys, "argv", argv):
+                with redirect_stderr(StringIO()):
+                    with self.assertRaises(SystemExit) as ctx:
+                        sync.main()
+        self.assertEqual(ctx.exception.code, 2)
 
 
 if __name__ == "__main__":

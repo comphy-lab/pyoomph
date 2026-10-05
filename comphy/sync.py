@@ -14,7 +14,8 @@ from urllib.parse import quote
 
 FORK = "https://github.com/comphy-lab/pyoomph.git"
 UPSTREAM = "https://github.com/cdiddens/pyoomph.git"
-TOKEN_ENV_KEYS = ("GH_TOKEN", "GITHUB_TOKEN")
+TOKEN_ENV_KEYS = ("GH_TOKEN", "GITHUB_TOKEN", "COMPHY_SYNC_TOKEN")
+WORKFLOW_PATH = ".github/workflows"
 
 
 def collected_secrets(*extra: str) -> list[str]:
@@ -87,7 +88,7 @@ def anonymous_environment():
     environment = {
         key: value for key, value in os.environ.items()
         if not key.startswith("GIT_CONFIG")
-        and key not in {"GIT_ASKPASS", "SSH_ASKPASS", "GH_TOKEN", "GITHUB_TOKEN"}
+        and key not in {"GIT_ASKPASS", "SSH_ASKPASS", "GH_TOKEN", "GITHUB_TOKEN", "COMPHY_SYNC_TOKEN"}
     }
     environment.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
                        GIT_TERMINAL_PROMPT="0", GIT_ASKPASS="/bin/false")
@@ -95,7 +96,7 @@ def anonymous_environment():
 
 
 def publish_environment(token: str):
-    """Authenticate fork pushes with GH_TOKEN only; ignore checkout credentials."""
+    """Authenticate fork pushes with the given token; ignore checkout credentials."""
     environment = anonymous_environment()
     auth = base64.b64encode(("x-access-token:" + token).encode()).decode()
     environment.update(
@@ -106,7 +107,27 @@ def publish_environment(token: str):
     return environment
 
 
-def prepare(root: Path, fork: str, upstream: str, *, publish=False, push_env=None, report=None):
+def workflow_paths(root: Path, old: str, new: str) -> list[str]:
+    if old == new:
+        return []
+    return git(root, "diff", "--name-only", old, new, "--", WORKFLOW_PATH).stdout.splitlines()
+
+
+def publishable_revision(root: Path, old: str, new: str, *, allow_workflows: bool) -> tuple[str, list[str]]:
+    """Last fast-forward of old..new that does not change workflow files, unless reviewed."""
+    paths = workflow_paths(root, old, new)
+    if allow_workflows or not paths:
+        return new, paths
+    safe = old
+    for commit in git(root, "rev-list", "--reverse", f"{old}..{new}").stdout.split():
+        if workflow_paths(root, old, commit):
+            break
+        safe = commit
+    return safe, paths
+
+
+def prepare(root: Path, fork: str, upstream: str, *, publish=False,
+            publish_workflows=False, push_env=None, report=None):
     """Use a fresh disposable repository. URLs are injectable only for offline tests."""
     git(root, "init", "--quiet")
     git(root, "config", "user.name", "CoMPhy maintenance")
@@ -127,18 +148,26 @@ def prepare(root: Path, fork: str, upstream: str, *, publish=False, push_env=Non
               "fork": fork, "upstream": upstream,
               "comphy_sha": base, "mirrors": {}, "candidate_sha": base,
               "candidate_ref": "comphy", "candidate_created": False,
-              "status": "current", "published": False, "publication": "not-requested"})
+              "status": "current", "published": False, "publication": "not-requested",
+              "workflow_gate": {}})
     refspecs = []
     for branch in ("main", "develop"):
         old = revision(root, f"refs/remotes/fork/{branch}")
         new = revision(root, f"refs/remotes/upstream/{branch}")
         if not ancestor(root, old, new):
             raise RuntimeError(f"{branch}: upstream diverged from mirrored {old}; no refs published")
-        report["mirrors"][branch] = {"before": old, "after": new}
-        if old != new:
-            refspecs.append(f"{new}:refs/heads/{branch}")
+        target, paths = publishable_revision(root, old, new, allow_workflows=publish_workflows)
+        report["mirrors"][branch] = {
+            "before": old, "after": new, "publish": target, "workflow_paths": paths,
+        }
+        if paths and target != new:
+            report["workflow_gate"][branch] = {
+                "blocked": new, "publishable": target, "paths": paths,
+            }
+        if old != target:
+            refspecs.append(f"{target}:refs/heads/{branch}")
 
-    development = report["mirrors"]["develop"]["after"]
+    development = report["mirrors"]["develop"]["publish"]
     if not ancestor(root, development, base):
         ref = f"sync/upstream-{base[:12]}-{development[:12]}"
         git(root, "checkout", "--detach", base)
@@ -162,6 +191,8 @@ def prepare(root: Path, fork: str, upstream: str, *, publish=False, push_env=Non
                 refspecs.append(f"{candidate}:refs/heads/{ref}")
                 report["candidate_created"] = True
             report.update(status="candidate", candidate_sha=candidate, candidate_ref=ref)
+    elif report["workflow_gate"]:
+        report["status"] = "workflow-review"
 
     report["intended_refspecs"] = refspecs
     if publish and refspecs:
@@ -180,30 +211,45 @@ def prepare(root: Path, fork: str, upstream: str, *, publish=False, push_env=Non
     return report
 
 
+def env_flag(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--publish", action="store_true")
+    parser.add_argument("--publish-workflows", action="store_true",
+                        help="Publish mirrored refs that update .github/workflows after review")
     parser.add_argument("--report", type=Path, required=True)
     args = parser.parse_args()
+    publish_workflows = args.publish_workflows or env_flag("PUBLISH_WORKFLOWS")
+    if publish_workflows and not args.publish:
+        parser.error("--publish-workflows requires --publish")
     env = os.environ.copy()
     if args.publish:
         if os.environ.get("GITHUB_REPOSITORY") != "comphy-lab/pyoomph":
             parser.error("Publishing is restricted to comphy-lab/pyoomph Actions")
-        token = os.environ.get("GH_TOKEN", "")
-        if not token:
-            parser.error("GH_TOKEN is required")
+        if publish_workflows:
+            token = os.environ.get("COMPHY_SYNC_TOKEN", "")
+            if not token:
+                parser.error("COMPHY_SYNC_TOKEN is required to publish workflow files")
+        else:
+            token = os.environ.get("GH_TOKEN", "")
+            if not token:
+                parser.error("GH_TOKEN is required")
         env = publish_environment(token)
     args.report.parent.mkdir(parents=True, exist_ok=True)
     report = {"status": "error", "published": False}
     try:
         with tempfile.TemporaryDirectory(prefix="comphy-sync-", dir=args.report.parent) as directory:
-            prepare(Path(directory), FORK, UPSTREAM, publish=args.publish, push_env=env, report=report)
+            prepare(Path(directory), FORK, UPSTREAM, publish=args.publish,
+                    publish_workflows=publish_workflows, push_env=env, report=report)
     except (RuntimeError, subprocess.SubprocessError) as exc:
         report["error"] = format_command_error(exc)
         report["status"] = "error"
     args.report.write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2))
-    if report["status"] in ("error", "conflict"):
+    if report["status"] in ("error", "conflict", "workflow-review"):
         raise SystemExit(1)
 
 
