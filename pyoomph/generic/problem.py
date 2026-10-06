@@ -29,6 +29,7 @@ from __future__ import annotations
 import contextlib
 import json
 import glob
+import re
 import sys
 import warnings
 from .._deprecation import deprecated_kwargs as _deprecated_kwargs
@@ -863,6 +864,23 @@ class InvertedElementRemeshRequest(RuntimeError):
     """
 
 
+# The launcher advertises the job through the environment - OMPI_COMM_WORLD_SIZE, the ORTE contact
+# URI, and the PMIx equivalents - and a child process inherits all of it. A plain python3 started from
+# rank 0 therefore joins the PARENT's MPI job in its own MPI_Init (pyoomph calls InitMPI on import),
+# believes it is rank 0 of an n-rank world, and blocks in the first collective it makes waiting for
+# three peers that are busy solving. That is what made the dedicated plot process hang under mpirun
+# while producing not one line of output. A child meant to run serially has to be told none of it.
+# PMI_/PMIX_ already cover an srun-launched job, so SLURM_* is deliberately left in place: a script
+# may legitimately read it, and removing it would not stop an enrolment that those two do not.
+_MPI_ENV_PREFIXES=("OMPI_","PMIX_","PMI_","HYDRA_","MPIR_","I_MPI_","MV2_")
+_MPI_ENV_NAMES=("MPI_LOCALRANKID","MPI_LOCALNRANKS")
+
+def _environment_without_mpi()->dict[str,str]:
+    """os.environ with everything that would enrol a child process in this MPI job removed."""
+    return {k:v for k,v in os.environ.items()
+            if not k.startswith(_MPI_ENV_PREFIXES) and k not in _MPI_ENV_NAMES}
+
+
 class Problem(_pyoomph.Problem):
     """A class representing a problem in the pyoomph library.
 
@@ -930,6 +948,13 @@ class Problem(_pyoomph.Problem):
         #: How many times one solve() call may remesh and retry after an inverted element before
         #: giving up. A domain that stays folded should fail loudly rather than loop.
         self.inversion_remesh_max_retries:int=3
+        #: Element sizes to ask the remesher for on successive retries, as multiples of each
+        #: template's own ``default_resolution``. Retrying without varying anything cannot work -
+        #: same geometry, same dt, same settings, so the same mesh - which is why a budget of 10
+        #: was measured to fail at exactly the same time as one of 3. The first retry keeps the
+        #: template's own sizes, so a fold a plain remesh does cure is cured as before; only the
+        #: later ones differ. Entries beyond the last are the last.
+        self.inversion_remesh_size_factors:list[float]=[1.0,0.7,1.4]
         #: A step that reported an inversion counts as folded when it achieved less than this fraction
         #: of the last clean step. 1/16 is four halvings: an ordinary transient inversion costs one or
         #: two and stays well above it, while a fold goes to the dt floor and falls far below.
@@ -1114,6 +1139,11 @@ class Problem(_pyoomph.Problem):
         self._run_statement_endtime:float | None=None
         self._loaded_run_statement_endtime:float | None=None
         self._where_expression="True"
+        # The state file a --runmode continue will resume from, resolved in initialise() together with
+        # the "can we continue at all" check and long before the load. Doing it there rather than at
+        # the load is what lets a malformed or unmatched --where fail in a second, instead of after
+        # code generation and compilation.
+        self._continue_state_file:str | None=None
 
         self._dump_header = "pyoomph_dump"
         # 0.1.0 stores the mesh structurally (see pyoomph/meshes/meshstate.py) instead of by rank-local
@@ -1182,6 +1212,12 @@ class Problem(_pyoomph.Problem):
         self.plotter:list[MatplotlibPlotter] | MatplotlibPlotter | None=None
         self.plot_in_dedicated_process:bool=False
         self._plotting_process:subprocess.Popen | None=None
+        # Whether a dedicated plot process is in charge of the plotting, as opposed to this process
+        # doing it itself. Separate from _plotting_process because only rank 0 owns the Popen, while
+        # every rank has to take the same branch: perform_plot is collective on a distributed mesh
+        # (rank 0 draws, the others serve it the merged mesh data), so a rank deciding on its own
+        # handle would have rank 0 skip the plot while the rest wait for it forever.
+        self._dedicated_plotter_active:bool=False
         self.latex_printer:"LaTeXPrinter | None"=None
 
         self.write_states:bool=True
@@ -1606,6 +1642,7 @@ class Problem(_pyoomph.Problem):
         if self._released:
             return
         self._released=True
+        self._shutdown_dedicated_plotter()
         for m in self._meshdict.values():
             if not isinstance(m,ODEStorageMesh):
                 _teardown_spatial_mesh(m)
@@ -2111,11 +2148,9 @@ class Problem(_pyoomph.Problem):
         Parameters:
             **kwargs: Keyword arguments specifying the scaling factors.
                 The keys are the variable names, and the values are either numerical scaling factors
-                or string expressions. In the latter case, we can set one scaling to another one, e.g.
-                
-                    ``set_scaling(u=1*meter/second,v="u")`` 
-                
-                would set the scaling of "v" to the one of "u"
+                or string expressions. In the latter case, we can set one scaling to another one,
+                e.g. ``set_scaling(u=1*meter/second,v="u")`` would set the scaling of "v" to the one
+                of "u".
         """            
         for k,v in kwargs.items():
             if type(v)==str:
@@ -2386,8 +2421,44 @@ class Problem(_pyoomph.Problem):
         )
         self.output(increase_time_for_PVD=True if dt is None else dt)
 
+    def _shutdown_dedicated_plotter(self,timeout:float=600.0):
+        """Let a dedicated plot process finish the states it was given, then wait for it.
+
+        Without this the plotter produced nothing at all: the child reads state file names from its
+        stdin and plots them one at a time, so simply exiting killed it in the middle of the queue -
+        usually before the first plot. It listens for the "__exit__" line (see _perform_replot), which
+        nothing ever sent.
+        """
+        proc=self._plotting_process
+        self._plotting_process=None
+        self._dedicated_plotter_active=False
+        if proc is None:
+            return
+        try:
+            if proc.poll() is None and proc.stdin is not None:
+                proc.stdin.write(b"__exit__\n")
+                proc.stdin.flush()
+        except (BrokenPipeError,OSError):
+            pass  # already gone; nothing left to ask of it
+        try:
+            if proc.stdin is not None:
+                proc.stdin.close()
+        except (BrokenPipeError,OSError):
+            pass
+        try:
+            retcode=proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            print("Dedicated plot process did not finish within "+str(timeout)+" s, terminating it. "
+                  "Its plots may be incomplete; see "+self.get_output_directory("_dedicated_plotter_log.txt"))
+            proc.kill()
+            proc.wait()
+            return
+        if retcode!=0 and not self.is_quiet():
+            print("Dedicated plot process exited with code "+str(retcode)+", see "
+                  +self.get_output_directory("_dedicated_plotter_log.txt"))
+
     def perform_plot(self):
-        if self._plotting_process is not None:
+        if self._dedicated_plotter_active:
             raise RuntimeError("Should not end up here")
         if isinstance(self.plotter, list):
             for p in self.plotter:
@@ -2556,25 +2627,29 @@ class Problem(_pyoomph.Problem):
             self.save_state(statefname)
             
         if self.plotter is not None:
-            if self._plotting_process is None:
+            # Asked on the replicated flag, not on this rank's handle: see _dedicated_plotter_active.
+            if not self._dedicated_plotter_active:
                 self.perform_plot()
 
-
-        if self._plotting_process is not None:
-            if self._plotting_process.poll() is not None:
-                raise RuntimeError("Plotting process failed. Have a look at " + self.get_output_directory("_dedicated_plotter_log.txt"))
+        if self._dedicated_plotter_active:
             if not self.write_states:
                 raise RuntimeError("Plotting process is active, but write_states is False. Please set write_states to True to use the plotting process")
-            print("State file written, invoking plotting process")
-            assert self._plotting_process.stdin is not None
-            assert statefname is not None
-            self._plotting_process.stdin.write((statefname + "\n").encode("utf-8"))
-            self._plotting_process.stdin.flush()
+            # Only rank 0 runs the child and only rank 0 wrote the state file it is to plot, so only
+            # rank 0 has anything to say to it. A failure of the child is shared, because the other
+            # ranks would otherwise carry on happily while the plots stopped appearing.
+            error:Exception | None=None
+            if self._plotting_process is not None:
+                if self._plotting_process.poll() is not None:
+                    error=RuntimeError("Plotting process failed. Have a look at " + self.get_output_directory("_dedicated_plotter_log.txt"))
+                else:
+                    print("State file written, invoking plotting process")
+                    assert self._plotting_process.stdin is not None
+                    assert statefname is not None
+                    self._plotting_process.stdin.write((statefname + "\n").encode("utf-8"))
+                    self._plotting_process.stdin.flush()
+            mpi_share_root_failure(error,context="feeding the dedicated plot process")
 
-
-            self._output_step += 1  # Write with the updated outstep here ??
-        else:
-            self._output_step += 1
+        self._output_step += 1
 
 
 
@@ -2607,7 +2682,14 @@ class Problem(_pyoomph.Problem):
         if redefined:
             cinfo={"redefined":True}
         if self._runmode=="continue":
-            cinfo={"outstep":self._output_step,"dimtime":self.get_current_time(),"nondimtime":self.get_current_time(dimensional=False,as_float=True),"floattime":self.get_current_time(dimensional=True,as_float=False)}
+            # outstep is the step the resumed run will write NEXT: _output_step was already incremented
+            # in the continue branch of initialise(). So everything the aborted run wrote with a step
+            # >= outstep, or at a time later than these, is about to be recomputed.
+            # floattime is the dimensional time as a plain float, which is what the text outputs carry
+            # in their time column (see _BaseOutputter.get_time). It used to be passed with
+            # as_float=False, making it an Expression and a mere duplicate of dimtime, and no consumer
+            # noticed because none of these four values was read at all.
+            cinfo={"outstep":self._output_step,"dimtime":self.get_current_time(),"nondimtime":self.get_current_time(dimensional=False,as_float=True),"floattime":self.get_current_time(dimensional=True,as_float=True)}
         self._equation_system._init_output(continue_info=cinfo,rank=get_mpi_rank()) 
 
 
@@ -3558,7 +3640,7 @@ class Problem(_pyoomph.Problem):
         self.cmdlineparser.add_argument("--runmode",help="Selects the runmode ([d]elete and run, [o]verride and run, [c]ontinue, [p]lot again",type=str)
         self.cmdlineparser.add_argument("--recompile_on_continue",help="When using --runmode c, compilation and code writing is usually suppressed. You can recompile the code anyhow with this flag",action="store_true")
         self.cmdlineparser.add_argument("--verbose",help="Gives a lot of output",action='store_true')
-        self.cmdlineparser.add_argument("--where",help="Python bool expression involving variables time or step. Only used in runmodes c and p",type=str,default="True")
+        self.cmdlineparser.add_argument("--where",help="Which state file(s) to use. Only used in runmodes c and p: --runmode p replots every match, --runmode c resumes from the last one. Accepts the name of a .dump state file (also one outside the output directory), 'i=N' for the Nth state file sorted by name (negative counts from the end, so i=-1 is the last one and the default behaviour), 't=X' or 'time=X' for the last state at or before the dimensional time X (seconds, or an expression with units such as 2.5*milli*second), or a Python bool expression over the variables 'step' and 'time' (the latter again dimensional, in seconds), e.g. 'step==10'. A bare number is refused as ambiguous between i= and t=. Default 'True', i.e. every state.",type=str,default="True")
         self.cmdlineparser.add_argument("--largest_residuals",help="Debug the largest residuals",type=int,default=self._debug_largest_residual)
         self.cmdlineparser.add_argument("--generate_precice_cfg",help="Generate some parts of a preCICE configuration file from the coupling equations",action="store_true")
         self.cmdlineparser.add_argument("--quick-test",help="Stops after the first successful Newton method. Useful for quick testing",action="store_true")
@@ -4095,6 +4177,38 @@ class Problem(_pyoomph.Problem):
                 return False,res
             return (dt_done<ref*self.inversion_remesh_dt_collapse),res
 
+        def remesh_at(factor:float)->None:
+            """Remesh the folded domains, asking for element sizes scaled by ``factor``.
+
+            Retrying without varying anything is the one thing that cannot work: the remesher is
+            handed the same geometry, at the same dt, with the same settings, so it produces
+            essentially the same mesh and it folds again. Measured on the printhead,
+            inversion_remesh_max_retries=10 failed at exactly the same microsecond as 3. The
+            give-up message below already named this ("or the remesher is reproducing the same bad
+            mesh") without anything acting on it.
+
+            default_resolution is the knob rather than mesh_size_factor, which sounds like the
+            right one and is not: it is applied in point() and add_ball() only, so it misses the
+            gmsh size FIELDS - and a template that drives its sizes from fields is exactly the one
+            that needs varying. Every define_geometry derives its sizes from default_resolution,
+            fields included, so scaling it reaches all of them.
+            """
+            # default_resolution is a convention every define_geometry follows, not a member of
+            # MeshTemplate itself, so it is read and written through getattr/setattr -- a plain
+            # attribute assignment is what the type checkers flag here, not the duck typing.
+            saved={t:getattr(t,"default_resolution",None) for t in self._domains_remesh_on_inversion}
+            try:
+                for t,base in saved.items():
+                    if base is not None:
+                        setattr(t,"default_resolution",base*factor)
+                self.force_remesh(self._domains_remesh_on_inversion)
+            finally:
+                for t,base in saved.items():
+                    if base is not None:
+                        setattr(t,"default_resolution",base)
+
+        factors=list(self.inversion_remesh_size_factors) or [1.0]
+        tried:list[float]=[]
         snapshot=self._snapshot_state()
         for i in range(self.inversion_remesh_max_retries+1):
             fold,res=attempt(arm_threshold=(i>0))
@@ -4102,15 +4216,19 @@ class Problem(_pyoomph.Problem):
                 return res
             if i>=self.inversion_remesh_max_retries:
                 raise InvertedElementRemeshRequest(
-                    "The mesh kept folding after "+str(i)+" remeshes. Either the domain itself is "
-                    "degenerating, in which case no remesh can help, or the remesher is reproducing the "
-                    "same bad mesh. Problem.inversion_remesh_max_retries raises the budget.")
+                    "The mesh kept folding after "+str(i)+" remeshes, at element sizes scaled by "
+                    +", ".join(repr(f) for f in tried)+" times the template's own. Either the domain "
+                    "itself is degenerating, in which case no remesh can help, or every one of those "
+                    "meshes is bad in the same way. Problem.inversion_remesh_max_retries raises the "
+                    "budget and Problem.inversion_remesh_size_factors chooses the sizes.")
+            factor=factors[min(i,len(factors)-1)]
+            tried.append(factor)
             if not self.is_quiet():
                 print("INVERTED ELEMENT: the step collapsed without getting past the fold; restoring "
-                      "the last good state and remeshing (attempt "+str(i+1)+" of "+
-                      str(self.inversion_remesh_max_retries)+")")
+                      "the last good state and remeshing at "+repr(factor)+" times the element size "
+                      "(attempt "+str(i+1)+" of "+str(self.inversion_remesh_max_retries)+")")
             self._restore_state(snapshot)
-            self.force_remesh(self._domains_remesh_on_inversion)
+            remesh_at(factor)
             snapshot=self._snapshot_state()   # the old one describes the old mesh
 
     def _perform_pending_remesh(self) -> bool:
@@ -4587,12 +4705,27 @@ class Problem(_pyoomph.Problem):
 
 
         if self._runmode=="continue":
-            # Find the highest dump
-            dumpdir = os.path.join(self.get_output_directory(), "_states")
-            dumps = sorted(glob.glob(os.path.join(dumpdir, "*.dump")))
-            if len(dumps)==0 or keyfile is None or not os.path.isfile(keyfile):
+            # Resolve --where here and not at the load further down: reading a state header touches
+            # nothing of the problem (DumpFile never calls the getters in read mode), so a bad
+            # selector can be reported before mesh generation and compilation. The downgrade below
+            # also needs to know whether the user asked for a particular state.
+            keyfile_ok = keyfile is not None and os.path.isfile(keyfile)
+            self._continue_state_file = self._select_state_file_to_continue(self._where_expression)
+            if not self._is_default_where(self._where_expression):
+                if self._continue_state_file is None:
+                    raise RuntimeError("--runmode c --where '"+self._where_expression+"' does not "
+                                       "select any state file in "+self._state_dir()+". Not starting "
+                                       "over, because you asked for a particular state: check the "
+                                       "selector, or drop --where to resume from the last state.")
+                if not keyfile_ok:
+                    # An explicitly named state is honoured even here, since it may well come from
+                    # another output directory that this one knows nothing about.
+                    print("Continuing although this output directory has no run keyfile, because "
+                          "--where names a state explicitly")
+            elif self._continue_state_file is None or not keyfile_ok:
                 print("Cannot continue, starting over")
                 self._runmode="overwrite"
+                self._continue_state_file=None
         
         elif self._runmode=="delete":            
             mpi_barrier()
@@ -4794,11 +4927,21 @@ class Problem(_pyoomph.Problem):
             exit()
 
         if self._runmode=="continue":
-            # Find the highest dump
-            dumpdir=os.path.join(self.get_output_directory(),"_states")
-            dumps=sorted(glob.glob(os.path.join(dumpdir,"*.dump")))
-            while len(dumps)>0:
-                dump_to_load=dumps.pop()
+            # Selected in the continue check above, which downgraded the runmode if there was nothing
+            # to continue from, so by here there is a file.
+            assert self._continue_state_file is not None
+            candidates=[self._continue_state_file]
+            default_where=self._is_default_where(self._where_expression)
+            if default_where:
+                # Only the default "resume from the last state" walks backwards. The newest file is
+                # the one a killed run may have left half written, and the state before it is then
+                # genuinely the right place to carry on from. When --where names a state it is not:
+                # answering "resume at t=0.5" with a silent resume at t=0.4 changes the run that was
+                # asked for, and nothing in the results shows it happened.
+                earlier=[d for d in self._list_state_files() if d<self._continue_state_file]
+                candidates+=earlier[::-1]
+            last_error:Exception | None=None
+            for dump_to_load in candidates:
                 if not self.is_quiet():
                     print("Loading state "+dump_to_load)
                 try:
@@ -4808,8 +4951,12 @@ class Problem(_pyoomph.Problem):
                     #self.save_state("_states/_continued_at_.dmp",relative_to_output=True)
                     break
                 except Exception as e:
+                    last_error=e
                     print("Cannot load state"+dump_to_load,e)
             else:
+                if not default_where:
+                    raise RuntimeError("Cannot load the state file selected by --where '"
+                                       +self._where_expression+"' ("+candidates[0]+"): "+str(last_error))
                 raise RuntimeError("Cannot load any state file to continue")
             self._continue_initialized=True
             self._continue_dt_pending=True
@@ -4843,13 +4990,19 @@ class Problem(_pyoomph.Problem):
                 mycmd=sys.orig_argv.copy()
             except:
                 raise RuntimeError("Problem.plot_in_dedicated_process=True only works for Python>=3.10")
-            mycmd+=["--runmode","p","--where","__pipe__"]
-            plotlog=open(self.get_output_directory("_dedicated_plotter_log.txt"),"w")
-            #self._plotting_process=subprocess.Popen(mycmd,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-            if not self.is_quiet():
-                print("Creating dedicated plot process: "+str(mycmd))
-            self._plotting_process=subprocess.Popen(mycmd,stdin=subprocess.PIPE,stdout=plotlog,stderr=plotlog)
-            #print(self._plotting_process.)
+            # Set on every rank, so that all of them agree to leave the plotting to the child.
+            self._dedicated_plotter_active=True
+            # Spawned by rank 0 alone. Every rank used to start its own replotter from sys.orig_argv:
+            # they all truncated the same _dedicated_plotter_log.txt and wrote the same plot files, and
+            # under --distribute the ranks that do not write the state file handed their child a path
+            # that need not exist yet.
+            if get_mpi_rank()==0:
+                mycmd+=["--runmode","p","--where","__pipe__"]
+                plotlog=open(self.get_output_directory("_dedicated_plotter_log.txt"),"w")
+                if not self.is_quiet():
+                    print("Creating dedicated plot process: "+str(mycmd))
+                self._plotting_process=subprocess.Popen(mycmd,stdin=subprocess.PIPE,stdout=plotlog,
+                                                       stderr=plotlog,env=_environment_without_mpi())
 
         for hook in self._hooks:
             hook.actions_after_initialise()
@@ -4861,6 +5014,177 @@ class Problem(_pyoomph.Problem):
             get_pyoomph_precice_adapter().generate_precice_config_file(self)
             exit()
 
+
+    # The file name output() writes. Deliberately narrower than "*.dump": the same directory also
+    # holds adaptive_recovery's _snapshot_<pid>_<n>.dump rollback states (see _state_snapshot_name),
+    # which belong to one solve and are not resumable points of the simulation. They used to be
+    # excluded only by the accident that "_" sorts before "s" while the resume took the LAST file, so
+    # anything selecting by index or by time would have picked one.
+    _state_file_glob = "state_*.dump"
+
+    def _state_dir(self, outdir: "str | None" = None) -> str:
+        """The directory holding the state files of an output directory (this problem's by default)."""
+        return os.path.join(self.get_output_directory() if outdir is None else outdir, "_states")
+
+    def _list_state_files(self, statedir: "str | None" = None) -> List[str]:
+        """The state files of a run, sorted oldest first. The only place the _states glob is spelled out."""
+        if statedir is None:
+            statedir = self._state_dir()
+        return sorted(glob.glob(os.path.join(statedir, self._state_file_glob)))
+
+    def _probe_state_file(self, fname: str) -> "Tuple[float,int] | None":
+        """``(dimensional time, output step)`` of a state file, or None if it cannot be read as one.
+
+        A run killed while output() was writing leaves a truncated newest file, and a directory may
+        hold files of a dump version this build no longer reads. Neither may abort the *selection* -
+        it is up to the caller to decide what an unreadable candidate means.
+        """
+        try:
+            return self._get_time_of_state_file(fname)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _is_default_where(where: str) -> bool:
+        """Whether ``--where`` was left at its default, i.e. the user asked for nothing in particular."""
+        return where.strip() in ("", "True")
+
+    @staticmethod
+    def _parse_where_time(text: str) -> "float | None":
+        """The seconds meant by the right-hand side of a ``t=`` selector, or None if it is not one.
+
+        A bare number is seconds, because that is the unit the state files store: they hold
+        get_current_time(dimensional=True,as_float=True), which reduces a dimensional time with
+        float(t/second). A unit expression is allowed too, so that a problem running on microseconds
+        does not force the user to convert by hand. Note that pyoomph spells a prefixed unit as a product,
+        so it is 2.5*milli*second and not 2.5*milliseconds.
+        """
+        try:
+            return float(text)
+        except ValueError:
+            pass
+        from ..expressions import units as _units
+        from ..expressions.units import second as _second
+        ns = {k: v for k, v in vars(_units).items() if not k.startswith("_")}
+        try:
+            expr = eval(text, {}, ns)
+        except Exception as e:
+            raise RuntimeError("--where t=" + text + ": cannot read '" + text + "' as a time. Give a "
+                               "number of seconds, or an expression with units like 2.5*milli*second ("
+                               + type(e).__name__ + ": " + str(e) + ")")
+        try:
+            return float(expr / _second)
+        except Exception:
+            raise RuntimeError("--where t=" + text + " is not a time: it does not reduce to seconds")
+
+    def _match_state_files(self, where: str, statedir: "str | None" = None) -> List[str]:
+        """The state files selected by a ``--where`` value, sorted oldest first.
+
+        Raises for a malformed selector, and returns an empty list when a well-formed one simply
+        matches nothing - whether that is fatal depends on the caller, see initialise().
+        """
+        where = where.strip()
+        if where == "__pipe__":
+            raise RuntimeError("--where __pipe__ only means something for --runmode p, where it turns "
+                               "the process into a plotting server fed with state file names over stdin")
+
+        # An explicit file: no directory search at all, so a state from ANOTHER output directory, or
+        # one renamed by hand, can be named directly. Recognised by the .dump suffix alone and NOT by
+        # containing a path separator, because a perfectly good expression may contain one too - a
+        # "time/2>0.5" would otherwise be taken for a file name.
+        if where.endswith(".dump"):
+            if not os.path.isfile(where):
+                raise RuntimeError("--where '" + where + "' looks like the name of a state file, but "
+                                   "there is no such file")
+            return [where]
+
+        if self._is_default_where(where):
+            # Short-circuit: "True" matches every state by construction, so do not open a single file
+            # to find that out. This is what keeps the default resume as cheap as it has always been.
+            return self._list_state_files(statedir)
+
+        files = self._list_state_files(statedir)
+
+        # i=<signed int>: an index into the sorted list, NOT the output step in the file name. The two
+        # differ as soon as the numbering has a gap, which is why "step==N" exists separately.
+        m = re.fullmatch(r"i\s*=\s*([+-]?\d+)", where)
+        if m is not None:
+            idx = int(m.group(1))
+            if len(files) == 0:
+                return []
+            if idx >= len(files) or idx < -len(files):
+                raise RuntimeError("--where '" + where + "' asks for state index " + str(idx) + ", but "
+                                   + str(len(files)) + " state files exist in "
+                                   + (self._state_dir() if statedir is None else statedir))
+            return [files[idx]]
+
+        # t=/time=<time>: the LAST state at or before that time. Deliberately never overshoots -
+        # resuming later than the instant the user named would silently skip part of the physics.
+        m = re.fullmatch(r"(?:t|time)\s*=\s*(.+)", where)
+        if m is not None:
+            want = self._parse_where_time(m.group(1).strip())
+            assert want is not None
+            times = [(f, self._probe_state_file(f)) for f in files]
+            at_or_before = [(ts[0], f) for f, ts in times if ts is not None and ts[0] <= want]
+            if len(at_or_before) == 0:
+                if len(files) == 0:
+                    return []
+                readable = [ts[0] for _f, ts in times if ts is not None]
+                if len(readable) == 0:
+                    return []
+                raise RuntimeError("--where '" + where + "': every state file is later than t="
+                                   + str(want) + " s (the earliest one is at t=" + str(min(readable))
+                                   + " s). Not falling back to it, since that would not be the time "
+                                   "you asked for.")
+            return [max(at_or_before)[1]]
+
+        # A bare number cannot be told from an index or a time, so refuse it rather than guess. Left
+        # to the expression branch below it would be worse than ambiguous: eval("7") is truthy, so it
+        # would match every state and look like a working selector while ignoring the number.
+        if re.fullmatch(r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?", where):
+            raise RuntimeError("--where '" + where + "' is ambiguous: write 'i=" + where + "' for the "
+                               "state at that index (negative counts from the end, i=-1 is the last "
+                               "one), 't=" + where + "' for the last state at or before that "
+                               "simulation time in seconds, or 'step==" + where + "' for the state "
+                               "with that output step")
+
+        # A Python bool expression over step and time - what --runmode p has always evaluated. time is
+        # the DIMENSIONAL time in seconds, the same number a t= selector takes.
+        out: List[str] = []
+        for f in files:
+            ts = self._probe_state_file(f)
+            if ts is None:
+                continue
+            t, step = ts
+            try:
+                matches = eval(where, {}, {"step": step, "time": t})
+            except Exception as e:
+                raise RuntimeError("--where expression '" + where + "' cannot be evaluated: "
+                                   + type(e).__name__ + ": " + str(e))
+            if matches:
+                out.append(f)
+        return out
+
+    def _select_state_file_to_continue(self, where: str, statedir: "str | None" = None) -> "str | None":
+        """The one state file a ``--where`` selects for --runmode c, or None when nothing matched.
+
+        The LAST match, so that the default "True" resolves to the newest state - which is exactly
+        what a plain "carry on where it stopped" has always done.
+        """
+        matches = self._match_state_files(where, statedir)
+        if len(matches) == 0:
+            return None
+        chosen = matches[-1]
+        if get_mpi_nproc() > 1:
+            # In principle every rank sees the same directory and picks the same file. In practice an
+            # NFS or Lustre attribute cache can hide the newest file from some ranks for seconds, and
+            # ranks that then load DIFFERENT states meet in the collective mesh rebuild inside
+            # load_state with incompatible data, which does not fail, it hangs. Rank 0 decides, as it
+            # does for the snapshot job id in _state_snapshot_name.
+            comm = get_mpi_world_comm()
+            assert comm is not None
+            chosen = cast(str, comm.bcast(chosen, root=0))
+        return chosen
 
     def _perform_replot(self):
         if self._where_expression=="__pipe__":
@@ -4874,16 +5198,11 @@ class Problem(_pyoomph.Problem):
                     self.timestepper.set_weights()
                     self.perform_plot()
         else:
-            dumpdir = os.path.join(self.get_output_directory(), "_states")
-            dumps = sorted(glob.glob(os.path.join(dumpdir, "*.dump")))
-            for d in dumps:
-                time,step=self._get_time_of_state_file(d)
-                where_res=eval(self._where_expression,{},{"step":step,"time":time})
-                #print(d,where_res)
-                if where_res:
-                    self.load_state(d)
-                    self.timestepper.set_weights()
-                    self.perform_plot()
+            # Every match, not just the last one: replotting a series is the whole point here.
+            for d in self._match_state_files(self._where_expression):
+                self.load_state(d)
+                self.timestepper.set_weights()
+                self.perform_plot()
 
 
     def rebuild_global_mesh_from_list(self,rebuild:bool=True):
@@ -11004,15 +11323,21 @@ Patrick E. Farrell, Ásgeir Birkisson & Simon W. Funke, https://arxiv.org/pdf/14
 
         Args:
             old_out_dir: Old output directory
-            statenumber: Which state file to load (default: -1, i.e. the last one)
+            statenumber: Which state to load. A negative value is an index into the state files sorted by name, so the default -1 is the last one. A non-negative value is the output *step*, i.e. the number in the ``state_NNNNNN.dump`` file name. (The asymmetry is historical.)
             ignore_outstep: Do not load the outstep (default: True)
         """
-        import glob
-        toglob=os.path.join(old_out_dir,"_states","state_"+("{:06d}.dump".format(statenumber) if statenumber>=0 else "*.dump"))
-        globs=glob.glob(toglob)
-        if len(globs)==0:
-            raise RuntimeError(f"No state files found for {toglob}")         
-        contifile=sorted(globs)[statenumber if statenumber<0 else 0]
+        statedir=self._state_dir(old_out_dir)
+        if statenumber>=0:
+            contifile=os.path.join(statedir,"state_{:06d}.dump".format(statenumber))
+            if not os.path.isfile(contifile):
+                raise RuntimeError(f"No state file {contifile}")
+        else:
+            dumps=self._list_state_files(statedir)
+            if len(dumps)==0:
+                raise RuntimeError(f"No state files found in {statedir}")
+            if -statenumber>len(dumps):
+                raise RuntimeError(f"Only {len(dumps)} state files in {statedir}, cannot take number {statenumber}")
+            contifile=dumps[statenumber]
         print("Continuing from",contifile)        
         self.load_state(contifile,ignore_outstep=ignore_outstep)
         

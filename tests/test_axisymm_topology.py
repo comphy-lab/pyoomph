@@ -429,12 +429,21 @@ def test_axially_short_neck_is_reported_not_silently_missed():
         detect_and_plan([ch], 0.08, None)
 
 
-def test_pinch_gap_shorter_than_distmin_raises():
-    # the opening carves a ~0.08-long gap at each waist; asking to bridge anything below
-    # 0.5 would immediately undo the pinch, which is a contradictory parameter choice
+def test_pinch_survives_a_distmin_wider_than_its_own_gap():
+    # The opening carves a ~0.08-long gap at the waist, and a distmin far wider than that used
+    # to re-bridge it and abort the plan -- although the two fragments being bridged are the
+    # two halves this very call has just cut apart.  Siblings are exempt from the closing step,
+    # so the pinch goes through, and the parent volume is still split exactly at the waist.
     pts = _cosine_jet(0.5, 0.44, 2.0, 1, 801)
-    with pytest.raises(RuntimeError, match="re-bridges"):
-        detect_and_plan([_chain(pts, ends=("fixed", "fixed"))], 0.08, 0.5)
+    plan = detect_and_plan([_chain(pts, ends=("fixed", "fixed"))], 0.08, 0.5,
+                           volume_tolerance=1e-9)
+    assert [e.kind for e in plan.events] == ["pinch"]
+    assert abs(plan.events[0].z_center - 1.0) < 0.05
+    assert len(plan.new_chains) == 2
+    tot = plan.fragment_volumes_before[0]
+    assert abs(sum(plan.fragment_volumes_after) - tot) <= 1e-9 * tot
+    for V in plan.fragment_volumes_after:
+        assert abs(V - _band_volume(pts, 0.0, plan.events[0].z_center)) <= 1e-9 * tot
 
 
 def test_missing_shapely_message(monkeypatch):
@@ -450,3 +459,60 @@ def test_missing_shapely_message(monkeypatch):
     monkeypatch.setattr(builtins, "__import__", fake)
     with pytest.raises(RuntimeError, match="pip install shapely"):
         axt._require_shapely()
+
+
+# --------------------------------------------------------------------------------------
+# Axis spans of a remesh without a plan (pyoomph.equations.topological_changes)
+# --------------------------------------------------------------------------------------
+
+def test_merge_spans_is_the_plain_union():
+    from pyoomph.equations.topological_changes import _merge_spans
+    assert _merge_spans([(0.0, 2.0), (1.98, 5.0)]) == [(0.0, 5.0)]
+    # one fragment handed over in three pieces, as --distribute does it
+    assert _merge_spans([(0.0, 0.7), (0.7, 1.4), (1.4, 2.0), (3.0, 5.0)]) == [(0.0, 2.0), (3.0, 5.0)]
+
+
+def test_the_pieces_of_one_fragment_fuse_into_its_own_span():
+    from pyoomph.equations.topological_changes import _axis_spans_per_fragment
+    pieces = [(0.0, 0.7), (0.7, 1.4), (1.4, 2.0), (3.0, 5.0)]
+    tips = [(0.0, 2.0), (3.0, 5.0)]
+    assert _axis_spans_per_fragment(pieces, tips, 1e-9) == [(0.0, 2.0), (3.0, 5.0)]
+
+
+def test_every_axis_span_endpoint_is_a_chain_tip():
+    from pyoomph.equations.topological_changes import _axis_spans_per_fragment
+    # The real state of the printhead at 1.2x drive, t = 28.4 us: two fragments whose tips have
+    # passed through each other, so their spans overlap by 0.122. Cutting the overlap at its
+    # midpoint - which is what used to happen - puts an axis Line end at -31.25118595, and no
+    # interface chain ends there. define_geometry joins a Line to a Spline only when they share a
+    # gmsh Point, i.e. only when the coordinates hash identically, so the loop could not close.
+    a, b = (-32.0309361, -31.190136), (-31.3122359, -29.9974208)
+    out = _axis_spans_per_fragment([(-32.0309361, -29.9974208)], [a, b], 1e-9)
+    assert out == [a, b]
+    ends = {z for s in out for z in s}
+    assert all(z in {a[0], a[1], b[0], b[1]} for z in ends)
+    assert not any(abs(z - (-31.25118595)) < 1e-6 for z in ends), "the invented midpoint is gone"
+
+
+def test_a_contained_fragment_keeps_its_own_axis_span():
+    from pyoomph.equations.topological_changes import _axis_spans_per_fragment
+    # A span wholly inside another used to be absorbed, so that fragment lost its axis entirely.
+    out = _axis_spans_per_fragment([(0.0, 5.0)], [(0.0, 5.0), (1.0, 2.0)], 1e-9)
+    assert (1.0, 2.0) in out and (0.0, 5.0) in out
+
+
+def test_a_wall_anchored_fragment_reaches_the_end_of_its_coverage():
+    from pyoomph.equations.topological_changes import _axis_spans_per_fragment
+    # One axis tip and one wall contact: the liquid is BEHIND the interface, so the span runs from
+    # the tip to the far end of what the mesh says the axis is covered by - the no-plan analogue of
+    # the plan branch adding the reservoir depth at a "fixed" end. A span that stopped at the tip
+    # would leave the whole nozzle above the meniscus outside every span.
+    assert _axis_spans_per_fragment([(0.21194, 14.375)], [(None, 0.21194)], 1e-9) == [(0.21194, 14.375)]
+
+
+def test_a_wall_anchored_fragment_does_not_claim_every_piece_of_coverage():
+    from pyoomph.equations.topological_changes import _axis_spans_per_fragment
+    # Its far end is a contact line, not an axis tip, so it must be matched on the tip it HAS.
+    # Closing its interval with the coverage's own ends instead made it match every piece below it.
+    out = _axis_spans_per_fragment([(-5.0, -4.0), (0.0, 3.0)], [(None, 0.0)], 1e-9)
+    assert out == [(-5.0, -4.0), (0.0, 3.0)]   # the lower piece is kept, but not as a second span
