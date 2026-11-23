@@ -143,10 +143,10 @@ class DumpFile:
 
     def write_numpy_data(self,v:NPAnyArray) -> None:
         if self.compression_level is None:
-            numpy.lib.format.write_array(self.file,numpy.array([v])) #type:ignore
+            numpy.lib.format.write_array(self.file,numpy.array([v]),allow_pickle=False) #type:ignore
         else:
             np_bytes = io.BytesIO()
-            numpy.save(np_bytes, v, allow_pickle=True) #type:ignore
+            numpy.save(np_bytes, v, allow_pickle=False) #type:ignore
             compress=zlib.compress(np_bytes.getvalue(),level=self.compression_level)            
             self.write_int_data(len(compress))
             self.file.write(compress)
@@ -154,13 +154,13 @@ class DumpFile:
 
     def read_numpy_data(self)->NPAnyArray:
         if self.compression_level is None:
-            return numpy.lib.format.read_array(self.file)[0] #type:ignore
+            return numpy.lib.format.read_array(self.file,allow_pickle=False)[0] #type:ignore
         else:
             l=self.read_int_data()
             compr=self.file.read(l)
             by=zlib.decompress(compr)
             np_bytes = io.BytesIO(by)
-            return numpy.load(np_bytes, allow_pickle=True)
+            return numpy.load(np_bytes, allow_pickle=False)
         #return None #TODO
 
     def string_data(self,getter:Callable[[],str],setter:Callable[[str],str]) -> str:
