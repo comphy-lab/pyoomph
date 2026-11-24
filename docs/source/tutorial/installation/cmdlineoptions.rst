@@ -49,6 +49,9 @@ The linear solver flags are mutually exclusive (passing e.g. both ``--pardiso`` 
 ``--accelerate``
       Use Apple's Accelerate sparse solver framework (macOS only).
 
+``--mumps``
+      Use MUMPS directly as linear solver. Unlike ``--petsc_mumps`` this does not go through PETSc, so it needs no PETSc installation at all, but it does require the separate ``pyoomph_mumps`` package, see :numref:`installmumps`. It is serial, or natively distributed under MPI with each rank supplying its own row block.
+
 Likewise, the eigensolver flags are mutually exclusive:
 
 ``--slepc``
@@ -59,6 +62,9 @@ Likewise, the eigensolver flags are mutually exclusive:
 
 ``--spectra``
       Use the built-in `Spectra <https://spectralib.org>`__ eigensolver. It needs no PETSc/SLEPc at all -- it is compiled into pyoomph -- and can target a given, also complex, eigenvalue, but it is serial: under ``--distribute`` the matrices are gathered onto one process first. This is the default whenever PETSc/SLEPc with MUMPS is not available, so the flag is mainly useful to override a different choice, e.g. to compare against SLEPc.
+
+``--mumps_eigen``
+      Use the built-in Spectra eigensolver with MUMPS supplying the shift-and-invert factorization, in real *and* complex arithmetic, so azimuthal and Floquet stability analysis are covered without PETSc/SLEPc. Needs the separate ``pyoomph_mumps`` package, see :numref:`installmumps`. The flag is spelled differently from the linear ``--mumps`` above because argparse has a single flat namespace for both groups.
 
 ``--arpack``
       Use scipy's ARPACK-based eigensolver. Note that this is scipy's own backend, not the ARPACK-with-Pardiso combination which pyoomph falls back to when neither SLEPc/MUMPS nor Spectra is available but MKL Pardiso is present. Neither ARPACK variant can target an eigenvalue.
@@ -139,13 +145,27 @@ Run control
 ~~~~~~~~~~~
 
 ``--runmode {d,delete,o,overwrite,c,continue,p,replot}``
-      Selects what to do with a pre-existing output directory. ``delete`` (the default) removes previous output before starting; ``overwrite`` starts without removing anything; ``continue`` (``c``) resumes a previously stopped simulation from its last written state, see :numref:`secpdecontinue`; ``replot`` (``p``) only redoes the plots of an already completed simulation, without solving anything again, see :numref:`secreplotting`.
+      Selects what to do with a pre-existing output directory. ``delete`` (the default) removes previous output before starting; ``overwrite`` starts without removing anything; ``continue`` (``c``) resumes a previously stopped simulation from its last written state, or from the one ``--where`` selects, see :numref:`secpdecontinue`; ``replot`` (``p``) only redoes the plots of an already completed simulation, without solving anything again, see :numref:`secreplotting`.
 
 ``--recompile_on_continue``
       When using ``--runmode c`` or ``--runmode p``, code writing/compilation is normally suppressed (the existing generated code is reused). Pass this flag to force a recompile anyhow.
 
-``--where EXPRESSION``
-      A Python ``bool`` expression involving the variables ``step`` and/or ``time``, e.g. ``"step==10"`` or ``"step in [10,11,20]"``. Only used together with ``--runmode c``/``--runmode p``, to restrict which output steps are considered.
+``--where SELECTOR``
+      Selects which state files are used. Only meaningful together with ``--runmode p``, which replots *every* selected state, and ``--runmode c``, which resumes from the *last* one. The following forms are accepted:
+
+      ==================================  ==========================================================
+      ``True`` (the default)              every state, i.e. continue resumes from the last one
+      ``some/dir/_states/state_...dump``  exactly that file, which may also live in another output directory
+      ``i=N``                             the Nth state file sorted by name; negative counts from the end, so ``i=-1`` is the last one
+      ``t=X``, ``time=X``                 the last state at or *before* the dimensional time ``X``
+      ``"step==10"``                      a Python ``bool`` expression over ``step`` and ``time``
+      ==================================  ==========================================================
+
+      The time in ``t=X`` and in the variable ``time`` is the *dimensional* time as a plain number of seconds, since that is what the state files store. A unit expression may be given instead, e.g. ``t=2.5*milli*second`` or ``t=3*hour`` -- note that pyoomph writes a prefixed unit as a product, so it is ``milli*second`` and not ``millisecond``.
+
+      A bare number such as ``--where 7`` is refused, because it could equally mean the index ``i=7``, the time ``t=7`` or the output step ``step==7``. ``i=N`` counts state *files*, whereas ``step==N`` matches the output step stored in the file, which is also the number in its name; the two differ as soon as the numbering has a gap.
+
+      With ``--runmode c``, a selector that matches no state is an error rather than a silent restart from scratch. Only the default resumes-from-the-last behaviour falls back to starting over when the output directory holds nothing to continue from.
 
 ``--quick-test``
       Stop right after the first successful Newton solve (after writing that one output). Useful for quickly checking that a script runs at all, e.g. in CI.

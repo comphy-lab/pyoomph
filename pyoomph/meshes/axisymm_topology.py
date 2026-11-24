@@ -81,8 +81,12 @@ class WaistNotYetSeparable(RuntimeError):
 class InterfaceStateNotPlannable(RuntimeError):
     """The interface handed in cannot be turned into a cross section this module can reason about.
 
-    Two shapes reach it: a chain whose ring self-intersects, and a union that already encloses a
-    hole. Both used to end the run, and both are states a *transient* can pass through, because
+    Several shapes reach it, before the morphology and after it: a chain whose ring
+    self-intersects; a union that already encloses a hole, or a reconnection that would create one;
+    a fragment that does not touch the symmetry axis (a ring - see ``reservoir_depth``), and its
+    mirror twin, which clips to nothing at ``x >= 0``; and a fragment left with no interface at all.
+    All of them used to end the run, and all of them are states a *transient* can pass through,
+    because
     :py:class:`~pyoomph.equations.topological_changes.AxisymmetricReconnection` detects after every
     Newton solve - including the solves of steps that are about to be rejected on temporal error or
     on a Newton failure, whose interface is an intermediate that no one ever asked to keep. Measured
@@ -241,6 +245,25 @@ def _poly_volume(poly: Any) -> float:
     return revolved_volume(np.asarray(poly.exterior.coords)[:-1])
 
 
+def _closure_linestring(sh, pt: Any, hres: Optional[float]) -> Any:
+    """The synthetic closure of a ``"fixed"`` chain end, in the FULL (mirrored) plane.
+
+    It has to be the closure :func:`_ring_coords` actually builds and :func:`_closed_section`
+    measures the volume against: straight across at the contact height without a reservoir depth,
+    and the L up the wall and across the far end of it - on both sides of the axis - with one.
+
+    Two places need it and used to spell it out separately, which is how they came apart: the
+    protect band of the opening, and the fixed-end safety walk of stage 5. The band was built for
+    flat closures alone, so a reservoir end - the only kind a nozzle meniscus has - was left
+    unprotected and its film was eroded into a ring.
+    """
+    if hres:
+        y0, y1 = float(pt[1]), float(pt[1]) + float(hres)
+        return sh.LineString([(float(pt[0]), y0), (float(pt[0]), y1),
+                              (-float(pt[0]), y1), (-float(pt[0]), y0)])
+    return sh.LineString([(-float(pt[0]), float(pt[1])), (float(pt[0]), float(pt[1]))])
+
+
 # --------------------------------------------------------------------------------------
 # Morphology
 # --------------------------------------------------------------------------------------
@@ -376,11 +399,13 @@ def _interface_curve(hpoly: Any, snap: float, eps: float,
     n = len(ring)
     on = ring[:, 0] <= snap
     if on.all():
-        raise RuntimeError("axisymmetric topology: degenerate fragment with no interface")
+        raise InterfaceStateNotPlannable("axisymmetric topology: degenerate fragment with no "
+                                         "interface")
     if not on.any():
-        raise RuntimeError(
+        raise InterfaceStateNotPlannable(
             "axisymmetric topology: a fragment does not touch the symmetry axis "
-            "(toroidal / detached topology is not supported)")
+            "(toroidal / detached topology is not supported). A film between an interface and a "
+            "wall is the usual source; see reservoir_depth.")
     # cyclic maximal runs of x > snap
     start = int(np.argmax(on))  # first on-axis index -> runs do not wrap from here
     runs: List[List[int]] = []
@@ -396,7 +421,8 @@ def _interface_curve(hpoly: Any, snap: float, eps: float,
     if cur:
         runs.append(cur)
     if not runs:
-        raise RuntimeError("axisymmetric topology: degenerate fragment with no interface")
+        raise InterfaceStateNotPlannable("axisymmetric topology: degenerate fragment with no "
+                                         "interface")
     runs.sort(key=lambda r: float(np.max(ring[r, 0])), reverse=True)
     main = runs[0]
     for r in runs[1:]:
@@ -542,19 +568,24 @@ def detect_and_plan(chains: List[InterfaceChain],
     # ---- 3. morphology -----------------------------------------------------------------
     P_union = sh.unary_union(P)
     # The synthetic closure of a "fixed" chain end (see _ring_coords) is not a physical boundary, so
-    # the sliver it cuts off is not a physical neck. A nozzle meniscus that is merely dimpled near
-    # the axis is thin only because the closure runs straight across the nozzle at the contact
-    # height, and eroding that away either deletes the whole reservoir as a vanished fragment or -
-    # worse - splits it into a ring, whose mirrored cross section does not touch the axis at all and
-    # is not representable here. So the opening leaves a band around every closure alone. Nothing
-    # detectable is lost: an event within 4*eps of a fixed end is refused further down anyway, and
-    # any thinness between an interface and its own closure is by construction next to that closure.
-    flat_closures = [sh.LineString([(-float(pt[0]), float(pt[1])), (float(pt[0]), float(pt[1]))])
-                     for _g, pt, h, _k in fixed_ends if not h]
+    # the sliver it cuts off is not a physical neck. A meniscus that runs close to its own closure is
+    # thin only because of where that closure was drawn, and eroding the thin part away either
+    # deletes the whole reservoir as a vanished fragment or - worse - splits it into a ring, whose
+    # mirrored cross section does not touch the axis at all and is not representable here. So the
+    # opening leaves a band around every closure alone. Nothing detectable is lost: an event within
+    # 4*eps of a fixed end is refused further down anyway, and any thinness between an interface and
+    # its own closure is by construction next to that closure.
+    #
+    # EVERY closure, flat or L. Building the band for flat ones alone is what let the ring through:
+    # the closure of a nozzle meniscus is the L of its reservoir depth, drawn at the CONTACT radius,
+    # which for a bore that widens (a nozzle opening into a feedthrough) is a wall that is not there
+    # past the nozzle. A meniscus retracted into the bore then has a film against an invented wall,
+    # and the opening cut the middle of that film out as a free-standing annulus.
+    closures = [_closure_linestring(sh, pt, h) for _g, pt, h, _k in fixed_ends]
     protect = None
-    if flat_closures and eps_p > 0.0:
+    if closures and eps_p > 0.0:
         protect = P_union.intersection(
-            sh.unary_union(flat_closures).buffer(2.0 * eps_p, quad_segs=qs))
+            sh.unary_union(closures).buffer(2.0 * eps_p, quad_segs=qs))
     if eps_p > 0.0:
         er = P_union.buffer(-eps_p, quad_segs=qs, join_style="round")
         if protect is not None:
@@ -606,7 +637,39 @@ def detect_and_plan(chains: List[InterfaceChain],
         volume_lost = float(sum(vol_before[pi] for pi in removed))
 
     if eps_c > 0.0 and Q:
-        R = _polygons(_close(sh.unary_union(Q), eps_c, qs))
+        # The closing step must not undo the opening step: two fragments that this very call
+        # cut apart at a waist are separated by a gap that is, by construction, only as wide as
+        # the neck was long, and a distmin of the usual size bridges it straight away. So the
+        # groups to close are built pairwise, and a pair of siblings (same parent) is never a
+        # candidate. Everything else -- a drop meeting the meniscus, two drops meeting -- is
+        # closed exactly as before.
+        par = list(range(len(Q)))
+
+        def _find(i: int) -> int:
+            while par[i] != i:
+                par[i] = par[par[i]]
+                i = par[i]
+            return i
+
+        for a in range(len(Q)):
+            for b in range(a + 1, len(Q)):
+                if q2p[a] == q2p[b]:
+                    continue
+                if Q[a].distance(Q[b]) <= 2.0 * eps_c:
+                    ra, rb = _find(a), _find(b)
+                    if ra != rb:
+                        par[rb] = ra
+        groups: Dict[int, List[int]] = {}
+        for i in range(len(Q)):
+            groups.setdefault(_find(i), []).append(i)
+        R = []
+        for g in groups.values():
+            if len(g) == 1:
+                # A lone fragment is still closed with itself: a fold of one and the same
+                # interface (a drop about to swallow its own tail) is a coalescence too.
+                R.extend(_polygons(_close(Q[g[0]], eps_c, qs)))
+            else:
+                R.extend(_polygons(_close(sh.unary_union([Q[i] for i in g]), eps_c, qs)))
     else:
         R = list(Q)
     if not R:
@@ -633,8 +696,12 @@ def detect_and_plan(chains: List[InterfaceChain],
 
     for r in R:
         if len(r.interiors) > 0:
-            raise RuntimeError("axisymmetric topology: the reconnection would enclose a "
-                               "hole (entrapped opposite phase); unsupported topology")
+            # Deferrable, like its pre-opening twin at the top of this function: this hook runs
+            # after every Newton solve, including the solves of steps that are about to be
+            # rejected, whose interface nobody keeps.
+            raise InterfaceStateNotPlannable("axisymmetric topology: the reconnection would "
+                                             "enclose a hole (entrapped opposite phase); "
+                                             "unsupported topology")
 
     n_pinch = sum(1 for cs in children_of if len(cs) > 1)
     n_merge = sum(1 for qq in merged_of if len(qq) > 1)
@@ -646,8 +713,18 @@ def detect_and_plan(chains: List[InterfaceChain],
     for r in R:
         h = _halfplane(r, clip, snap)
         if h is None:
-            raise RuntimeError("axisymmetric topology: a fragment vanished when clipped "
-                               "to the half plane x>=0")
+            # A fragment with nothing at x>=0 is not a vanished fragment: the section is mirrored,
+            # so it is the twin of an OFF-AXIS fragment that this loop has already accepted at
+            # x>0. Saying "vanished" sent the reader looking for a lost fragment; the condition
+            # that actually holds is the one _interface_curve raises for the twin a few lines
+            # further down, so say that here instead.
+            if float(r.bounds[2]) <= snap:
+                raise InterfaceStateNotPlannable(
+                    "axisymmetric topology: a fragment does not touch the symmetry axis "
+                    "(toroidal / detached topology is not supported). A film between an "
+                    "interface and a wall is the usual source; see reservoir_depth.")
+            raise InterfaceStateNotPlannable("axisymmetric topology: a fragment vanished when "
+                                             "clipped to the half plane x>=0")
         R_half.append(h)
     stubs = [(pt, float(h)) for _g, pt, h, _k in fixed_ends if h]
     curves = [_interface_curve(h, max(snap, 1e-12 * extent), max(eps_ref, snap), stubs)
@@ -667,12 +744,7 @@ def detect_and_plan(chains: List[InterfaceChain],
         # event, not just the contact point: a waist a few eps above a wall still lands on
         # the closure even though it is far from the contact line itself. With a reservoir the
         # closure is the L along the wall and across the far end of it, so that is what is walked.
-        if hres:
-            y0, y1 = float(pt[1]), float(pt[1]) + hres
-            p = sh.LineString([(float(pt[0]), y0), (float(pt[0]), y1), (-float(pt[0]), y1),
-                               (-float(pt[0]), y0)])
-        else:
-            p = sh.LineString([(-float(pt[0]), float(pt[1])), (float(pt[0]), float(pt[1]))])
+        p = _closure_linestring(sh, pt, hres)
         for blob, be in blobs:
             if blob.distance(p) < 4.0 * be:
                 raise RuntimeError(
@@ -691,6 +763,21 @@ def detect_and_plan(chains: List[InterfaceChain],
             zlo = float(Q[a].bounds[3])
             zhi = float(Q[b].bounds[1])
             zc = 0.5 * (zlo + zhi)
+            if zlo > zhi:
+                # The children overlap in z, so no plane separates them and the midpoint above is
+                # not even between them. Ask the removed band where the neck actually is.
+                ha, hb = _halfplane(Q[a], clip, snap), _halfplane(Q[b], clip, snap)
+                bands = _neck_band(sh, P_half[pi], [ha, hb])
+                zb = None
+                # The band that matters is the one bridging the two children, not the largest:
+                # the opening also rounds off convex corners elsewhere and leaves slivers there.
+                for band in sorted(bands, key=lambda pp: max(ha.distance(pp), hb.distance(pp))):
+                    zb = _band_waist_z(sh, band, P_half[pi])
+                    if zb is not None:
+                        break
+                if zb is not None:
+                    zc = zb
+                zlo, zhi = zc - eps_p, zc + eps_p
             zw = _waist_zeta(old_pts, old_zeta, zlo, zhi, eps_p)
             waists.append((zc, zw))
             events.append(ReconnectionEvent(
@@ -771,6 +858,44 @@ def detect_and_plan(chains: List[InterfaceChain],
                                             for blob, be in blobs):
                     owner[g] = j
 
+    # A fragment shorter than the exclusion window keeps no old point at all, and splicing it
+    # then has nothing to anchor the fresh cap to. That is a property of the window, not of the
+    # fragment, so the window is narrowed for such a fragment alone -- down to the point where
+    # it keeps its two outermost points -- instead of failing the whole plan.
+    for ri in range(len(R)):
+        if np.any(owner == ri):
+            continue
+        f = cap_window_factor
+        while f > 0.5 and not np.any(owner == ri):
+            f *= 0.5
+            for g in range(len(old_pts)):
+                if owner[g] >= 0:
+                    continue
+                pt = sh.Point(float(old_pts[g, 0]), float(old_pts[g, 1]))
+                if any(blob.distance(pt) <= f * be for blob, be in blobs):
+                    continue
+                d = [float(ln.distance(pt)) for ln in lines]
+                j = int(np.argmin(d))
+                if j == ri and d[j] <= tol_keep:
+                    owner[g] = ri
+
+    # The splice reads the survivors in old traversal order (ascending global index) and pairs
+    # survivors[0] with arclength 0 of the fragment's curve. Nothing so far has tied the two
+    # orientations together: _interface_curve starts each curve where the ring happened to be cut,
+    # and the sort above only orders the curves among themselves. Where they disagree, the two ends
+    # swap roles - on the state that brought this to light, the WALL CONTACT of the reservoir was
+    # taken for the fresh axial tip, moved onto the axis, and 70% of the meniscus was rebuilt as a
+    # cap. So orient every curve by its own survivors before splicing.
+    for ri in range(len(curves)):
+        owned_ri = np.where(owner == ri)[0]
+        if len(owned_ri) < 2:
+            continue
+        dproj = np.array([lines[ri].project(sh.Point(float(old_pts[g, 0]), float(old_pts[g, 1])))
+                          for g in owned_ri])
+        if np.sum(np.sign(np.diff(dproj))) < 0.0:
+            curves[ri] = curves[ri][::-1].copy()
+            lines[ri] = sh.LineString(curves[ri])
+
     fixed_reservoir: Dict[int, Optional[float]] = {g: h for g, _pt, h, _k in fixed_ends}
     new_chains: List[NewChain] = []
     for ri in range(len(R)):
@@ -780,21 +905,25 @@ def detect_and_plan(chains: List[InterfaceChain],
             cap_window_factor, cap_spacing_factor, extent, fixed_reservoir))
 
     # ---- 8. volume targets and local correction ---------------------------------------
-    tgt_q = _q_targets(sh, P, P_half, Q, children_of, q2p, vol_before, waists)
+    tgt_q = _q_targets(sh, P, P_half, Q, children_of, q2p, vol_before, waists,
+                       [_halfplane(q, clip, snap) for q in Q])
     targets = [float(sum(tgt_q[qi] for qi in merged_of[ri])) for ri in range(len(R))]
     if volume_conservation:
         for ri, nc in enumerate(new_chains):
             if not np.any(nc.origin < 0):
                 continue
             _correct_volume(sh, nc, targets[ri], eps_ref, volume_tolerance)
+    # Deferrable: all three say that THIS state could not be turned into a usable plan, not that
+    # anything is wrong with the parameters, and the state one solve later is a different one. The
+    # same reasoning as for the refusals before the morphology; see InterfaceStateNotPlannable.
     for nc in new_chains:
         if np.any(nc.points[:, 0] < -1e-12 * extent):
-            raise RuntimeError("axisymmetric topology: the corrected interface crosses "
-                               "the symmetry axis")
+            raise InterfaceStateNotPlannable("axisymmetric topology: the corrected interface "
+                                             "crosses the symmetry axis")
         nc.points[nc.points[:, 0] < 0.0, 0] = 0.0
         if not sh.LineString(nc.points).is_simple:
-            raise RuntimeError("axisymmetric topology: the corrected interface is "
-                               "self-intersecting")
+            raise InterfaceStateNotPlannable("axisymmetric topology: the corrected interface is "
+                                             "self-intersecting")
         if np.any(np.diff(nc.zeta) <= 0.0):
             raise RuntimeError("axisymmetric topology: the new zeta chart is not "
                                "strictly monotone")
@@ -904,6 +1033,49 @@ def _change_blobs(P: Any, R: Any, eps_p: float, eps_c: float,
     return out
 
 
+def _band_waist_z(sh, band, parent_half) -> Optional[float]:
+    """The axial position of the waist inside a removed neck band.
+
+    The band is what the opening took out between two children, so the waist is inside it --
+    but it is NOT the band's own narrowest cross section: the band is bounded above and below
+    by the fresh rounded caps, so its cut width goes to zero at its ends, not at the neck.
+    What the waist is is the narrowest point of the ORIGINAL interface, so the search runs over
+    the piece of the parent's boundary that lies on the band, ignoring the r=0 mirror line that
+    closes the half section.
+
+    This stays right when the children overlap in z (a pinch beside a meniscus retracted into a
+    bore: the reservoir child still reaches down the wall past the waist), where the midpoint of
+    the children's bounding boxes is not even between them.
+    """
+    if band.is_empty or parent_half.is_empty:
+        return None
+    try:
+        common = band.boundary.intersection(parent_half.boundary)
+    except Exception:
+        return None
+    if common.is_empty:
+        return None
+    scale = max(float(parent_half.bounds[2]), 1e-30)
+    best_r, best_z = float("inf"), None
+    for geom in getattr(common, "geoms", [common]):
+        for r, z in getattr(geom, "coords", []):
+            r = float(r)
+            if r <= 1e-9 * scale:      # the mirror line, not interface
+                continue
+            if r < best_r:
+                best_r, best_z = r, float(z)
+    return best_z
+
+
+def _neck_band(sh, parent_half, kids_half):
+    """The piece(s) of the parent that the opening removed, with the one bridging two children
+    first."""
+    if not kids_half:
+        return []
+    lost = parent_half.difference(sh.unary_union(kids_half))
+    return [pp for pp in _polygons(lost) if pp.area > 0.0]
+
+
 def _waist_zeta(old_pts, old_zeta, zlo: float, zhi: float, eps: float) -> float:
     """Old zeta of the narrowest old point inside the removed neck band."""
     m = (old_pts[:, 1] >= zlo - eps) & (old_pts[:, 1] <= zhi + eps)
@@ -950,8 +1122,13 @@ def _splice_fragment(sh, curve: np.ndarray, line: Any, owned: np.ndarray, old_pt
                      extent: float,
                      fixed_reservoir: Optional[Dict[int, Optional[float]]] = None) -> NewChain:
     if len(owned) == 0:
-        raise RuntimeError("axisymmetric topology: a new fragment retains no old "
-                           "interface point; the event windows are too wide")
+        b = line.bounds
+        raise RuntimeError(
+            "axisymmetric topology: the new fragment spanning z={:g}..{:g} retains no old "
+            "interface point; it is shorter than the event window of "
+            "cap_window_factor={:g} times the pinch radius. Lower cap_window_factor (on "
+            "PrintheadProblem: pinch_off_cap_window_factor), or rmin_nd."
+            .format(b[1], b[3], cap_window_factor))
     survivors: List[Tuple[float, int]] = [
         (float(line.project(sh.Point(float(old_pts[g, 0]), float(old_pts[g, 1])))), int(g))
         for g in owned]
@@ -1222,7 +1399,7 @@ def _cap_window(sh, line, da: float, db: float, h: float, eps: float,
 # Volume targets and local correction
 # --------------------------------------------------------------------------------------
 
-def _q_targets(sh, P, P_half, Q, children_of, q2p, vol_before, waists) -> List[float]:
+def _q_targets(sh, P, P_half, Q, children_of, q2p, vol_before, waists, Q_half=None) -> List[float]:
     tgt = [0.0] * len(Q)
     for pi, cs in enumerate(children_of):
         if len(cs) == 1:
@@ -1231,6 +1408,34 @@ def _q_targets(sh, P, P_half, Q, children_of, q2p, vol_before, waists) -> List[f
         if not cs:
             continue
         kids = sorted(cs, key=lambda qi: Q[qi].bounds[1])
+        if Q_half is not None:
+            # Every child keeps what it covers; what the opening removed is handed to the child
+            # it is adjacent to, and the one band that bridges two children is cut at its own
+            # waist. Nothing here assumes the children are separated by a plane, which they are
+            # not when a pinch happens next to a meniscus retracted into the bore.
+            qh = {qi: Q_half[qi] for qi in kids}
+            got = {qi: _poly_volume(qh[qi]) for qi in kids}
+            for band in _neck_band(sh, P_half[pi], [qh[qi] for qi in kids]):
+                d = [(float(qh[qi].distance(band)), qi) for qi in kids]
+                tol_t = 1e-9 * max(float(band.length), 1.0)
+                touch = [qi for dd, qi in d if dd <= tol_t]
+                parts = [band]
+                if len(touch) > 1:
+                    zb = _band_waist_z(sh, band, P_half[pi])
+                    if zb is not None:
+                        bb = band.bounds
+                        cut = sh.LineString([(bb[0] - 1.0, zb), (bb[2] + 1.0, zb)])
+                        try:
+                            parts = _polygons(sh.split(band, cut))
+                        except Exception:
+                            parts = [band]
+                for pp in parts:
+                    qi = min(((float(qh[k].distance(pp)), k) for k in kids))[1]
+                    got[qi] += _poly_volume(pp)
+            scale = float(vol_before[pi]) / max(sum(got.values()), 1e-300)
+            for qi in kids:
+                tgt[qi] = got[qi] * scale
+            continue
         zsplit = []
         for a, b in zip(kids[:-1], kids[1:]):
             zsplit.append(0.5 * (float(Q[a].bounds[3]) + float(Q[b].bounds[1])))
@@ -1325,7 +1530,7 @@ def _correct_volume(sh, nc: NewChain, target: float, eps: float, tol: float) -> 
                                    rtol=8.9e-16, maxiter=200))  # type:ignore[arg-type] # scipy stubs over-restrict rtol and pretend full_output
             res = abs(vol(A))
             if res > tol * target:
-                raise RuntimeError(
+                raise InterfaceStateNotPlannable(
                     "axisymmetric topology: the volume correction stalled at a relative "
                     "residual of {:g}, above volume_tolerance={:g}".format(
                         res / target, tol))
@@ -1333,7 +1538,12 @@ def _correct_volume(sh, nc: NewChain, target: float, eps: float, tol: float) -> 
             nc.points[np.abs(nc.points[:, 0]) < 1e-15, 0] = 0.0
             return
         span *= 2.0
-    raise RuntimeError(
+    # Deferrable, like the other refusals about the SHAPE handed in rather than about the
+    # parameters: an offset this large means the spliced fragment and its target are far apart,
+    # which is a property of the state, and the state one solve later is a different one. A
+    # geometry that genuinely cannot be corrected still ends the run, once max_unplannable_states
+    # consecutive solves have seen it.
+    raise InterfaceStateNotPlannable(
         "axisymmetric topology: cannot conserve the volume of a reconnected fragment; "
         "the required normal offset exceeds +-{:g}".format(span))
 
